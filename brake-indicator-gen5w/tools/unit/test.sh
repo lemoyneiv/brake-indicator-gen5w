@@ -15,6 +15,8 @@ javac --release 8 -Xlint:-options -d "$W" \
     "$BLE/Gen5wBleClient.java" \
     "$SRC/IndicatorConfig.java" \
     "$SRC/BrakeEvaluator.java" \
+    "$SRC/HmgVehiclePoller.java" \
+    "$SRC/HevRegenProbe.java" \
     "$SRC/Elm327BrakeProtocol.java" \
     "$SRC/TelemetryRecorder.java" \
     "$SRC/UsbExporter.java" \

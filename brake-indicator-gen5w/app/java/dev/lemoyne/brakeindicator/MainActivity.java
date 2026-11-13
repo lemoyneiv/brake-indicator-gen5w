@@ -24,12 +24,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Gen5W landscape dashboard for Brake Light Indicator v0.3:
+ * Gen5W landscape dashboard for Brake Light Indicator v0.4:
  *  - Left card: Live brake-lamp preview, configurable OBD vs HMG-API icon mode toggle,
- *    built-in HMG-API readings vs real OBD (`770`/`22BC06`) ground truth, live accuracy/lag
- *    scorecard, 3-second test, dataset reset, and atomic USB CSV export.
+ *    built-in HMG-API 20 Hz readings vs real OBD (`770`/`22BC06`) ground truth, coasting +
+ *    HEVFlag/USM regen-level detection, one-tap `Mark Regen` paddle baseline button, and
+ *    atomic 3-file USB export (`brake-dataset`, `brake-summary`, `hev-regen-probe`).
  *  - Right card: `@gen5w_ble` direct BLE scanner pairing (with automatic `127.0.0.1:35000`
- *    loopback fallback) and live discrete transition log.
+ *    loopback fallback) and live discrete transition + HEV signal diff log.
  */
 public final class MainActivity extends Activity
         implements BrakeEngine.StateListener, ObdBrakeClient.Listener {
@@ -126,7 +127,7 @@ public final class MainActivity extends Activity
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator v0.3");
+        title.setText("Brake Light Indicator v0.4");
         title.setTextColor(TEXT_PRIMARY);
         title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -226,19 +227,19 @@ public final class MainActivity extends Activity
         telemetryText = new TextView(this);
         telemetryText.setTypeface(Typeface.MONOSPACE);
         telemetryText.setTextColor(TEXT_PRIMARY);
-        telemetryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
-        telemetryText.setLineSpacing(5.0f, 1.0f);
+        telemetryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
+        telemetryText.setLineSpacing(4.0f, 1.0f);
         telemetryText.setText("Starting HMG-API vehicle polling...");
         LinearLayout.LayoutParams teleLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        teleLp.topMargin = 12;
+        teleLp.topMargin = 10;
         leftCard.addView(telemetryText, teleLp);
 
         // Left action buttons
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
 
-        Button testBtn = styledButton("Test Icon (3s)", new View.OnClickListener() {
+        Button testBtn = styledButton("Test (3s)", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 startService(new Intent(MainActivity.this, OverlayService.class));
@@ -247,11 +248,22 @@ public final class MainActivity extends Activity
             }
         });
         LinearLayout.LayoutParams b1 = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f);
         b1.rightMargin = 8;
         actions.addView(testBtn, b1);
 
-        Button clearBtn = styledButton("Clear Dataset", new View.OnClickListener() {
+        Button markRegenBtn = styledButton("Mark Regen", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                markRegenBaselineAsync();
+            }
+        });
+        LinearLayout.LayoutParams bMark = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f);
+        bMark.rightMargin = 8;
+        actions.addView(markRegenBtn, bMark);
+
+        Button clearBtn = styledButton("Clear", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 engine.getRecorder().clear();
@@ -260,11 +272,11 @@ public final class MainActivity extends Activity
             }
         });
         LinearLayout.LayoutParams b2 = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.85f);
         b2.rightMargin = 8;
         actions.addView(clearBtn, b2);
 
-        Button exportBtn = styledButton("Export CSV to USB", new View.OnClickListener() {
+        Button exportBtn = styledButton("Export USB", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 exportDatasetToUsb();
@@ -280,7 +292,7 @@ public final class MainActivity extends Activity
         actionNoticeText.setTextColor(ACCENT_TEAL);
         actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
         actionNoticeText.setPadding(2, 6, 2, 0);
-        actionNoticeText.setText("Exports synchronized HMG-API + OBD 22BC06 CSV & summary to <usb>/BrakeIndicator/.");
+        actionNoticeText.setText("Exports CSV + summary + HEV regen probe to <usb>/BrakeIndicator/.");
         leftCard.addView(actionNoticeText);
 
         columns.addView(leftCard, leftLp);
@@ -321,7 +333,10 @@ public final class MainActivity extends Activity
         Button reconnBtn = styledButton("Reconnect", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                engine.getRecorder().recordExternalEvent(
+                        engine.getObdClient().monotonicMs(), "OBD Reconnect tapped");
                 engine.getObdClient().requestReconnect();
+                refreshObdPanel();
                 actionNoticeText.setText("Retrying @gen5w_ble direct -> 127.0.0.1 fallback...");
             }
         });
@@ -362,7 +377,7 @@ public final class MainActivity extends Activity
         transitionLogText.setTextColor(TEXT_PRIMARY);
         transitionLogText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
         transitionLogText.setLineSpacing(4.0f, 1.0f);
-        transitionLogText.setText("No brake-lamp or HMG-API model transitions recorded yet.");
+        transitionLogText.setText("No brake-lamp, regen-level, or HMG-API transitions recorded yet.");
         scroll.addView(transitionLogText);
         rightCard.addView(scroll, scrollLp);
 
@@ -396,12 +411,12 @@ public final class MainActivity extends Activity
 
         sourceLabel.setText("Icon Trigger: " + snap.source);
         configSummaryText.setText(cfg.anchor + " (" + cfg.xOffsetPx + ", " + cfg.yOffsetPx + ") "
-                + cfg.iconSizePx + "px  |  HMG-API: " + (hmgConnected ? "OK" : "WAITING"));
+                + cfg.iconSizePx + "px  |  HMG-API: " + engine.getHmgStatusSummary());
         modeToggleBtn.setText("Mode: " + cfg.obdMode.shortLabel() + " (tap to switch)");
 
         TelemetryRecorder.ScoreSnapshot sc = engine.getRecorder().scoreSnapshot();
 
-        StringBuilder sb = new StringBuilder(512);
+        StringBuilder sb = new StringBuilder(640);
         sb.append("Real OBD (770/22BC06) : ");
         if (snap.obdFresh) {
             sb.append(snap.obd.brakeLampLit ? "ON " : "OFF")
@@ -423,6 +438,13 @@ public final class MainActivity extends Activity
         sb.append("Brake Prsr / Accel    : prsr=")
           .append(fmtObjFloat(snap.brakePressure, "%.1f")).append("  |  accel=")
           .append(fmtObjFloat(snap.accelPedal, "%.1f")).append("%\n");
+
+        sb.append("Regen (Coast / HEV)   : ")
+          .append(snap.inferredRegenLevel >= 0 ? ("L" + snap.inferredRegenLevel) : "learning...")
+          .append("  |  ")
+          .append(engine.getHevProbe().compactUiSummary())
+          .append('\n');
+
         sb.append("Steer / Park / HV SOC : ")
           .append(fmtObjFloat(snap.steeringAngleDeg, "%+.1f")).append(" deg  |  P=")
           .append(fmtFlag(snap.gearPark)).append(" EPB=").append(fmtFlag(snap.parkingBrake))
@@ -497,6 +519,25 @@ public final class MainActivity extends Activity
         transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
     }
 
+    private void markRegenBaselineAsync() {
+        actionNoticeText.setText("Snapshotting HEVFlag / USM / CLUSTER baseline...");
+        Thread worker = new Thread("BrakeMarkRegen") {
+            @Override
+            public void run() {
+                final String msg = engine.markRegenBaseline();
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        actionNoticeText.setText(msg + " — click paddle now to watch live diffs!");
+                        transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
     private void cycleObdMode() {
         Thread worker = new Thread("BrakeModeCycle") {
             @Override
@@ -516,7 +557,7 @@ public final class MainActivity extends Activity
     }
 
     private void exportDatasetToUsb() {
-        actionNoticeText.setText("Exporting synchronized CSV + summary to USB...");
+        actionNoticeText.setText("Exporting CSV + summary + HEV regen probe to USB...");
         Thread worker = new Thread("BrakeUsbExport") {
             @Override
             public void run() {
@@ -530,7 +571,7 @@ public final class MainActivity extends Activity
                     @Override
                     public void run() {
                         if (res.ok) {
-                            actionNoticeText.setText("Saved to USB: " + res.csvPath);
+                            actionNoticeText.setText("Saved CSV + HEV regen report: " + res.csvPath);
                         } else {
                             actionNoticeText.setText(res.errorMessage);
                         }

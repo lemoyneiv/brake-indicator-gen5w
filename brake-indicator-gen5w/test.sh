@@ -12,12 +12,14 @@ R=$T/root
 mkdir -p "$R/system" "$R/data/hmgapi/settings"
 printf 'ro.board.platform=tcc803x\n' > "$R/props.txt"
 
-# Verify built APK and key v0.3.0 classes inside classes.dex
+# Verify built APK and key v0.4.0 classes inside classes.dex
 check "built: BrakeIndicator.apk exists" yes "$(test -f "$B/app/BrakeIndicator.apk" && echo yes || echo no)"
 DEX_STRINGS=$(unzip -p "$B/app/BrakeIndicator.apk" classes.dex | strings)
 has "apk contains OverlayService" "Ldev/lemoyne/brakeindicator/OverlayService;" "$DEX_STRINGS"
 has "apk contains MainActivity" "Ldev/lemoyne/brakeindicator/MainActivity;" "$DEX_STRINGS"
 has "apk contains BrakeEngine" "Ldev/lemoyne/brakeindicator/BrakeEngine;" "$DEX_STRINGS"
+has "apk contains HmgVehiclePoller" "Ldev/lemoyne/brakeindicator/HmgVehiclePoller;" "$DEX_STRINGS"
+has "apk contains HevRegenProbe" "Ldev/lemoyne/brakeindicator/HevRegenProbe;" "$DEX_STRINGS"
 has "apk contains ObdBrakeClient" "Ldev/lemoyne/brakeindicator/ObdBrakeClient;" "$DEX_STRINGS"
 has "apk contains Elm327BrakeProtocol" "Ldev/lemoyne/brakeindicator/Elm327BrakeProtocol;" "$DEX_STRINGS"
 has "apk contains TelemetryRecorder" "Ldev/lemoyne/brakeindicator/TelemetryRecorder;" "$DEX_STRINGS"

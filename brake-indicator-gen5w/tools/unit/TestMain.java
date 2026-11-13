@@ -2,12 +2,17 @@ package dev.lemoyne.brakeindicator;
 
 import gen5w.ble.Gen5wBleClient;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -18,11 +23,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.3.0:
+ * Host JVM unit tests for v0.4.0:
+ * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder, LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (@gen5w_ble direct BLE primary session + ALREADY_CONNECTED 127.0.0.1 loopback fallback)
- * - IndicatorConfig & BrakeEvaluator (250 ms cached HMG-API speed handling, i-Pedal/SCC regen, standstill hold, ObdMode)
- * - TelemetryRecorder & UsbExporter (confusion matrix, regen recall, onset lag, CSV + summary atomic USB export)
+ * - IndicatorConfig & BrakeEvaluator (100/250 ms cached HMG-API speed handling, L0..L3 coasting regen estimator,
+ *   i-Pedal/SCC regen, standstill hold, ObdMode)
+ * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, Mark Regen baseline, live paddle-click diff)
+ * - TelemetryRecorder & UsbExporter (confusion matrix, regen columns, external events, 3-file atomic USB export)
  */
 public final class TestMain {
 
@@ -30,12 +38,15 @@ public final class TestMain {
     private static int failed;
 
     public static void main(String[] args) throws Exception {
+        testHmgVehiclePollerFastAndLegacyHubStall();
         testElm327IgmpBrakeDecoding();
         testElm327SafetyAndBvm02Exclusion();
         testObdBrakeClientBleAndLoopbackFallback();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
+        testBrakeEvaluatorCoastingRegenInference();
         testBrakeEvaluatorStandstillHoldAndRelease();
+        testHevRegenProbeSafetyAndBaselineDiff();
         testTelemetryRecorderScoringAndCsv();
         testUsbExporterMountsAndAtomicWrite();
 
@@ -43,6 +54,77 @@ public final class TestMain {
         if (failed > 0) {
             System.exit(1);
         }
+    }
+
+    private static void testHmgVehiclePollerFastAndLegacyHubStall() throws Exception {
+        final String[] names = {"speed", "brake.pressure", "pedal.accel"};
+        final byte[] oPayload = "speed 54.2\nbrake.pressure 0\npedal.accel 12.5\n".getBytes("UTF-8");
+
+        // 1. Patched Hub fast path: 'O' frame followed immediately by 'X'(0)
+        ByteArrayOutputStream wireFast = new ByteArrayOutputStream();
+        writeLfdFrame(wireFast, (byte) 'O', oPayload);
+        writeLfdFrame(wireFast, (byte) 'X', new byte[]{0, 0, 0, 0});
+
+        ByteArrayOutputStream sentReq = new ByteArrayOutputStream();
+        final int[] adjustedTimeout = {-1};
+        HmgVehiclePoller.PollResult fastRes = HmgVehiclePoller.readVehicleOverStreams(
+                new ByteArrayInputStream(wireFast.toByteArray()),
+                sentReq,
+                new HmgVehiclePoller.TimeoutSetter() {
+                    @Override
+                    public void setReadTimeoutMs(int timeoutMs) {
+                        adjustedTimeout[0] = timeoutMs;
+                    }
+                },
+                names,
+                90);
+        byte[] reqBytes = sentReq.toByteArray();
+        eq("LFD1 header magic", "LFD1", new String(reqBytes, 0, 4, "UTF-8"));
+        eq("Patched Hub fast path ok=true", Boolean.TRUE, Boolean.valueOf(fastRes.ok));
+        eq("Patched Hub fast path legacyHubStall=false", Boolean.FALSE, Boolean.valueOf(fastRes.legacyHubStall));
+        eq("Patched Hub parsed speed=54.2", "54.2", fastRes.readings.get("speed"));
+        eq("Patched Hub shortened post-output timeout to 90ms", Integer.valueOf(90), Integer.valueOf(adjustedTimeout[0]));
+
+        // 2. Unpatched KitKat Hub stall path: 'O' arrives immediately, then read() throws SocketTimeoutException
+        // before the 3,000 ms hmgapid EOF timeout! Must recover all readings with legacyHubStall=true.
+        ByteArrayOutputStream wireOnlyO = new ByteArrayOutputStream();
+        writeLfdFrame(wireOnlyO, (byte) 'O', oPayload);
+        final byte[] onlyOBytes = wireOnlyO.toByteArray();
+        InputStream stallingIn = new InputStream() {
+            int pos = 0;
+            @Override
+            public int read() throws IOException {
+                if (pos < onlyOBytes.length) {
+                    return onlyOBytes[pos++] & 0xff;
+                }
+                throw new SocketTimeoutException("simulated 90ms post-O grace timeout");
+            }
+        };
+        HmgVehiclePoller.PollResult stallRes = HmgVehiclePoller.readVehicleOverStreams(
+                stallingIn, new ByteArrayOutputStream(), null, names, 90);
+        eq("Legacy KitKat Hub stall recovers ok=true", Boolean.TRUE, Boolean.valueOf(stallRes.ok));
+        eq("Legacy KitKat Hub flags legacyHubStall=true", Boolean.TRUE, Boolean.valueOf(stallRes.legacyHubStall));
+        eq("Legacy KitKat Hub recovers speed=54.2", "54.2", stallRes.readings.get("speed"));
+        eq("Legacy KitKat Hub recovers pedal.accel=12.5", "12.5", stallRes.readings.get("pedal.accel"));
+
+        // 3. Unpatched KitKat Hub if 'X'(1) arrives after 'O': still recovers readings with legacyHubStall=true
+        ByteArrayOutputStream wireExit1 = new ByteArrayOutputStream();
+        writeLfdFrame(wireExit1, (byte) 'O', oPayload);
+        writeLfdFrame(wireExit1, (byte) 'X', new byte[]{1, 0, 0, 0});
+        HmgVehiclePoller.PollResult exit1Res = HmgVehiclePoller.readVehicleOverStreams(
+                new ByteArrayInputStream(wireExit1.toByteArray()), new ByteArrayOutputStream(), null, names, 90);
+        eq("Legacy Hub exit=1 after 'O' recovers ok=true", Boolean.TRUE, Boolean.valueOf(exit1Res.ok));
+        eq("Legacy Hub exit=1 flags legacyHubStall=true", Boolean.TRUE, Boolean.valueOf(exit1Res.legacyHubStall));
+    }
+
+    private static void writeLfdFrame(ByteArrayOutputStream out, byte type, byte[] payload) {
+        out.write(type);
+        int len = payload.length;
+        out.write(len & 0xff);
+        out.write((len >> 8) & 0xff);
+        out.write((len >> 16) & 0xff);
+        out.write((len >> 24) & 0xff);
+        out.write(payload, 0, len);
     }
 
     private static void testElm327IgmpBrakeDecoding() {
@@ -344,6 +426,67 @@ public final class TestMain {
                 Boolean.TRUE, Boolean.valueOf(sModelIcon.obdFresh));
     }
 
+    private static void testBrakeEvaluatorCoastingRegenInference() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        eq("classifyCoastingRegenLevel L0", Integer.valueOf(0), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.10f, -1)));
+        eq("classifyCoastingRegenLevel L1", Integer.valueOf(1), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.60f, -1)));
+        eq("classifyCoastingRegenLevel L2", Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(1.15f, -1)));
+        eq("classifyCoastingRegenLevel L3", Integer.valueOf(3), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(1.85f, -1)));
+        eq("classifyCoastingRegenLevel hysteresis holds L2 at 0.80",
+                Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.80f, 2)));
+
+        // Simulate 100 ms updated HMG-API speed steps during off-throttle coasting in L1, then L2, then L3
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 20000L;
+        float spd = 72.0f;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // 1. Coast in L1 (~0.58 m/s^2 -> -0.21 km/h every 100 ms) for 900 ms
+        for (int tick = 0; tick <= 18; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.21f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, 1));
+            t += 50L;
+        }
+        eq("Coasting decel ~0.58 m/s^2 infers Regen L1", Integer.valueOf(1), Integer.valueOf(snap.inferredRegenLevel));
+        eq("hevRegenRaw passed through to Snapshot", Integer.valueOf(1), Integer.valueOf(snap.hevRegenRaw));
+
+        // 2. Driver clicks paddle to L2 (~1.16 m/s^2 -> -0.42 km/h every 100 ms)
+        for (int tick = 1; tick <= 16; tick++) {
+            if (tick % 2 == 0) spd -= 0.42f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, 2));
+            t += 50L;
+        }
+        eq("Coasting decel ~1.16 m/s^2 infers Regen L2", Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 3. Driver presses throttle (18%): inferredRegenLevel stays latched at L2 until next coast or Park
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd + 0.5f, 18.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, 2));
+        t += 100L;
+        eq("Throttle press preserves learned L2", Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 4. Coast in L3 (~1.80 m/s^2 -> -0.65 km/h every 100 ms)
+        for (int tick = 1; tick <= 18; tick++) {
+            if (tick % 2 == 0) spd -= 0.65f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, 3));
+            t += 50L;
+        }
+        eq("Coasting decel ~1.80 m/s^2 infers Regen L3", Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+        eq("L3 coast also illuminates HMG-API model", Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 5. Shifting into Park resets inferredRegenLevel to -1
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1));
+        eq("Park resets inferredRegenLevel to -1", Integer.valueOf(-1), Integer.valueOf(snap.inferredRegenLevel));
+    }
+
     private static void testBrakeEvaluatorStandstillHoldAndRelease() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
         BrakeEvaluator ev = new BrakeEvaluator();
@@ -378,22 +521,102 @@ public final class TestMain {
         eq("Throttle >= 2% releases standstill hold", Boolean.FALSE, Boolean.valueOf(released.illuminated));
     }
 
+    @SuppressWarnings("unused")
+    private interface FakeOemService {
+        int getRecuperationLevel();
+        boolean isSmartRegenActive();
+        String getVinNumber();
+        int getDeviceSerial();
+        void setRecuperationLevel(int level);
+    }
+
+    private static void testHevRegenProbeSafetyAndBaselineDiff() throws Exception {
+        // 1. Privacy & mutator safety checks
+        eq("Blocks VIN signal name", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeSignalName("HEVFlag.CAR_VIN_CODE")));
+        eq("Blocks MAC signal name", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeSignalName("BCM.getBtMacAddress")));
+        eq("Blocks GPS signal name", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeSignalName("CLU.getGpsLatitude")));
+        eq("Allows EV_RECUP_LEVEL signal name", Boolean.TRUE, Boolean.valueOf(HevRegenProbe.isSafeSignalName("HEVFlag.EV_RECUP_LEVEL(12)")));
+
+        Method okInt = FakeOemService.class.getMethod("getRecuperationLevel");
+        Method okBool = FakeOemService.class.getMethod("isSmartRegenActive");
+        Method badVinString = FakeOemService.class.getMethod("getVinNumber");
+        Method badSerialInt = FakeOemService.class.getMethod("getDeviceSerial");
+        Method badMutator = FakeOemService.class.getMethod("setRecuperationLevel", int.class);
+        eq("Allows primitive int getter", Boolean.TRUE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(okInt)));
+        eq("Allows primitive boolean getter", Boolean.TRUE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(okBool)));
+        eq("Blocks String VIN getter", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(badVinString)));
+        eq("Blocks serial int getter", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(badSerialInt)));
+        eq("Blocks mutator method", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(badMutator)));
+
+        // 2. Baseline marking & live paddle-click diffing
+        final Map<String, String> liveSignals = new LinkedHashMap<String, String>();
+        liveSignals.put("HEVFlag.EV_READY(1)", "1");
+        liveSignals.put("HEVFlag.EV_RECUP_LEVEL(12)", "1");
+        liveSignals.put("USM.getSmartRecuperation", "0");
+        liveSignals.put("HEVFlag.ODOMETER(4)", "123450"); // noisy counter -> must not trigger false candidate alerts
+        liveSignals.put("BCM.getVinCode", "SECRET");      // unsafe name -> must be dropped even if returned
+
+        HevRegenProbe probe = new HevRegenProbe(new HevRegenProbe.SignalSource() {
+            @Override
+            public String serviceStatusSummary() {
+                return "HEV=YES(3 flags) USM=YES CLU=YES";
+            }
+
+            @Override
+            public Map<String, String> readSignals(boolean fullScan) {
+                return new LinkedHashMap<String, String>(liveSignals);
+            }
+        });
+
+        final List<String> events = new ArrayList<String>();
+        probe.setChangeListener(new HevRegenProbe.ChangeListener() {
+            @Override
+            public void onHevSignalChanged(String key, String oldVal, String newVal, boolean regenKeywordMatch) {
+                events.add(key + ":" + oldVal + "->" + newVal + ":" + regenKeywordMatch);
+            }
+        });
+
+        probe.poll(true);
+        eq("Initial direct regen candidate = 1", Integer.valueOf(1), Integer.valueOf(probe.getLatestDirectRegenRaw()));
+        String markMsg = probe.markBaseline();
+        eq("markBaseline counts only safe signals (4)", Boolean.TRUE, Boolean.valueOf(markMsg.contains("4 HEV/USM/CLU signals")));
+
+        // Simulate odometer tick + driver clicking left paddle from Level 1 -> Level 2
+        liveSignals.put("HEVFlag.ODOMETER(4)", "123451");
+        liveSignals.put("HEVFlag.EV_RECUP_LEVEL(12)", "2");
+        probe.poll(false);
+
+        eq("Only non-noisy paddle signal fired ChangeListener", Integer.valueOf(1), Integer.valueOf(events.size()));
+        eq("ChangeListener flagged regen candidate",
+                "HEVFlag.EV_RECUP_LEVEL(12):1->2:true", events.get(0));
+        eq("Updated direct regen candidate = 2", Integer.valueOf(2), Integer.valueOf(probe.getLatestDirectRegenRaw()));
+        eq("Baseline diff count = 1", Integer.valueOf(1), Integer.valueOf(probe.getBaselineChangedCount()));
+
+        String report = probe.buildReport(false);
+        eq("Probe report highlights REGEN/MODE CANDIDATE",
+                Boolean.TRUE, Boolean.valueOf(report.contains("HEVFlag.EV_RECUP_LEVEL(12) : 1 -> 2") && report.contains("REGEN/MODE CANDIDATE")));
+        eq("Probe report excludes unsafe VIN signal",
+                Boolean.FALSE, Boolean.valueOf(report.contains("SECRET") || report.contains("Vin")));
+    }
+
     private static void testTelemetryRecorderScoringAndCsv() {
         TelemetryRecorder rec = new TelemetryRecorder();
         long wall = 1763000000000L;
 
-        // Tick 0 (t=1000): Both OFF -> TN
-        rec.record(makeScoredSnapshot(1000L, false, "OFF", 0, false, false), wall);
-        // Tick 1 (t=1050): OBD turns ON via Regen (36), Model still OFF -> FN (pending OBD rise at rel=50ms)
-        rec.record(makeScoredSnapshot(1050L, false, "OFF", 36, true, false), wall + 50L);
+        // Tick 0 (t=1000): Both OFF -> TN (inferred regen L1, hev raw 1)
+        rec.record(makeScoredSnapshot(1000L, false, "OFF", 0, false, false, 1, 1), wall);
+        // External baseline marker event
+        rec.recordExternalEvent(1025L, "MARK #1 (42 HEV/USM/CLU signals)");
+        // Tick 1 (t=1050): OBD turns ON via Regen (36), Model still OFF -> FN (inferred regen transitions L1 -> L2)
+        rec.record(makeScoredSnapshot(1050L, false, "OFF", 36, true, false, 2, 2), wall + 50L);
         // Tick 2 (t=1150): Model turns ON via REGEN_DECEL -> TP, onset lag = 150 - 50 = +100 ms!
-        rec.record(makeScoredSnapshot(1150L, true, "REGEN_DECEL", 36, true, false), wall + 150L);
+        rec.record(makeScoredSnapshot(1150L, true, "REGEN_DECEL", 36, true, false, 2, 2), wall + 150L);
         // Tick 3 (t=1200): Both ON via Regen -> TP
-        rec.record(makeScoredSnapshot(1200L, true, "REGEN_DECEL", 36, true, false), wall + 200L);
+        rec.record(makeScoredSnapshot(1200L, true, "REGEN_DECEL", 36, true, false, 2, 2), wall + 200L);
         // Tick 4 (t=1250): OBD turns OFF (0), Model still holding -> FP (pending OBD fall at rel=250ms)
-        rec.record(makeScoredSnapshot(1250L, true, "REGEN_DECEL", 0, false, false), wall + 250L);
+        rec.record(makeScoredSnapshot(1250L, true, "REGEN_DECEL", 0, false, false, 2, 2), wall + 250L);
         // Tick 5 (t=1330): Model turns OFF -> TN, release lag = 330 - 250 = +80 ms!
-        rec.record(makeScoredSnapshot(1330L, false, "OFF", 0, false, false), wall + 330L);
+        rec.record(makeScoredSnapshot(1330L, false, "OFF", 0, false, false, 2, 2), wall + 330L);
 
         TelemetryRecorder.ScoreSnapshot sc = rec.scoreSnapshot();
         eq("6 buffered rows", Integer.valueOf(6), Integer.valueOf(sc.bufferedRows));
@@ -409,22 +632,33 @@ public final class TestMain {
         String csv = rec.toCsvString();
         String[] lines = csv.trim().split("\n");
         eq("CSV has header + 6 data rows", Integer.valueOf(7), Integer.valueOf(lines.length));
-        eq("CSV header includes obd_lamp_raw", Boolean.TRUE, Boolean.valueOf(lines[0].contains("obd_lamp_raw")));
-        eq("CSV row 3 records REGEN_DECEL and raw 36",
-                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].contains(",36,1,0")));
+        eq("CSV header includes inferred_regen_level,hev_regen_raw",
+                Boolean.TRUE, Boolean.valueOf(lines[0].endsWith("inferred_regen_level,hev_regen_raw")));
+        eq("CSV row 3 records REGEN_DECEL, raw 36, L2, hev=2",
+                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].endsWith(",36,1,0,2,2")));
 
-        String summary = rec.buildSummaryReport(IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)");
+        String summary = rec.buildSummaryReport(
+                IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)", "OK (20Hz)", "EV_RECUP_LEVEL=2 | diff=1");
         eq("Summary includes confusion matrix",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")));
+        eq("Summary includes external MARK #1 and CoastRegenEst transitions",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("MARK #1") && summary.contains("CoastRegenEst: L1 -> L2")));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(
-            long tMs, boolean modelLit, String modelSrc, int obdRaw, boolean obdLit, boolean pedalBit) {
+            long tMs,
+            boolean modelLit,
+            String modelSrc,
+            int obdRaw,
+            boolean obdLit,
+            boolean pedalBit,
+            int inferredRegen,
+            int hevRaw) {
         BrakeEvaluator.ObdSample obd = new BrakeEvaluator.ObdSample(true, "BLE", tMs - 10L, obdRaw, obdLit, pedalBit);
         return new BrakeEvaluator.Snapshot(
                 tMs,
                 obdLit,
-                obdLit ? "OBD_BLE:REGEN(36)" : "OBD_BLE:OFF(0)",
+                obdLit ? "OBD_REGEN[36]" : "OBD_OFF",
                 modelLit,
                 modelSrc,
                 Float.valueOf(0.0f),
@@ -438,7 +672,9 @@ public final class TestMain {
                 Float.valueOf(72.0f),
                 obd,
                 true,
-                false);
+                false,
+                inferredRegen,
+                hevRaw);
     }
 
     private static void testUsbExporterMountsAndAtomicWrite() throws Exception {
@@ -456,25 +692,28 @@ public final class TestMain {
         List<String> mounts = UsbExporter.parseUsbMountPoints(mountedProcMounts);
         eq("prefers /storage/usb0 ahead of /mnt/media_rw/usb0", "/storage/usb0", mounts.get(0));
 
-        File tmpRoot = Files.createTempDirectory("brake-usb-v3").toFile();
+        File tmpRoot = Files.createTempDirectory("brake-usb-v4").toFile();
         try {
             File fakeUsb0 = new File(tmpRoot, "usb0");
             fakeUsb0.mkdirs();
 
             UsbExporter.ExportResult emptyRes = UsbExporter.exportToDirectories(
-                    "a,b\n1,2\n", "summary\n", Collections.<String>emptyList(), "BrakeIndicator");
+                    "a,b\n1,2\n", "summary\n", "probe\n", Collections.<String>emptyList(), "BrakeIndicator");
             eq("empty mounts returns ok=false", Boolean.FALSE, Boolean.valueOf(emptyRes.ok));
 
             UsbExporter.ExportResult okRes = UsbExporter.exportToDirectories(
                     "elapsed_ms,obd_lamp_lit\n0,1\n",
                     "=== Summary ===\n",
+                    "=== Gen5W HEVFlag Probe ===\n",
                     Arrays.asList(fakeUsb0.getAbsolutePath()),
                     "BrakeIndicator");
-            eq("export dataset+summary succeeds", Boolean.TRUE, Boolean.valueOf(okRes.ok));
+            eq("export dataset+summary+probe succeeds", Boolean.TRUE, Boolean.valueOf(okRes.ok));
             eq("CSV file written", Boolean.TRUE,
                     Boolean.valueOf(okRes.csvPath != null && new File(okRes.csvPath).isFile()));
             eq("Summary file written", Boolean.TRUE,
                     Boolean.valueOf(okRes.summaryPath != null && new File(okRes.summaryPath).isFile()));
+            eq("HEV probe file written", Boolean.TRUE,
+                    Boolean.valueOf(okRes.hevProbePath != null && new File(okRes.hevProbePath).isFile()));
             // Ensure no leftover .part files remain after atomic rename
             String[] names = new File(fakeUsb0, "BrakeIndicator").list();
             boolean anyPart = false;

@@ -1,12 +1,12 @@
 {
   "id": "brake-indicator-gen5w",
   "name": "Brake Light Indicator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "hmgapi": ">=1.0.0",
   "authors": ["Kyle"],
   "license": "AGPL-3.0",
   "repo": "https://github.com/lemoyneiv/brake-indicator-gen5w",
-  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units using HMG-API built-in vehicle readings and optional OBD-II ground-truth brake lamp telemetry (@gen5w_ble direct BLE + 127.0.0.1:35000 fallback) with synchronized USB CSV dataset export.",
+  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units using decoupled 20 Hz HMG-API vehicle readings, optional OBD-II ground-truth brake lamp telemetry (@gen5w_ble direct BLE + 127.0.0.1:35000 fallback), coasting + HEVFlag regen-level detection, and synchronized USB dataset export.",
   "live": true,
   "apps": [
     {

@@ -67,12 +67,23 @@ public final class UsbExporter {
         public final boolean ok;
         public final String csvPath;
         public final String summaryPath;
+        public final String hevProbePath;
         public final String errorMessage;
 
         public ExportResult(boolean ok, String csvPath, String summaryPath, String errorMessage) {
+            this(ok, csvPath, summaryPath, null, errorMessage);
+        }
+
+        public ExportResult(
+                boolean ok,
+                String csvPath,
+                String summaryPath,
+                String hevProbePath,
+                String errorMessage) {
             this.ok = ok;
             this.csvPath = csvPath;
             this.summaryPath = summaryPath;
+            this.hevProbePath = hevProbePath;
             this.errorMessage = errorMessage;
         }
     }
@@ -82,6 +93,14 @@ public final class UsbExporter {
     public static ExportResult exportDatasetAndSummary(
             String csvContent,
             String summaryContent,
+            List<String> extraUsbFolders) {
+        return exportDatasetAndSummary(csvContent, summaryContent, null, extraUsbFolders);
+    }
+
+    public static ExportResult exportDatasetAndSummary(
+            String csvContent,
+            String summaryContent,
+            String hevProbeContent,
             List<String> extraUsbFolders) {
         Set<String> roots = new LinkedHashSet<String>();
         if (extraUsbFolders != null) {
@@ -100,7 +119,6 @@ public final class UsbExporter {
         List<String> mountedUsb = parseUsbMountPoints(mountsText);
         roots.addAll(mountedUsb);
 
-        // Include direct /storage/usb* candidates only if /proc/mounts could not be read
         if (mountsText.isEmpty()) {
             for (int i = 0; i < DIRECT_USB_CANDIDATES.length; i++) {
                 File dir = new File(DIRECT_USB_CANDIDATES[i]);
@@ -110,7 +128,7 @@ public final class UsbExporter {
             }
         }
 
-        return exportToDirectories(csvContent, summaryContent, new ArrayList<String>(roots), SUBFOLDER);
+        return exportToDirectories(csvContent, summaryContent, hevProbeContent, new ArrayList<String>(roots), SUBFOLDER);
     }
 
     public static ExportResult exportToDirectories(
@@ -118,18 +136,32 @@ public final class UsbExporter {
             String summaryContent,
             List<String> candidateMountRoots,
             String subfolderName) {
+        return exportToDirectories(csvContent, summaryContent, null, candidateMountRoots, subfolderName);
+    }
+
+    public static ExportResult exportToDirectories(
+            String csvContent,
+            String summaryContent,
+            String hevProbeContent,
+            List<String> candidateMountRoots,
+            String subfolderName) {
         byte[] csvBytes;
         byte[] summaryBytes;
+        byte[] probeBytes = null;
         try {
             csvBytes = (csvContent == null ? "" : csvContent).getBytes("UTF-8");
             summaryBytes = (summaryContent == null ? "" : summaryContent).getBytes("UTF-8");
+            if (hevProbeContent != null && !hevProbeContent.isEmpty()) {
+                probeBytes = hevProbeContent.getBytes("UTF-8");
+            }
         } catch (Exception e) {
-            return new ExportResult(false, null, null, "UTF-8 encoding failed: " + e.getMessage());
+            return new ExportResult(false, null, null, null, "UTF-8 encoding failed: " + e.getMessage());
         }
 
         if (candidateMountRoots == null || candidateMountRoots.isEmpty()) {
             return new ExportResult(
                     false,
+                    null,
                     null,
                     null,
                     "No mounted USB stick found. Insert a FAT32/exFAT USB drive (ensure USB port is in host mode).");
@@ -138,6 +170,7 @@ public final class UsbExporter {
         String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
         String desiredCsv = "brake-dataset-" + stamp + ".csv";
         String desiredSummary = "brake-summary-" + stamp + ".txt";
+        String desiredProbe = "hev-regen-probe-" + stamp + ".txt";
         String lastErr = "unable to write to USB mount";
 
         for (String mountRoot : candidateMountRoots) {
@@ -159,12 +192,16 @@ public final class UsbExporter {
 
                 File csvOut = writeBytesAtomically(targetDir, desiredCsv, csvBytes);
                 File sumOut = writeBytesAtomically(targetDir, desiredSummary, summaryBytes);
+                File probeOut = (probeBytes != null)
+                        ? writeBytesAtomically(targetDir, desiredProbe, probeBytes)
+                        : null;
 
                 if (csvOut.isFile() && csvOut.length() > 0) {
                     return new ExportResult(
                             true,
                             csvOut.getAbsolutePath(),
                             sumOut.getAbsolutePath(),
+                            probeOut != null ? probeOut.getAbsolutePath() : null,
                             null);
                 }
             } catch (Exception e) {
@@ -173,7 +210,7 @@ public final class UsbExporter {
             }
         }
 
-        return new ExportResult(false, null, null, "USB write failed (" + lastErr + ").");
+        return new ExportResult(false, null, null, null, "USB write failed (" + lastErr + ").");
     }
 
     public static File writeBytesAtomically(File targetDir, String baseFileName, byte[] data) throws IOException {
@@ -226,10 +263,6 @@ public final class UsbExporter {
         }
     }
 
-    /**
-     * Parses `/proc/mounts` text and returns mounted external USB root directories,
-     * preferring `/storage/usb*` ahead of `/mnt/media_rw/usb*`.
-     */
     public static List<String> parseUsbMountPoints(String procMountsText) {
         Set<String> storageMounts = new LinkedHashSet<String>();
         Set<String> rawMounts = new LinkedHashSet<String>();

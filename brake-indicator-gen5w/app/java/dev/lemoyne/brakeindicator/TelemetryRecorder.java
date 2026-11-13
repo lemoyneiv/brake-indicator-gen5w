@@ -9,14 +9,14 @@ import java.util.TreeMap;
 /**
  * Bounded, zero-flash-write RAM dataset recorder and live Model-vs-OBD accuracy scorer.
  *
- * Stores up to {@link #CAPACITY} synchronized HMG-API + OBD ground-truth rows (~30 minutes at 20 Hz,
- * downsampled automatically to 1 Hz while parked idle) in compact primitive arrays (~1.7 MB RAM)
- * so Dalvik GC experiences zero object churn during long calibration drives.
+ * Stores up to {@link #CAPACITY} synchronized HMG-API + OBD ground-truth + Regen Level rows
+ * (~30 minutes at 20 Hz, downsampled automatically to 1 Hz while parked idle) in compact
+ * primitive arrays (~1.8 MB RAM) so Dalvik GC experiences zero object churn during drives.
  */
 public final class TelemetryRecorder {
 
     public static final int CAPACITY = 36000;
-    private static final int TRANSITION_LOG_CAP = 80;
+    private static final int TRANSITION_LOG_CAP = 100;
     private static final long MAX_SCORING_OBD_AGE_MS = 450L;
     private static final long IDLE_PARK_DOWNSAMPLE_MS = 1000L;
     private static final long EDGE_MATCH_WINDOW_MS = 1400L;
@@ -123,6 +123,8 @@ public final class TelemetryRecorder {
     private final byte[] transportCode = new byte[CAPACITY];
     private final short[] obdAgeMs = new short[CAPACITY];
     private final short[] obdLampRaw = new short[CAPACITY];
+    private final byte[] inferredRegen = new byte[CAPACITY];
+    private final short[] hevRegenRaw = new short[CAPACITY];
 
     private int head;
     private int size;
@@ -146,6 +148,7 @@ public final class TelemetryRecorder {
     private boolean prevObdFresh;
     private boolean prevObdLit;
     private int prevObdRaw = -1;
+    private int prevInferredRegen = -1;
 
     private long lastModelRiseMs = -1L;
     private long lastModelFallMs = -1L;
@@ -181,6 +184,7 @@ public final class TelemetryRecorder {
         prevObdFresh = false;
         prevObdLit = false;
         prevObdRaw = -1;
+        prevInferredRegen = -1;
         lastModelRiseMs = -1L;
         lastModelFallMs = -1L;
         pendingObdRiseMs = -1L;
@@ -192,6 +196,18 @@ public final class TelemetryRecorder {
         rawCodeCounts.clear();
         transitionHead = 0;
         transitionSize = 0;
+    }
+
+    public synchronized void recordExternalEvent(long nowMonoMs, String eventText) {
+        if (eventText == null || eventText.isEmpty()) return;
+        if (startElapsedMs < 0L && nowMonoMs > 0L) {
+            startElapsedMs = nowMonoMs;
+        }
+        long relMs = (startElapsedMs >= 0L && nowMonoMs >= startElapsedMs)
+                ? (nowMonoMs - startElapsedMs)
+                : Math.max(0L, lastStoredElapsedMs);
+        pushTransitionLine(String.format(Locale.US, "[%7.2fs] %s",
+                Float.valueOf(relMs / 1000.0f), eventText));
     }
 
     public synchronized void record(BrakeEvaluator.Snapshot snap, long currentWallTimeMs) {
@@ -272,6 +288,10 @@ public final class TelemetryRecorder {
         transportCode[idx] = encodeTransport(obd.transport);
         obdAgeMs[idx] = (short) (age < 0L ? -1 : Math.min(32000L, age));
         obdLampRaw[idx] = (short) (snap.obdFresh ? obd.rawCode : -1);
+        inferredRegen[idx] = (byte) (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel <= 10
+                ? snap.inferredRegenLevel : -1);
+        hevRegenRaw[idx] = (short) (snap.hevRegenRaw >= 0
+                ? Math.min(32000, snap.hevRegenRaw) : -1);
 
         lastStoredElapsedMs = relMs;
         totalRecordedRows++;
@@ -315,11 +335,13 @@ public final class TelemetryRecorder {
             prevObdFresh = snap.obdFresh;
             prevObdLit = obdLit;
             prevObdRaw = obdRaw;
+            prevInferredRegen = snap.inferredRegenLevel;
             return;
         }
 
         boolean modelChanged = (modelLit != prevModelLit) || !snap.modelSource.equals(prevModelSource);
         boolean obdChanged = (snap.obdFresh != prevObdFresh) || (snap.obdFresh && obdRaw != prevObdRaw);
+        boolean regenChanged = (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel != prevInferredRegen);
 
         // Edge lag Pairing (signed: positive = HMG-API model lagged behind real OBD)
         if (modelLit && !prevModelLit) {
@@ -358,8 +380,19 @@ public final class TelemetryRecorder {
             }
         }
 
+        if (regenChanged) {
+            String fromLbl = prevInferredRegen < 0 ? "?" : ("L" + prevInferredRegen);
+            pushTransitionLine(String.format(Locale.US,
+                    "[%7.2fs] CoastRegenEst: %s -> L%d (decel=%.2f m/s^2 @ %s km/h)",
+                    Float.valueOf(relMs / 1000.0f),
+                    fromLbl,
+                    Integer.valueOf(snap.inferredRegenLevel),
+                    Float.valueOf(snap.decelMps2),
+                    fmtFloat(unboxFloat(snap.speedKmh), "%.1f")));
+        }
+
         if (modelChanged || obdChanged) {
-            StringBuilder line = new StringBuilder(112);
+            StringBuilder line = new StringBuilder(120);
             line.append(String.format(Locale.US, "[%7.2fs] ", Float.valueOf(relMs / 1000.0f)));
             if (snap.obdFresh) {
                 line.append("OBD=").append(obdLit ? "ON" : "OFF")
@@ -374,6 +407,9 @@ public final class TelemetryRecorder {
                     .append(" decel=").append(String.format(Locale.US, "%.2f", Float.valueOf(snap.decelMps2)))
                     .append(" prsr=").append(fmtFloat(unboxFloat(snap.brakePressure), "%.1f"))
                     .append(" acc=").append(fmtFloat(unboxFloat(snap.accelPedal), "%.1f"));
+            if (snap.inferredRegenLevel >= 0) {
+                line.append(" reg=L").append(snap.inferredRegenLevel);
+            }
             pushTransitionLine(line.toString());
         }
 
@@ -382,6 +418,7 @@ public final class TelemetryRecorder {
         prevObdFresh = snap.obdFresh;
         prevObdLit = obdLit;
         prevObdRaw = obdRaw;
+        prevInferredRegen = snap.inferredRegenLevel;
     }
 
     private void pushTransitionLine(String s) {
@@ -416,7 +453,7 @@ public final class TelemetryRecorder {
 
     public synchronized String recentTransitionsText(int maxLines) {
         if (transitionSize == 0) {
-            return "No brake-lamp or HMG-API model transitions recorded yet.";
+            return "No brake-lamp, regen-level, or HMG-API transitions recorded yet.";
         }
         int count = Math.min(transitionSize, Math.max(1, maxLines));
         int startOffset = transitionSize - count;
@@ -430,11 +467,11 @@ public final class TelemetryRecorder {
     }
 
     public synchronized String toCsvString() {
-        StringBuilder sb = new StringBuilder(Math.max(256, size * 88));
+        StringBuilder sb = new StringBuilder(Math.max(256, size * 96));
         sb.append("elapsed_ms,wall_iso,hmg_speed_kmh,hmg_decel_mps2,hmg_brake_pressure,")
           .append("hmg_pedal_accel,hmg_steering_deg,hmg_gear_park,hmg_parking_brake,hmg_moving,")
           .append("hmg_hv_soc,model_lit,model_source,icon_lit,obd_connected,obd_transport,")
-          .append("obd_age_ms,obd_lamp_raw,obd_lamp_lit,obd_pedal_bit\n");
+          .append("obd_age_ms,obd_lamp_raw,obd_lamp_lit,obd_pedal_bit,inferred_regen_level,hev_regen_raw\n");
 
         SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US);
         Date d = new Date();
@@ -445,6 +482,8 @@ public final class TelemetryRecorder {
             int k = flagKnownMask[idx] & 0xFF;
             short raw = obdLampRaw[idx];
             boolean hasObdVal = raw >= 0;
+            byte infReg = inferredRegen[idx];
+            short hevRaw = hevRegenRaw[idx];
 
             d.setTime(wallTimeMs[idx]);
             sb.append(elapsedMs[idx]).append(',')
@@ -466,15 +505,25 @@ public final class TelemetryRecorder {
               .append(obdAgeMs[idx] >= 0 ? Integer.toString(obdAgeMs[idx]) : "").append(',')
               .append(hasObdVal ? Integer.toString(raw) : "").append(',')
               .append(hasObdVal ? ((f & FLAG_OBD_LIT) != 0 ? "1" : "0") : "").append(',')
-              .append(hasObdVal ? ((f & FLAG_OBD_PEDAL) != 0 ? "1" : "0") : "").append('\n');
+              .append(hasObdVal ? ((f & FLAG_OBD_PEDAL) != 0 ? "1" : "0") : "").append(',')
+              .append(infReg >= 0 ? Integer.toString(infReg) : "").append(',')
+              .append(hevRaw >= 0 ? Integer.toString(hevRaw) : "").append('\n');
         }
         return sb.toString();
     }
 
     public synchronized String buildSummaryReport(IndicatorConfig cfg, String obdStatusSummary) {
+        return buildSummaryReport(cfg, obdStatusSummary, null, null);
+    }
+
+    public synchronized String buildSummaryReport(
+            IndicatorConfig cfg,
+            String obdStatusSummary,
+            String hmgStatusSummary,
+            String hevProbeCompactSummary) {
         ScoreSnapshot sc = scoreSnapshot();
-        StringBuilder sb = new StringBuilder(2048);
-        sb.append("=== Brake Light Indicator v0.3.0 Calibration Summary ===\n");
+        StringBuilder sb = new StringBuilder(2304);
+        sb.append("=== Brake Light Indicator v0.4.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
@@ -485,7 +534,13 @@ public final class TelemetryRecorder {
               .append(", decel=").append(cfg.decelThresholdMps2).append(" m/s^2")
               .append(", standstillHold=").append(cfg.standstillHold).append('\n');
         }
+        if (hmgStatusSummary != null) {
+            sb.append("HMG-API Session     : ").append(hmgStatusSummary).append('\n');
+        }
         sb.append("OBD Session Status  : ").append(obdStatusSummary == null ? "-" : obdStatusSummary).append('\n');
+        if (hevProbeCompactSummary != null) {
+            sb.append("HEV Regen Probe     : ").append(hevProbeCompactSummary).append('\n');
+        }
         sb.append("Buffered CSV Rows   : ").append(sc.bufferedRows)
           .append(" / ").append(CAPACITY)
           .append(" (total recorded: ").append(sc.totalRecordedRows).append(")\n\n");

@@ -1,7 +1,5 @@
-# Draft a release of brake-indicator-gen5w from a version tag (e.g. v0.1.0) when
-# MOD_KEY and MOD_KEY_PUB secrets are configured. If releases are signed locally via
-# ./build.sh and uploaded with gh release create, this workflow skips cleanly when
-# MOD_KEY is not set in repository secrets.
+# Build, test, sign, and publish a GitHub Release of brake-indicator-gen5w from a version tag (e.g. v0.1.0).
+# Uses repository secrets MOD_KEY, MOD_KEY_PUB, and optional APP_KEY_P12 (base64-encoded).
 name: Release
 
 on:
@@ -30,14 +28,13 @@ jobs:
             echo "has_key=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_key=false" >> "$GITHUB_OUTPUT"
-            echo "No MOD_KEY secret configured; skipping CI signing (use ./build.sh locally)." >> "$GITHUB_STEP_SUMMARY"
+            echo "No MOD_KEY secret configured; skipping CI release." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   release:
     needs: check-secrets
     if: needs.check-secrets.outputs.has_key == 'true'
     runs-on: ubuntu-24.04
-    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,28 +105,45 @@ jobs:
           echo "HMGAPI_SDK=$S" >> "$GITHUB_ENV"
           pip install --require-hashes -r "$S/requirements.txt"
 
-      - name: Build and ship packages
+      - name: Build and sign installable packages
         env:
           MOD_KEY: ${{ secrets.MOD_KEY }}
           MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+          APP_KEY_P12: ${{ secrets.APP_KEY_P12 }}
         run: |
           umask 077
           k="$RUNNER_TEMP/keys"
           mkdir -p "$k"
           echo "$MOD_KEY" | base64 -d > "$k/author.key"
           echo "$MOD_KEY_PUB" | base64 -d > "$k/author.key.pub"
+          if [ -n "$APP_KEY_P12" ]; then
+            echo "$APP_KEY_P12" | base64 -d > "$k/brake-indicator-app.p12"
+            export HMGAPI_APP_KEY="$k/brake-indicator-app.p12"
+          fi
+          UUID=$(java -cp "$HMGAPI_SDK/lib/hmgapi-engine.jar" hmgapi.engine.Signing uuid "$k/author.key.pub")
+          echo "AUTHOR_UUID=$UUID" >> "$GITHUB_ENV"
           umask 022
           HMGAPI_KEY="$k/author.key" sh ./build.sh
           rm -rf "$k"
 
-      - name: Draft release
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$MOD/mod.json")
           notes="$RUNNER_TEMP/notes.md"
-          { echo "$name $VERSION"
-            echo
-            echo '```'; cat dist/SHA256SUMS; echo '```'; } > "$notes"
+          cat > "$notes" <<EOF
+          **$name $VERSION** for Hyundai / Kia / Genesis Gen5W head units (signed with author key \`$AUTHOR_UUID\`).
+
+          ### Install
+          - **With HMG-API (USB Updater):** Unzip \`${MOD}-v${VERSION}-hmgapi-usb.zip\` to the root of a FAT32/exFAT USB drive (\`HMGAPI/updates/${MOD}-v${VERSION}.zip\`) and install via **HMG-API → Updates**.
+          - **With NEMESIS (USB Auto-Prompt):** Unzip \`${MOD}-v${VERSION}-nemesis-usb.zip\` to the root of a USB drive (\`NEMESIS.data\` and \`packages/hmgapi.${MOD}.zip\`) and plug into the head unit once Android is up. Tapping **Launch** in NEMESIS Manager opens **Brake Indicator** directly.
+
+          ### Checksums (\`SHA256SUMS\`)
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          sed -i 's/^          //' "$notes"
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease --latest=false" ;; esac
-          gh release create "$GITHUB_REF_NAME" --draft $pre --title "$name $VERSION" --notes-file "$notes" dist/*.zip dist/SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" $pre --title "$name $VERSION" --notes-file "$notes" dist/*.zip dist/SHA256SUMS

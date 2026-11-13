@@ -360,7 +360,7 @@ public final class HevRegenProbe {
         if (s == null || s.isEmpty()) return null;
         try {
             int v = Integer.parseInt(s.trim());
-            if (v < 0 || v == 255 || v == 65535 || v > 32000) {
+            if (v < 0 || v == 250 || v == 255 || v == 65535 || v > 32000) {
                 return null;
             }
             return Integer.valueOf(v);

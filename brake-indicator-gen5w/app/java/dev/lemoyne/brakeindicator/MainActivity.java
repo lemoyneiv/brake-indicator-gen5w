@@ -24,13 +24,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Gen5W landscape dashboard for Brake Light Indicator v0.4:
+ * Gen5W landscape dashboard for Brake Light Indicator v0.5:
  *  - Left card: Live brake-lamp preview, configurable OBD vs HMG-API icon mode toggle,
- *    built-in HMG-API 20 Hz readings vs real OBD (`770`/`22BC06`) ground truth, coasting +
- *    HEVFlag/USM regen-level detection, one-tap `Mark Regen` paddle baseline button, and
- *    atomic 3-file USB export (`brake-dataset`, `brake-summary`, `hev-regen-probe`).
+ *    built-in HMG-API readings vs real OBD (`770`/`22BC06`) ground truth, automatic
+ *    `L0 / L1 / L2 / L3 / i-Pedal` regen-mode detection, instant `Mark Log` bookmark
+ *    button, and atomic USB export (`brake-dataset` + `brake-summary`).
  *  - Right card: `@gen5w_ble` direct BLE scanner pairing (with automatic `127.0.0.1:35000`
- *    loopback fallback) and live discrete transition + HEV signal diff log.
+ *    loopback fallback) and live discrete transition log.
  */
 public final class MainActivity extends Activity
         implements BrakeEngine.StateListener, ObdBrakeClient.Listener {
@@ -127,7 +127,7 @@ public final class MainActivity extends Activity
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator v0.4");
+        title.setText("Brake Light Indicator v0.5");
         title.setTextColor(TEXT_PRIMARY);
         title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -252,16 +252,18 @@ public final class MainActivity extends Activity
         b1.rightMargin = 8;
         actions.addView(testBtn, b1);
 
-        Button markRegenBtn = styledButton("Mark Regen", new View.OnClickListener() {
+        Button markLogBtn = styledButton("Mark Log", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                markRegenBaselineAsync();
+                String msg = engine.markDriveEvent();
+                actionNoticeText.setText("Bookmarked in transition log: " + msg);
+                transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
             }
         });
         LinearLayout.LayoutParams bMark = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.05f);
         bMark.rightMargin = 8;
-        actions.addView(markRegenBtn, bMark);
+        actions.addView(markLogBtn, bMark);
 
         Button clearBtn = styledButton("Clear", new View.OnClickListener() {
             @Override
@@ -292,7 +294,7 @@ public final class MainActivity extends Activity
         actionNoticeText.setTextColor(ACCENT_TEAL);
         actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
         actionNoticeText.setPadding(2, 6, 2, 0);
-        actionNoticeText.setText("Exports CSV + summary + HEV regen probe to <usb>/BrakeIndicator/.");
+        actionNoticeText.setText("Exports CSV + calibration summary to <usb>/BrakeIndicator/.");
         leftCard.addView(actionNoticeText);
 
         columns.addView(leftCard, leftLp);
@@ -439,10 +441,10 @@ public final class MainActivity extends Activity
           .append(fmtObjFloat(snap.brakePressure, "%.1f")).append("  |  accel=")
           .append(fmtObjFloat(snap.accelPedal, "%.1f")).append("%\n");
 
-        sb.append("Regen (Coast / HEV)   : ")
-          .append(snap.inferredRegenLevel >= 0 ? ("L" + snap.inferredRegenLevel) : "learning...")
-          .append("  |  ")
-          .append(engine.getHevProbe().compactUiSummary())
+        sb.append("Detected Regen Mode   : ")
+          .append(snap.inferredRegenLevel >= 0
+                  ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)
+                  : "learning (coast >= 21 km/h)")
           .append('\n');
 
         sb.append("Steer / Park / HV SOC : ")
@@ -519,25 +521,6 @@ public final class MainActivity extends Activity
         transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
     }
 
-    private void markRegenBaselineAsync() {
-        actionNoticeText.setText("Snapshotting HEVFlag / USM / CLUSTER baseline...");
-        Thread worker = new Thread("BrakeMarkRegen") {
-            @Override
-            public void run() {
-                final String msg = engine.markRegenBaseline();
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        actionNoticeText.setText(msg + " — click paddle now to watch live diffs!");
-                        transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
-                    }
-                });
-            }
-        };
-        worker.setDaemon(true);
-        worker.start();
-    }
-
     private void cycleObdMode() {
         Thread worker = new Thread("BrakeModeCycle") {
             @Override
@@ -557,7 +540,7 @@ public final class MainActivity extends Activity
     }
 
     private void exportDatasetToUsb() {
-        actionNoticeText.setText("Exporting CSV + summary + HEV regen probe to USB...");
+        actionNoticeText.setText("Exporting CSV + calibration summary to USB...");
         Thread worker = new Thread("BrakeUsbExport") {
             @Override
             public void run() {
@@ -571,7 +554,7 @@ public final class MainActivity extends Activity
                     @Override
                     public void run() {
                         if (res.ok) {
-                            actionNoticeText.setText("Saved CSV + HEV regen report: " + res.csvPath);
+                            actionNoticeText.setText("Saved CSV + summary: " + res.csvPath);
                         } else {
                             actionNoticeText.setText(res.errorMessage);
                         }

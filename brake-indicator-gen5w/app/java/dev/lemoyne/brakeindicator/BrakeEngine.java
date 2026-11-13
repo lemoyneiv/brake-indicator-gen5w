@@ -14,19 +14,34 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * In-process vehicle & OBD-II evaluation engine shared by {@link OverlayService}
  * and {@link MainActivity}.
  *
- * Polls HMG-API's built-in `Vehicle` readings at 20 Hz (50 ms), fuses or compares them
- * against {@link ObdBrakeClient} (`@gen5w_ble` primary -> `127.0.0.1:35000` fallback),
- * records a 30-minute synchronized CSV dataset in RAM, and exports to removable USB.
+ * Polls HMG-API's built-in `Vehicle` readings at 20 Hz (50 ms) (or 650 ms on legacy
+ * KitKat `Hub`), aligns `-dv/dt` and `L0..i-Pedal` detection to exact HMG-API poll
+ * timestamps, fuses or compares them against {@link ObdBrakeClient} (`@gen5w_ble`
+ * primary -> `127.0.0.1:35000` fallback), records a 30-minute synchronized CSV dataset
+ * in RAM, and exports to removable USB.
  */
 public final class BrakeEngine {
 
     public interface StateListener {
         void onEngineState(IndicatorConfig config, BrakeEvaluator.Snapshot snapshot, boolean hmgConnected);
+    }
+
+    private static final class HmgPollSnapshot {
+        final Map<String, String> readings;
+        final long monoMs;
+        final boolean legacyStall;
+
+        HmgPollSnapshot(Map<String, String> readings, long monoMs, boolean legacyStall) {
+            this.readings = readings == null ? Collections.<String, String>emptyMap() : readings;
+            this.monoMs = monoMs;
+            this.legacyStall = legacyStall;
+        }
     }
 
     private static final String PREFS_NAME = "brake_obd_pairing";
@@ -49,7 +64,6 @@ public final class BrakeEngine {
     private static final long LEGACY_HUB_POLL_MS = 650L;
     private static final long HMG_RETRY_MS = 250L;
     private static final long HMG_FRESH_MAX_MS = 1800L;
-    private static final long HEV_WATCH_INTERVAL_MS = 1000L;
     private static final long SETTINGS_REFRESH_MS = 3000L;
 
     private static BrakeEngine sInstance;
@@ -68,13 +82,13 @@ public final class BrakeEngine {
     private final ObdBrakeClient obdClient;
     private final List<StateListener> listeners = new CopyOnWriteArrayList<StateListener>();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicInteger markSeq = new AtomicInteger(0);
 
     private volatile IndicatorConfig config = IndicatorConfig.defaults();
     private volatile BrakeEvaluator.Snapshot latestSnapshot;
-    private volatile Map<String, String> latestHmgReadings = Collections.emptyMap();
-    private volatile long latestHmgMonoMs = -1L;
+    private volatile HmgPollSnapshot latestHmgPoll =
+            new HmgPollSnapshot(Collections.<String, String>emptyMap(), -1L, false);
     private volatile boolean hmgConnected;
-    private volatile boolean hmgLegacyStall;
     private volatile long testUntilMs;
     private volatile boolean forceSettingsReload = true;
 
@@ -117,15 +131,6 @@ public final class BrakeEngine {
             }
         };
         this.obdClient = new ObdBrakeClient(store);
-        this.hevProbe.setChangeListener(new HevRegenProbe.ChangeListener() {
-            @Override
-            public void onHevSignalChanged(String key, String oldVal, String newVal, boolean regenKeywordMatch) {
-                recorder.recordExternalEvent(
-                        obdClient.monotonicMs(),
-                        "HEV " + key + ": " + oldVal + " -> " + newVal
-                                + (regenKeywordMatch ? " [CANDIDATE]" : ""));
-            }
-        });
     }
 
     public void ensureStarted() {
@@ -140,15 +145,6 @@ public final class BrakeEngine {
         };
         hmgThread.setDaemon(true);
         hmgThread.start();
-
-        Thread hevThread = new Thread("BrakeHevWatch") {
-            @Override
-            public void run() {
-                hevWatchLoop();
-            }
-        };
-        hevThread.setDaemon(true);
-        hevThread.start();
 
         Thread evalThread = new Thread("BrakeEvalLoop") {
             @Override
@@ -200,13 +196,25 @@ public final class BrakeEngine {
         if (!hmgConnected) {
             return "WAITING";
         }
-        return hmgLegacyStall ? "OK (legacy Hub - update HMG-API)" : "OK (20Hz)";
+        return latestHmgPoll.legacyStall ? "OK (legacy Hub - update HMG-API)" : "OK (20Hz)";
+    }
+
+    public String markDriveEvent() {
+        int n = markSeq.incrementAndGet();
+        BrakeEvaluator.Snapshot snap = latestSnapshot;
+        String reg = snap != null
+                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)
+                : "?";
+        String spd = (snap != null && snap.speedKmh != null)
+                ? String.format(java.util.Locale.US, "%.1f km/h", snap.speedKmh)
+                : "- km/h";
+        String msg = "MARK #" + n + " (regen=" + reg + ", speed=" + spd + ")";
+        recorder.recordExternalEvent(obdClient.monotonicMs(), msg);
+        return msg;
     }
 
     public String markRegenBaseline() {
-        String msg = hevProbe.markBaseline();
-        recorder.recordExternalEvent(obdClient.monotonicMs(), msg);
-        return msg;
+        return markDriveEvent();
     }
 
     public void triggerManualTest(long durationMs) {
@@ -253,19 +261,18 @@ public final class BrakeEngine {
     }
 
     public UsbExporter.ExportResult exportDatasetToUsb() {
-        String hevReport = hevProbe.buildReport(true);
         String csv = recorder.toCsvString();
         String summary = recorder.buildSummaryReport(
                 config,
                 obdClient.getStatusSummary(),
                 getHmgStatusSummary(),
-                hevProbe.compactUiSummary());
+                null);
         List<String> extraFolders = null;
         try {
             extraFolders = HmgApi.connect().timeout(1500).usbFolders();
         } catch (Exception ignored) {
         }
-        return UsbExporter.exportDatasetAndSummary(csv, summary, hevReport, extraFolders);
+        return UsbExporter.exportDatasetAndSummary(csv, summary, null, extraFolders);
     }
 
     private void hmgPollLoop() {
@@ -286,9 +293,8 @@ public final class BrakeEngine {
 
                 HmgVehiclePoller.PollResult res = HmgVehiclePoller.readVehicle(VEHICLE_READINGS, 900, 90);
                 if (res.ok && !res.readings.isEmpty()) {
-                    latestHmgReadings = res.readings;
-                    latestHmgMonoMs = obdClient.monotonicMs();
-                    hmgLegacyStall = res.legacyHubStall;
+                    long pollAt = obdClient.monotonicMs();
+                    latestHmgPoll = new HmgPollSnapshot(res.readings, pollAt, res.legacyHubStall);
                     targetPeriodMs = res.legacyHubStall ? LEGACY_HUB_POLL_MS : EVAL_INTERVAL_MS;
                 } else {
                     targetPeriodMs = HMG_RETRY_MS;
@@ -308,44 +314,24 @@ public final class BrakeEngine {
         }
     }
 
-    private void hevWatchLoop() {
-        boolean first = true;
-        while (running.get()) {
-            long startMono = obdClient.monotonicMs();
-            try {
-                hevProbe.poll(first);
-                first = false;
-            } catch (Throwable ignored) {
-            }
-            long spent = obdClient.monotonicMs() - startMono;
-            long sleep = HEV_WATCH_INTERVAL_MS - spent;
-            if (sleep > 10L) {
-                try {
-                    Thread.sleep(sleep);
-                } catch (InterruptedException ie) {
-                    break;
-                }
-            }
-        }
-    }
-
     private void evalLoop() {
         while (running.get()) {
             long tickStartMono = obdClient.monotonicMs();
             try {
-                long hmgAt = latestHmgMonoMs;
+                HmgPollSnapshot hmgSnap = latestHmgPoll;
+                long hmgAt = hmgSnap.monoMs;
                 boolean okHmg = hmgAt > 0L
                         && (tickStartMono - hmgAt) >= 0L
                         && (tickStartMono - hmgAt) <= HMG_FRESH_MAX_MS
-                        && !latestHmgReadings.isEmpty();
+                        && !hmgSnap.readings.isEmpty();
                 hmgConnected = okHmg;
                 Map<String, String> readings = okHmg
-                        ? latestHmgReadings
+                        ? hmgSnap.readings
                         : Collections.<String, String>emptyMap();
+                long hmgSampleElapsedMs = okHmg ? hmgAt : -1L;
 
                 IndicatorConfig cfg = config;
                 BrakeEvaluator.ObdSample obd = obdClient.currentSample();
-                int hevRaw = hevProbe.getLatestDirectRegenRaw();
 
                 BrakeEvaluator.Input input = new BrakeEvaluator.Input(
                         tickStartMono,
@@ -359,7 +345,8 @@ public final class BrakeEngine {
                         BrakeEvaluator.parseReadingFloat(readings.get("hv.soc")),
                         obd,
                         testUntilMs,
-                        hevRaw);
+                        -1,
+                        hmgSampleElapsedMs);
 
                 BrakeEvaluator.Snapshot snap = evaluator.evaluate(cfg, input);
                 latestSnapshot = snap;

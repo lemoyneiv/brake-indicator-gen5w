@@ -23,14 +23,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.4.0:
+ * Host JVM unit tests for v0.5.0:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
- * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder, LNEX BVM02 exclusion, VIN/write safety)
+ * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
+ *   LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (@gen5w_ble direct BLE primary session + ALREADY_CONNECTED 127.0.0.1 loopback fallback)
- * - IndicatorConfig & BrakeEvaluator (100/250 ms cached HMG-API speed handling, L0..L3 coasting regen estimator,
- *   i-Pedal/SCC regen, standstill hold, ObdMode)
- * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, Mark Regen baseline, live paddle-click diff)
- * - TelemetryRecorder & UsbExporter (confusion matrix, regen columns, external events, 3-file atomic USB export)
+ * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
+ *   settled L0..L3 coasting chord + i-Pedal auto-detection, E-GMP R13-H regen hysteresis, standstill hold)
+ * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
+ * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
 public final class TestMain {
 
@@ -44,7 +45,8 @@ public final class TestMain {
         testObdBrakeClientBleAndLoopbackFallback();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
-        testBrakeEvaluatorCoastingRegenInference();
+        testBrakeEvaluatorLegacyHub650msPollAlignment();
+        testBrakeEvaluatorCoastingRegenAndIpedalInference();
         testBrakeEvaluatorStandstillHoldAndRelease();
         testHevRegenProbeSafetyAndBaselineDiff();
         testTelemetryRecorderScoringAndCsv();
@@ -141,26 +143,27 @@ public final class TestMain {
         Elm327BrakeProtocol.IgmpBrakeReading my25Off = Elm327BrakeProtocol.decodeIgmpBrakeResponse(my25OffResp);
         eq("MY25 8-byte OFF decoded", Boolean.TRUE, Boolean.valueOf(my25Off != null && !my25Off.brakeLampLit));
 
-        // 3. Pure Regen / Smart Cruise Control brake lamps ON without pedal (0x24 = 36 and 0x04 = 4)
-        String regen36Resp = "778100B62BC0670400003\r7782124000000000000\r";
-        Elm327BrakeProtocol.IgmpBrakeReading regen36 = Elm327BrakeProtocol.decodeIgmpBrakeResponse(regen36Resp);
-        eq("IGMP Regen 36 lit=true", Boolean.TRUE, Boolean.valueOf(regen36 != null && regen36.brakeLampLit));
-        eq("IGMP Regen 36 rawCode=36", Integer.valueOf(36), Integer.valueOf(regen36.rawCode));
-        eq("IGMP Regen 36 pedalBit=false", Boolean.FALSE, Boolean.valueOf(regen36.pedalBit));
+        // 3. Pure Regen / i-Pedal / SCC / Auto-Hold brake lamps ON without pedal (bit 0 = 0):
+        //    4 (0x04), 36 (0x24), 40 (0x28), 44 (0x2C) -> brakeLampLit=true, pedalBit=false
+        int[] pureRegenCodes = {4, 36, 40, 44};
+        for (int i = 0; i < pureRegenCodes.length; i++) {
+            int code = pureRegenCodes[i];
+            String hex = String.format("%02X", Integer.valueOf(code));
+            String resp = "778100B62BC0670400003\r77821" + hex + "000000000000\r";
+            Elm327BrakeProtocol.IgmpBrakeReading r = Elm327BrakeProtocol.decodeIgmpBrakeResponse(resp);
+            eq("IGMP Pure Regen/SCC code " + code + " lit=true, pedalBit=false",
+                    Boolean.TRUE, Boolean.valueOf(r != null && r.rawCode == code && r.brakeLampLit && !r.pedalBit));
+        }
 
-        String regen4Resp = "778100B62BC0670400003\r7782104000000000000\r";
-        Elm327BrakeProtocol.IgmpBrakeReading regen4 = Elm327BrakeProtocol.decodeIgmpBrakeResponse(regen4Resp);
-        eq("IGMP Regen 4 lit=true, pedalBit=false",
-                Boolean.TRUE, Boolean.valueOf(regen4 != null && regen4.brakeLampLit && !regen4.pedalBit));
-
-        // 4. Foot pedal / brake switch active codes: 40 (0x28), 41 (0x29), 44 (0x2C), 45 (0x2D)
-        int[] pedalCodes = {40, 41, 44, 45};
+        // 4. Physical foot-pedal switch active codes (bit 0 = 1):
+        //    37 (0x25), 41 (0x29), 45 (0x2D) -> brakeLampLit=true, pedalBit=true
+        int[] pedalCodes = {37, 41, 45};
         for (int i = 0; i < pedalCodes.length; i++) {
             int code = pedalCodes[i];
             String hex = String.format("%02X", Integer.valueOf(code));
             String resp = "778100B62BC0670400003\r77821" + hex + "000000000000\r";
             Elm327BrakeProtocol.IgmpBrakeReading r = Elm327BrakeProtocol.decodeIgmpBrakeResponse(resp);
-            eq("IGMP Pedal code " + code + " lit+pedalBit",
+            eq("IGMP Pedal switch code " + code + " lit=true, pedalBit=true",
                     Boolean.TRUE, Boolean.valueOf(r != null && r.rawCode == code && r.brakeLampLit && r.pedalBit));
         }
 
@@ -172,11 +175,11 @@ public final class TestMain {
         Elm327BrakeProtocol.PromptBuffer pb = new Elm327BrakeProtocol.PromptBuffer();
         List<String> c1 = pb.feed("778100B62BC06704000".getBytes(Elm327BrakeProtocol.ASCII));
         eq("PromptBuffer partial chunk -> 0 prompts", Integer.valueOf(0), Integer.valueOf(c1.size()));
-        List<String> c2 = pb.feed("03\r778212400000000>".getBytes(Elm327BrakeProtocol.ASCII));
+        List<String> c2 = pb.feed("03\r778212C00000000>".getBytes(Elm327BrakeProtocol.ASCII));
         eq("PromptBuffer '>' completes 1 prompt", Integer.valueOf(1), Integer.valueOf(c2.size()));
         Elm327BrakeProtocol.IgmpBrakeReading chunked = Elm327BrakeProtocol.decodeIgmpBrakeResponse(c2.get(0));
-        eq("Chunked BLE prompt decodes rawCode=36",
-                Boolean.TRUE, Boolean.valueOf(chunked != null && chunked.rawCode == 36 && chunked.brakeLampLit));
+        eq("Chunked BLE prompt decodes rawCode=44 pure regen",
+                Boolean.TRUE, Boolean.valueOf(chunked != null && chunked.rawCode == 44 && chunked.brakeLampLit && !chunked.pedalBit));
     }
 
     private static void testElm327SafetyAndBvm02Exclusion() {
@@ -245,7 +248,7 @@ public final class TestMain {
                             if ("ATI".equalsIgnoreCase(cmd)) {
                                 reply = "ELM327 v1.5\r>";
                             } else if ("22BC06".equalsIgnoreCase(cmd)) {
-                                reply = "778100B62BC0670400003\r7782124000000000000\r>";
+                                reply = "778100B62BC0670400003\r778212C000000000000\r>";
                             } else {
                                 reply = "OK\r>";
                             }
@@ -273,7 +276,7 @@ public final class TestMain {
             @Override
             public void sendLine(String line) {
                 sentBleLines.add(line);
-                // When WRITE_CHAR_NR 22BC06 arrives over @gen5w_ble, reply with CHAR_NOTIFY 22BC06 pedal=40!
+                // When WRITE_CHAR_NR 22BC06 arrives over @gen5w_ble, reply with CHAR_NOTIFY 22BC06 pedal=45 (0x2D)!
                 if (line.startsWith("@AA:BB:CC:DD:EE:01 WRITE_CHAR_NR ")
                         && line.toLowerCase().endsWith("3232424330360d")) {
                     final ObdBrakeClient c = ref[0];
@@ -282,7 +285,7 @@ public final class TestMain {
                             @Override
                             public void run() {
                                 String payloadHex = Elm327BrakeProtocol.bytesToHex(
-                                        "778100B62BC0670400003\r778212800000000>\r"
+                                        "778100B62BC0670400003\r778212D00000000>\r"
                                                 .getBytes(Elm327BrakeProtocol.ASCII));
                                 c.getBleClientForTest().handleServerLine(
                                         "@AA:BB:CC:DD:EE:01 CHAR_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb "
@@ -317,8 +320,8 @@ public final class TestMain {
 
             String bleRaw = client.sendBleCommandBlocking("22BC06", 1000L);
             Elm327BrakeProtocol.IgmpBrakeReading bleDecoded = Elm327BrakeProtocol.decodeIgmpBrakeResponse(bleRaw);
-            eq("Direct @gen5w_ble 22BC06 round-trip decoded rawCode=40",
-                    Boolean.TRUE, Boolean.valueOf(bleDecoded != null && bleDecoded.rawCode == 40 && bleDecoded.pedalBit));
+            eq("Direct @gen5w_ble 22BC06 round-trip decoded rawCode=45 (pedal switch)",
+                    Boolean.TRUE, Boolean.valueOf(bleDecoded != null && bleDecoded.rawCode == 45 && bleDecoded.pedalBit));
             eq("Direct @gen5w_ble blocks unsafe VIN 0902", null, client.sendBleCommandBlocking("0902", 300L));
 
             // 4. Simulate obd-gen5w holding BLE link (status=253 reason=ALREADY_CONNECTED) -> fallback to 127.0.0.1:<port>
@@ -330,7 +333,7 @@ public final class TestMain {
             eq("127.0.0.1 loopback fallback session succeeds", Boolean.TRUE, Boolean.valueOf(okBridge));
             BrakeEvaluator.ObdSample bridgeSample = client.currentSample();
             eq("Loopback sample transport=BRIDGE", "BRIDGE", bridgeSample.transport);
-            eq("Loopback sample rawCode=36 (Regen ON)", Integer.valueOf(36), Integer.valueOf(bridgeSample.rawCode));
+            eq("Loopback sample rawCode=44 (Pure Regen ON)", Integer.valueOf(44), Integer.valueOf(bridgeSample.rawCode));
             eq("Loopback sample brakeLampLit=true", Boolean.TRUE, Boolean.valueOf(bridgeSample.brakeLampLit));
             eq("Loopback sample pedalBit=false", Boolean.FALSE, Boolean.valueOf(bridgeSample.pedalBit));
         } finally {
@@ -370,7 +373,7 @@ public final class TestMain {
     }
 
     private static void testBrakeEvaluatorCachedSpeedAndObdModes() {
-        IndicatorConfig defaultCfg = IndicatorConfig.defaults(); // OBD_WHEN_CONNECTED + PRESSURE_AND_DECEL (1.2 m/s^2)
+        IndicatorConfig defaultCfg = IndicatorConfig.defaults(); // OBD_WHEN_CONNECTED + PRESSURE_AND_DECEL
         Map<String, String> modelOnlyMap = new HashMap<String, String>();
         modelOnlyMap.put("obd_mode", "model_only_icon");
         IndicatorConfig modelIconCfg = IndicatorConfig.fromMap(modelOnlyMap);
@@ -384,7 +387,7 @@ public final class TestMain {
         eq("409.5 invalid brake.pressure ignored", Boolean.FALSE, Boolean.valueOf(sInvalid.illuminated));
 
         // 2. Simulate HMG-API's 250 ms `speed` cache polled at 20 Hz (50 ms):
-        // Speed updates ONLY every 5th tick (every 250 ms) by -1.30 km/h (~1.44 m/s^2) at 12% i-Pedal throttle!
+        // Speed updates ONLY every 5th tick (every 250 ms) by -1.30 km/h (~1.44 m/s^2) at 8% i-Pedal throttle!
         BrakeEvaluator evRegen = new BrakeEvaluator();
         float cachedSpeed = 80.0f;
         int litTicksAfterOnset = 0;
@@ -395,7 +398,7 @@ public final class TestMain {
                 cachedSpeed -= 1.30f;
             }
             lastSnap = evRegen.evaluate(defaultCfg, new BrakeEvaluator.Input(
-                    t, 0.0f, cachedSpeed, 12.0f, -2.5f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.5f,
+                    t, 0.0f, cachedSpeed, 8.0f, -2.5f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.5f,
                     BrakeEvaluator.ObdSample.disconnected(), 0L));
             if (tick >= 6 && lastSnap.illuminated) {
                 litTicksAfterOnset++;
@@ -408,41 +411,91 @@ public final class TestMain {
         eq("Model source is REGEN_DECEL", "REGEN_DECEL", lastSnap.modelSource);
 
         // 3. Verify OBD_WHEN_CONNECTED vs MODEL_ONLY_ICON when OBD and Model disagree:
-        // Suppose speed is steady 70 km/h (Model = OFF), while OBD 22BC06 reports Regen ON (rawCode=36)
+        // Suppose speed is steady 70 km/h (Model = OFF), while OBD 22BC06 reports Pure Regen ON (rawCode=44)
         BrakeEvaluator evObd = new BrakeEvaluator();
-        BrakeEvaluator.ObdSample obdOn = new BrakeEvaluator.ObdSample(true, "BLE", 5000L, 36, true, false);
+        BrakeEvaluator.ObdSample obdOn = new BrakeEvaluator.ObdSample(true, "BLE", 5000L, 44, true, false);
         BrakeEvaluator.Snapshot sObdIcon = evObd.evaluate(defaultCfg, new BrakeEvaluator.Input(
-                5040L, 0.0f, 70.0f, 5.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
+                5040L, 0.0f, 70.0f, 15.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
         eq("OBD_WHEN_CONNECTED lights icon from OBD", Boolean.TRUE, Boolean.valueOf(sObdIcon.illuminated));
-        eq("OBD_WHEN_CONNECTED source OBD_REGEN[36]", "OBD_REGEN[36]", sObdIcon.source);
+        eq("OBD_WHEN_CONNECTED source OBD_REGEN[44]", "OBD_REGEN[44]", sObdIcon.source);
         eq("Model still independently evaluated as OFF for scoring",
                 Boolean.FALSE, Boolean.valueOf(sObdIcon.modelIlluminated));
 
         BrakeEvaluator.Snapshot sModelIcon = evObd.evaluate(modelIconCfg, new BrakeEvaluator.Input(
-                5090L, 0.0f, 70.0f, 5.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
+                5090L, 0.0f, 70.0f, 15.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
         eq("MODEL_ONLY_ICON keeps icon driven by HMG-API model (OFF)",
                 Boolean.FALSE, Boolean.valueOf(sModelIcon.illuminated));
         eq("MODEL_ONLY_ICON still keeps obdFresh=true for background scoring",
                 Boolean.TRUE, Boolean.valueOf(sModelIcon.obdFresh));
     }
 
-    private static void testBrakeEvaluatorCoastingRegenInference() {
+    private static void testBrakeEvaluatorLegacyHub650msPollAlignment() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
-        eq("classifyCoastingRegenLevel L0", Integer.valueOf(0), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.10f, -1)));
-        eq("classifyCoastingRegenLevel L1", Integer.valueOf(1), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.60f, -1)));
-        eq("classifyCoastingRegenLevel L2", Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(1.15f, -1)));
-        eq("classifyCoastingRegenLevel L3", Integer.valueOf(3), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(1.85f, -1)));
-        eq("classifyCoastingRegenLevel hysteresis holds L2 at 0.80",
-                Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.80f, 2)));
+        BrakeEvaluator ev = new BrakeEvaluator();
 
-        // Simulate 100 ms updated HMG-API speed steps during off-throttle coasting in L1, then L2, then L3
+        // Simulate real EV6 on legacy 650 ms KitKat Hub (13 eval ticks @ 50 ms per 650 ms HMG poll)
+        // with live OBD reporting 44 (0x2C, pure regen ON, pedalBit=false) during L2 coast (~0.98 m/s^2).
+        long pollMonoMs = 10000L;
+        float speedKmh = 64.4f;
+        BrakeEvaluator.Snapshot firstTickAfterSecondPoll = null;
+        BrakeEvaluator.Snapshot twelfthTickAfterSecondPoll = null;
+        BrakeEvaluator.Snapshot lastSnap = null;
+
+        for (int pollIdx = 0; pollIdx < 4; pollIdx++) {
+            if (pollIdx > 0) {
+                pollMonoMs += 650L;
+                // -2.30 km/h per 650 ms = 0.983 m/s^2 (L2 settled coast)
+                speedKmh -= 2.30f;
+            }
+            for (int sub = 0; sub < 13; sub++) {
+                long nowMs = pollMonoMs + sub * 50L;
+                BrakeEvaluator.ObdSample obd44 = new BrakeEvaluator.ObdSample(
+                        true, "BLE", nowMs - 20L, 44, true, false);
+                lastSnap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        nowMs, 0.0f, speedKmh, 0.0f, 0.0f,
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                        obd44, 0L, -1, pollMonoMs));
+                if (pollIdx == 1 && sub == 0) {
+                    firstTickAfterSecondPoll = lastSnap;
+                } else if (pollIdx == 1 && sub == 12) {
+                    twelfthTickAfterSecondPoll = lastSnap;
+                }
+            }
+        }
+
+        eq("650ms legacy Hub poll-aligned decel has zero mid-poll decay across 13 ticks",
+                Boolean.TRUE,
+                Boolean.valueOf(firstTickAfterSecondPoll != null
+                        && twelfthTickAfterSecondPoll != null
+                        && firstTickAfterSecondPoll.decelMps2 > 0.90f
+                        && Math.abs(firstTickAfterSecondPoll.decelMps2 - twelfthTickAfterSecondPoll.decelMps2) < 0.001f));
+        eq("OBD raw=44 (pedalBit=false) allows coasting L2 auto-detection on 650ms Hub",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_2),
+                Integer.valueOf(lastSnap.inferredRegenLevel));
+        eq("L2 coasting on 650ms Hub lights HMG-API model (REGEN_DECEL)",
+                Boolean.TRUE,
+                Boolean.valueOf(lastSnap.modelIlluminated && "REGEN_DECEL".equals(lastSnap.modelSource)));
+    }
+
+    private static void testBrakeEvaluatorCoastingRegenAndIpedalInference() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        eq("classifyCoastingRegenLevel L0", Integer.valueOf(0), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.32f, -1)));
+        eq("classifyCoastingRegenLevel L1", Integer.valueOf(1), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.60f, -1)));
+        eq("classifyCoastingRegenLevel L2", Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.95f, -1)));
+        eq("classifyCoastingRegenLevel L3", Integer.valueOf(3), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(1.75f, -1)));
+        eq("classifyCoastingRegenLevel hysteresis holds L2 at 0.74",
+                Integer.valueOf(2), Integer.valueOf(BrakeEvaluator.classifyCoastingRegenLevel(0.74f, 2)));
+        eq("regenLevelLabel formats 4 as i-Pedal", "i-Pedal", BrakeEvaluator.regenLevelLabel(BrakeEvaluator.REGEN_LEVEL_IPEDAL));
+        eq("regenLevelLabel formats -1 as ?", "?", BrakeEvaluator.regenLevelLabel(BrakeEvaluator.REGEN_LEVEL_UNKNOWN));
+
+        // Simulate 100 ms updated HMG-API speed steps during off-throttle coasting in L1, L2, L3, and i-Pedal
         BrakeEvaluator ev = new BrakeEvaluator();
         long t = 20000L;
         float spd = 72.0f;
         BrakeEvaluator.Snapshot snap = null;
 
-        // 1. Coast in L1 (~0.58 m/s^2 -> -0.21 km/h every 100 ms) for 900 ms
-        for (int tick = 0; tick <= 18; tick++) {
+        // 1. Coast in L1 (~0.58 m/s^2 -> -0.21 km/h every 100 ms) for 1200 ms (settle 350ms + chord >= 750ms)
+        for (int tick = 0; tick <= 24; tick++) {
             if (tick > 0 && tick % 2 == 0) spd -= 0.21f;
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
                     t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
@@ -452,15 +505,15 @@ public final class TestMain {
         eq("Coasting decel ~0.58 m/s^2 infers Regen L1", Integer.valueOf(1), Integer.valueOf(snap.inferredRegenLevel));
         eq("hevRegenRaw passed through to Snapshot", Integer.valueOf(1), Integer.valueOf(snap.hevRegenRaw));
 
-        // 2. Driver clicks paddle to L2 (~1.16 m/s^2 -> -0.42 km/h every 100 ms)
-        for (int tick = 1; tick <= 16; tick++) {
-            if (tick % 2 == 0) spd -= 0.42f;
+        // 2. Driver clicks paddle to L2 (~0.97 m/s^2 -> -0.35 km/h every 100 ms)
+        for (int tick = 1; tick <= 24; tick++) {
+            if (tick % 2 == 0) spd -= 0.35f;
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
                     t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
                     BrakeEvaluator.ObdSample.disconnected(), 0L, 2));
             t += 50L;
         }
-        eq("Coasting decel ~1.16 m/s^2 infers Regen L2", Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
+        eq("Coasting decel ~0.97 m/s^2 infers Regen L2", Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
 
         // 3. Driver presses throttle (18%): inferredRegenLevel stays latched at L2 until next coast or Park
         snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
@@ -470,7 +523,7 @@ public final class TestMain {
         eq("Throttle press preserves learned L2", Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
 
         // 4. Coast in L3 (~1.80 m/s^2 -> -0.65 km/h every 100 ms)
-        for (int tick = 1; tick <= 18; tick++) {
+        for (int tick = 1; tick <= 24; tick++) {
             if (tick % 2 == 0) spd -= 0.65f;
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
                     t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
@@ -480,7 +533,43 @@ public final class TestMain {
         eq("Coasting decel ~1.80 m/s^2 infers Regen L3", Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
         eq("L3 coast also illuminates HMG-API model", Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
 
-        // 5. Shifting into Park resets inferredRegenLevel to -1
+        // 5. i-Pedal Signature B1: Low-speed zero-pedal full-stop regen (12 -> 5 km/h at ~1.94 m/s^2, no creep taper)
+        spd = 12.6f;
+        for (int tick = 0; tick <= 20; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.70f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("Low-speed zero-pedal full-stop regen promotes mode to i-Pedal (4)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 6. i-Pedal Signature B3: Low-speed creep taper (15 -> 12 km/h at ~0.55 m/s^2) demotes i-Pedal (4) -> L3 (3)
+        spd = 15.5f;
+        for (int tick = 0; tick <= 24; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.20f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("Low-speed creep taper demotes i-Pedal (4) back to L3 (3)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 7. i-Pedal Signature B2: Steady speed cruise (48 km/h) at 26% neutral pedal for >= 1.1s promotes to i-Pedal (4)
+        t += 2500L; // new cruise segment at 48 km/h
+        spd = 48.0f;
+        for (int tick = 0; tick <= 34; tick++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 26.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("Steady cruise at 26% neutral pedal infers i-Pedal (4)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 8. Shifting into Park resets inferredRegenLevel to -1
         snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
                 t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, 70.0f,
                 BrakeEvaluator.ObdSample.disconnected(), 0L, -1));
@@ -548,13 +637,12 @@ public final class TestMain {
         eq("Blocks serial int getter", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(badSerialInt)));
         eq("Blocks mutator method", Boolean.FALSE, Boolean.valueOf(HevRegenProbe.isSafeGetterMethod(badMutator)));
 
-        // 2. Baseline marking & live paddle-click diffing
+        // 2. Rejects 250 (0xFA USM unsupported sentinel) as direct regen candidate
         final Map<String, String> liveSignals = new LinkedHashMap<String, String>();
         liveSignals.put("HEVFlag.EV_READY(1)", "1");
-        liveSignals.put("HEVFlag.EV_RECUP_LEVEL(12)", "1");
-        liveSignals.put("USM.getSmartRecuperation", "0");
-        liveSignals.put("HEVFlag.ODOMETER(4)", "123450"); // noisy counter -> must not trigger false candidate alerts
-        liveSignals.put("BCM.getVinCode", "SECRET");      // unsafe name -> must be dropped even if returned
+        liveSignals.put("USM.getSmartRecuperation", "250"); // 0xFA unsupported sentinel -> must NOT become direct candidate
+        liveSignals.put("HEVFlag.ODOMETER(4)", "123450");   // noisy counter -> must not trigger false candidate alerts
+        liveSignals.put("BCM.getVinCode", "SECRET");        // unsafe name -> must be dropped even if returned
 
         HevRegenProbe probe = new HevRegenProbe(new HevRegenProbe.SignalSource() {
             @Override
@@ -577,7 +665,14 @@ public final class TestMain {
         });
 
         probe.poll(true);
+        eq("250 (0xFA USM sentinel) ignored as direct regen candidate (-1)",
+                Integer.valueOf(-1), Integer.valueOf(probe.getLatestDirectRegenRaw()));
+
+        liveSignals.put("HEVFlag.EV_RECUP_LEVEL(12)", "1");
+        probe.poll(true);
         eq("Initial direct regen candidate = 1", Integer.valueOf(1), Integer.valueOf(probe.getLatestDirectRegenRaw()));
+        events.clear();
+
         String markMsg = probe.markBaseline();
         eq("markBaseline counts only safe signals (4)", Boolean.TRUE, Boolean.valueOf(markMsg.contains("4 HEV/USM/CLU signals")));
 
@@ -603,20 +698,20 @@ public final class TestMain {
         TelemetryRecorder rec = new TelemetryRecorder();
         long wall = 1763000000000L;
 
-        // Tick 0 (t=1000): Both OFF -> TN (inferred regen L1, hev raw 1)
-        rec.record(makeScoredSnapshot(1000L, false, "OFF", 0, false, false, 1, 1), wall);
-        // External baseline marker event
-        rec.recordExternalEvent(1025L, "MARK #1 (42 HEV/USM/CLU signals)");
-        // Tick 1 (t=1050): OBD turns ON via Regen (36), Model still OFF -> FN (inferred regen transitions L1 -> L2)
-        rec.record(makeScoredSnapshot(1050L, false, "OFF", 36, true, false, 2, 2), wall + 50L);
+        // Tick 0 (t=1000): Both OFF -> TN (inferred regen L3)
+        rec.record(makeScoredSnapshot(1000L, false, "OFF", 0, false, false, 3, -1), wall);
+        // External bookmark event
+        rec.recordExternalEvent(1025L, "MARK #1 (regen=L3, speed=64.0 km/h)");
+        // Tick 1 (t=1050): OBD turns ON via Pure Regen 44 (0x2C, pedalBit=false), Model still OFF -> FN (regen transitions L3 -> i-Pedal)
+        rec.record(makeScoredSnapshot(1050L, false, "OFF", 44, true, false, 4, -1), wall + 50L);
         // Tick 2 (t=1150): Model turns ON via REGEN_DECEL -> TP, onset lag = 150 - 50 = +100 ms!
-        rec.record(makeScoredSnapshot(1150L, true, "REGEN_DECEL", 36, true, false, 2, 2), wall + 150L);
-        // Tick 3 (t=1200): Both ON via Regen -> TP
-        rec.record(makeScoredSnapshot(1200L, true, "REGEN_DECEL", 36, true, false, 2, 2), wall + 200L);
+        rec.record(makeScoredSnapshot(1150L, true, "REGEN_DECEL", 44, true, false, 4, -1), wall + 150L);
+        // Tick 3 (t=1200): Driver taps brake pedal (raw=45, pedalBit=true), Model ON via BRAKE_PRESSURE -> TP
+        rec.record(makeScoredSnapshot(1200L, true, "BRAKE_PRESSURE", 45, true, true, 4, -1), wall + 200L);
         // Tick 4 (t=1250): OBD turns OFF (0), Model still holding -> FP (pending OBD fall at rel=250ms)
-        rec.record(makeScoredSnapshot(1250L, true, "REGEN_DECEL", 0, false, false, 2, 2), wall + 250L);
+        rec.record(makeScoredSnapshot(1250L, true, "REGEN_DECEL", 0, false, false, 4, -1), wall + 250L);
         // Tick 5 (t=1330): Model turns OFF -> TN, release lag = 330 - 250 = +80 ms!
-        rec.record(makeScoredSnapshot(1330L, false, "OFF", 0, false, false, 2, 2), wall + 330L);
+        rec.record(makeScoredSnapshot(1330L, false, "OFF", 0, false, false, 4, -1), wall + 330L);
 
         TelemetryRecorder.ScoreSnapshot sc = rec.scoreSnapshot();
         eq("6 buffered rows", Integer.valueOf(6), Integer.valueOf(sc.bufferedRows));
@@ -625,7 +720,8 @@ public final class TestMain {
         eq("FP=1", Long.valueOf(1L), Long.valueOf(sc.fp));
         eq("TN=2", Long.valueOf(2L), Long.valueOf(sc.tn));
         eq("FN=1", Long.valueOf(1L), Long.valueOf(sc.fn));
-        eq("Regen recall 2/3 ticks", Long.valueOf(2L), Long.valueOf(sc.regenModelMatchedSamples));
+        eq("Pedal switch recall 1/1 ticks", Long.valueOf(1L), Long.valueOf(sc.pedalModelMatchedSamples));
+        eq("Pure Regen recall 1/2 ticks", Long.valueOf(1L), Long.valueOf(sc.regenModelMatchedSamples));
         eq("Onset lag +100 ms", Long.valueOf(100L), Long.valueOf(sc.meanOnsetLagMs));
         eq("Release lag +80 ms", Long.valueOf(80L), Long.valueOf(sc.meanReleaseLagMs));
 
@@ -634,15 +730,23 @@ public final class TestMain {
         eq("CSV has header + 6 data rows", Integer.valueOf(7), Integer.valueOf(lines.length));
         eq("CSV header includes inferred_regen_level,hev_regen_raw",
                 Boolean.TRUE, Boolean.valueOf(lines[0].endsWith("inferred_regen_level,hev_regen_raw")));
-        eq("CSV row 3 records REGEN_DECEL, raw 36, L2, hev=2",
-                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].endsWith(",36,1,0,2,2")));
+        eq("CSV row 3 records REGEN_DECEL, raw 44, pedal=0, i-Pedal(4)",
+                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].endsWith(",44,1,0,4,")));
+        eq("CSV row 4 records BRAKE_PRESSURE, raw 45, pedal=1, i-Pedal(4)",
+                Boolean.TRUE, Boolean.valueOf(lines[4].contains(",1,BRAKE_PRESSURE,1,1,BLE,") && lines[4].endsWith(",45,1,1,4,")));
 
         String summary = rec.buildSummaryReport(
-                IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)", "OK (20Hz)", "EV_RECUP_LEVEL=2 | diff=1");
-        eq("Summary includes confusion matrix",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")));
-        eq("Summary includes external MARK #1 and CoastRegenEst transitions",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("MARK #1") && summary.contains("CoastRegenEst: L1 -> L2")));
+                IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)", "OK (20Hz)", null);
+        eq("Summary banner is v0.5.0",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.5.0 Calibration Summary")));
+        eq("Summary includes confusion matrix and Pedal Switch Rec.",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
+                        && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
+                        && summary.contains("Pure Regen/SCC Rec. : 50.0% (1/2 ticks)")));
+        eq("Summary formats i-Pedal transition cleanly",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("MARK #1")
+                        && summary.contains("RegenModeEst: L3 -> i-Pedal")
+                        && summary.contains("reg=i-Pedal")));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

@@ -131,10 +131,11 @@ public final class Elm327BrakeProtocol {
      * Verified across 2022-2025 Kia EV6 and Hyundai Ioniq 5/6 signalsets & real-vehicle frames:
      * - `payload` = `[0x62, 0xBC, 0x06, A, B, C, D, E, ...]` (8 to 11+ bytes)
      * - `rawCode = payload[7] & 0xFF` (data byte E, bitOffset 32):
-     *     - `0` (`0x00`)                   -> Brake lights OFF
-     *     - `4` (`0x04`), `36` (`0x24`)    -> Brake lights ON via Regen / Smart Cruise Control (no pedal)
-     *     - `40` (`0x28`), `41` (`0x29`),
-     *       `44` (`0x2C`), `45` (`0x2D`)   -> Brake lights ON with brake pedal / brake switch active
+     *     - `0` (`0x00`)                                 -> Brake lights OFF
+     *     - `4` (`0x04`), `36` (`0x24`),
+     *       `40` (`0x28`), `44` (`0x2C`, bit `0` = `0`)  -> Brake lights ON via Regen / i-Pedal / SCC / Auto-Hold (no pedal)
+     *     - `37` (`0x25`), `41` (`0x29`),
+     *       `45` (`0x2D`, bit `0` = `1`)                 -> Brake lights ON with physical brake pedal switch active
      */
     public static final class IgmpBrakeReading {
         public final int rawCode;
@@ -428,7 +429,7 @@ public final class Elm327BrakeProtocol {
             }
             int rawCode = u[7] & 0xFF;
             boolean lit = (rawCode != 0);
-            boolean pedalBit = (rawCode & 0x08) != 0;
+            boolean pedalBit = (rawCode & 0x01) != 0;
             return new IgmpBrakeReading(rawCode, lit, pedalBit, bytesToHex(u));
         }
         return null;

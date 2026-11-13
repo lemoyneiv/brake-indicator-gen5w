@@ -50,6 +50,8 @@ public final class TelemetryRecorder {
         public final long fp;
         public final long tn;
         public final long fn;
+        public final long pedalObdOnSamples;
+        public final long pedalModelMatchedSamples;
         public final long regenObdOnSamples;
         public final long regenModelMatchedSamples;
         public final int onsetCount;
@@ -71,6 +73,27 @@ public final class TelemetryRecorder {
                 long meanOnsetLagMs,
                 int releaseCount,
                 long meanReleaseLagMs) {
+            this(bufferedRows, totalRecordedRows, scoredSamples, tp, fp, tn, fn,
+                    0L, 0L, regenObdOnSamples, regenModelMatchedSamples,
+                    onsetCount, meanOnsetLagMs, releaseCount, meanReleaseLagMs);
+        }
+
+        public ScoreSnapshot(
+                int bufferedRows,
+                long totalRecordedRows,
+                long scoredSamples,
+                long tp,
+                long fp,
+                long tn,
+                long fn,
+                long pedalObdOnSamples,
+                long pedalModelMatchedSamples,
+                long regenObdOnSamples,
+                long regenModelMatchedSamples,
+                int onsetCount,
+                long meanOnsetLagMs,
+                int releaseCount,
+                long meanReleaseLagMs) {
             this.bufferedRows = bufferedRows;
             this.totalRecordedRows = totalRecordedRows;
             this.scoredSamples = scoredSamples;
@@ -78,6 +101,8 @@ public final class TelemetryRecorder {
             this.fp = fp;
             this.tn = tn;
             this.fn = fn;
+            this.pedalObdOnSamples = pedalObdOnSamples;
+            this.pedalModelMatchedSamples = pedalModelMatchedSamples;
             this.regenObdOnSamples = regenObdOnSamples;
             this.regenModelMatchedSamples = regenModelMatchedSamples;
             this.onsetCount = onsetCount;
@@ -101,6 +126,11 @@ public final class TelemetryRecorder {
             long denom = tp + fn;
             if (denom <= 0L) return Float.NaN;
             return (tp * 100.0f) / (float) denom;
+        }
+
+        public float pedalRecallPct() {
+            if (pedalObdOnSamples <= 0L) return Float.NaN;
+            return (pedalModelMatchedSamples * 100.0f) / (float) pedalObdOnSamples;
         }
 
         public float regenRecallPct() {
@@ -139,6 +169,8 @@ public final class TelemetryRecorder {
     private long fp;
     private long tn;
     private long fn;
+    private long pedalObdOnSamples;
+    private long pedalModelMatchedSamples;
     private long regenObdOnSamples;
     private long regenModelMatchedSamples;
 
@@ -176,6 +208,8 @@ public final class TelemetryRecorder {
         fp = 0L;
         tn = 0L;
         fn = 0L;
+        pedalObdOnSamples = 0L;
+        pedalModelMatchedSamples = 0L;
         regenObdOnSamples = 0L;
         regenModelMatchedSamples = 0L;
         prevStateValid = false;
@@ -317,7 +351,12 @@ public final class TelemetryRecorder {
             } else {
                 fn++;
             }
-            if (obdLit && !obd.pedalBit) {
+            if (obdLit && obd.pedalBit) {
+                pedalObdOnSamples++;
+                if (modelLit) {
+                    pedalModelMatchedSamples++;
+                }
+            } else if (obdLit && !obd.pedalBit) {
                 regenObdOnSamples++;
                 if (modelLit) {
                     regenModelMatchedSamples++;
@@ -381,12 +420,13 @@ public final class TelemetryRecorder {
         }
 
         if (regenChanged) {
-            String fromLbl = prevInferredRegen < 0 ? "?" : ("L" + prevInferredRegen);
+            String fromLbl = BrakeEvaluator.regenLevelLabel(prevInferredRegen);
+            String toLbl = BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel);
             pushTransitionLine(String.format(Locale.US,
-                    "[%7.2fs] CoastRegenEst: %s -> L%d (decel=%.2f m/s^2 @ %s km/h)",
+                    "[%7.2fs] RegenModeEst: %s -> %s (decel=%.2f m/s^2 @ %s km/h)",
                     Float.valueOf(relMs / 1000.0f),
                     fromLbl,
-                    Integer.valueOf(snap.inferredRegenLevel),
+                    toLbl,
                     Float.valueOf(snap.decelMps2),
                     fmtFloat(unboxFloat(snap.speedKmh), "%.1f")));
         }
@@ -408,7 +448,7 @@ public final class TelemetryRecorder {
                     .append(" prsr=").append(fmtFloat(unboxFloat(snap.brakePressure), "%.1f"))
                     .append(" acc=").append(fmtFloat(unboxFloat(snap.accelPedal), "%.1f"));
             if (snap.inferredRegenLevel >= 0) {
-                line.append(" reg=L").append(snap.inferredRegenLevel);
+                line.append(" reg=").append(BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel));
             }
             pushTransitionLine(line.toString());
         }
@@ -443,6 +483,8 @@ public final class TelemetryRecorder {
                 fp,
                 tn,
                 fn,
+                pedalObdOnSamples,
+                pedalModelMatchedSamples,
                 regenObdOnSamples,
                 regenModelMatchedSamples,
                 onsetCount,
@@ -523,7 +565,7 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.4.0 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.5.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
@@ -554,6 +596,8 @@ public final class TelemetryRecorder {
         sb.append("Overall Agreement   : ").append(fmtPct(sc.agreementPct())).append('\n');
         sb.append("Model Precision     : ").append(fmtPct(sc.precisionPct())).append('\n');
         sb.append("Model Recall (All)  : ").append(fmtPct(sc.recallPct())).append('\n');
+        sb.append("Pedal Switch Rec.   : ").append(fmtPct(sc.pedalRecallPct()))
+          .append(" (").append(sc.pedalModelMatchedSamples).append('/').append(sc.pedalObdOnSamples).append(" ticks)\n");
         sb.append("Pure Regen/SCC Rec. : ").append(fmtPct(sc.regenRecallPct()))
           .append(" (").append(sc.regenModelMatchedSamples).append('/').append(sc.regenObdOnSamples).append(" ticks)\n");
         sb.append("Mean Onset Lag      : ")

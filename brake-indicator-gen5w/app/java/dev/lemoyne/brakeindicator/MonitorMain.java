@@ -16,33 +16,38 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Background HMG-API service ("user": "system", uid 1000) that:
- *  1. Polls HMG-API vehicle readings + Option 1 ITM_HSCANService OEM getters at 10 Hz.
- *  2. Evaluates brake-lamp illumination state via BrakeEvaluator.
- *  3. Streams updates over @dev.lemoyne.brakeindicator.ipc to OverlayService and MainActivity.
- *  4. Starts OverlayService automatically when Android is up and no overlay client is connected.
+ * Background HMG-API service ("user": "root") that:
+ *  1. Polls OEM Binder services (`tm_hscan_service` + `ISystemService`) directly at 25 Hz (40 ms)
+ *     for zero-hop brake pressure, CAN speed, accelerator pedal, Park, and EPB readings.
+ *  2. Evaluates pedal, regenerative, and Smart Cruise Control brake-lamp illumination via BrakeEvaluator.
+ *  3. Pushes instant state transitions over @dev.lemoyne.brakeindicator.ipc to OverlayService and MainActivity.
+ *  4. Exports on-car OEM CAN probe reports directly to any mounted FAT32/exFAT USB stick via UsbExporter.
  */
 public final class MonitorMain {
 
     private static final String APP_PACKAGE = "dev.lemoyne.brakeindicator";
     private static final String OVERLAY_COMPONENT = "dev.lemoyne.brakeindicator/.OverlayService";
-    private static final long POLL_INTERVAL_MS = 100L;
+    private static final long POLL_INTERVAL_MS = 40L;
     private static final long SETTINGS_REFRESH_MS = 2500L;
     private static final long OVERLAY_ENSURE_MS = 4000L;
     private static final long HEARTBEAT_PUSH_MS = 500L;
 
-    private final HmgApi api = HmgApi.connect().timeout(2000);
+    private final HmgApi syncApi = HmgApi.connect().timeout(2000);
     private final BrakeEvaluator evaluator = new BrakeEvaluator();
     private final HscanProbe hscanProbe;
     private final List<LocalSocket> subscribers = new ArrayList<LocalSocket>();
+    private final Object reloadMonitor = new Object();
 
     private volatile IndicatorConfig config = IndicatorConfig.defaults();
+    private volatile Map<String, String> fallbackVehicle = Collections.emptyMap();
+    private volatile boolean needVehicleFallback = true;
     private volatile BrakeEvaluator.Snapshot latestSnapshot;
     private volatile String latestStateLine = "";
     private volatile long testUntilMs;
@@ -58,7 +63,7 @@ public final class MonitorMain {
         File dataDir = dataPath != null && !dataPath.isEmpty()
                 ? new File(dataPath)
                 : new File("/data/local/tmp");
-        System.out.println("brake-indicator: monitor starting (uid=" + android.os.Process.myUid() + ")");
+        System.out.println("brake-indicator: monitor v0.2.0 starting (uid=" + android.os.Process.myUid() + ")");
         MonitorMain monitor = new MonitorMain(dataDir);
         monitor.run();
     }
@@ -74,32 +79,44 @@ public final class MonitorMain {
         acceptThread.setDaemon(true);
         acceptThread.start();
 
-        long lastSettingsMs = 0L;
-        long lastOverlayCheckMs = 0L;
+        Thread syncThread = new Thread("brake-hmgapi-sync") {
+            @Override
+            public void run() {
+                syncLoop();
+            }
+        };
+        syncThread.setDaemon(true);
+        syncThread.start();
+
         long lastPushMs = 0L;
         boolean lastLit = false;
 
         while (true) {
             long loopStart = SystemClock.elapsedRealtime();
             try {
-                if (forceSettingsReload || loopStart - lastSettingsMs >= SETTINGS_REFRESH_MS) {
-                    reloadSettings();
-                    forceSettingsReload = false;
-                    lastSettingsMs = loopStart;
-                }
-
                 IndicatorConfig cfg = config;
-                Map<String, String> veh = readHmgVehicle();
-                Float hubPressure = BrakeEvaluator.parseReadingFloat(veh.get("brake.pressure"));
-                Float speedKmh = BrakeEvaluator.parseReadingFloat(veh.get("speed"));
-                Float accelPedal = BrakeEvaluator.parseReadingFloat(veh.get("pedal.accel"));
-                Boolean gearPark = BrakeEvaluator.parseReadingFlag(veh.get("gear.park"));
-                Boolean parkingBrake = BrakeEvaluator.parseReadingFlag(veh.get("parking_brake"));
+                HscanProbe.PollResult hscan = hscanProbe.pollFast(loopStart);
 
-                boolean wantDiag = cfg.probeLogging || hasSubscribers();
-                HscanProbe.PollResult hscan = hscanProbe.poll(loopStart, wantDiag, speedKmh, hubPressure);
+                // Use zero-hop OEM Binder readings first; fall back to HMG-API Hub only if unbound
+                needVehicleFallback = (!hscan.connected || hscan.directGearPark == null);
+                Map<String, String> fb = fallbackVehicle;
 
-                Float effectivePressure = hubPressure != null ? hubPressure : hscan.directBrakePressure;
+                Float effectivePressure = hscan.directBrakePressure != null
+                        ? hscan.directBrakePressure
+                        : BrakeEvaluator.parseReadingFloat(fb.get("brake.pressure"));
+                Float speedKmh = hscan.directSpeedKmh != null
+                        ? hscan.directSpeedKmh
+                        : BrakeEvaluator.parseReadingFloat(fb.get("speed"));
+                Float accelPedal = hscan.directAccelPedal != null
+                        ? hscan.directAccelPedal
+                        : BrakeEvaluator.parseReadingFloat(fb.get("pedal.accel"));
+                Boolean gearPark = hscan.directGearPark != null
+                        ? hscan.directGearPark
+                        : BrakeEvaluator.parseReadingFlag(fb.get("gear.park"));
+                Boolean parkingBrake = hscan.directParkingBrake != null
+                        ? hscan.directParkingBrake
+                        : BrakeEvaluator.parseReadingFlag(fb.get("parking_brake"));
+
                 BrakeEvaluator.Input input = new BrakeEvaluator.Input(
                         loopStart,
                         hscan.directStopLamp,
@@ -127,23 +144,22 @@ public final class MonitorMain {
                 latestStateLine = encoded;
                 lastLit = snap.illuminated;
 
-                if (litChanged || (lineChanged && loopStart - lastPushMs >= 100L)
+                if (litChanged || (lineChanged && loopStart - lastPushMs >= 80L)
                         || loopStart - lastPushMs >= HEARTBEAT_PUSH_MS) {
                     broadcastState(encoded);
                     lastPushMs = loopStart;
                 }
 
-                if (!hasSubscribers() && loopStart - lastOverlayCheckMs >= OVERLAY_ENSURE_MS) {
-                    lastOverlayCheckMs = loopStart;
-                    ensureOverlayServiceStarted();
-                }
+                // Run 2 Hz diagnostic getter sweep AFTER overlay broadcast so brake onset has zero lag
+                boolean wantDiag = cfg.probeLogging || hasSubscribers();
+                hscanProbe.pollDiagnosticsIfDue(loopStart, wantDiag, snap);
             } catch (Throwable t) {
                 System.out.println("brake-indicator: loop error: " + t);
             }
 
             long elapsed = SystemClock.elapsedRealtime() - loopStart;
             long sleepMs = POLL_INTERVAL_MS - elapsed;
-            if (sleepMs > 10L) {
+            if (sleepMs > 2L) {
                 try {
                     Thread.sleep(sleepMs);
                 } catch (InterruptedException ie) {
@@ -153,9 +169,49 @@ public final class MonitorMain {
         }
     }
 
+    /**
+     * Handles all UNIX-socket HMG-API calls (`settings`, fallback `vehicle`, and `am startservice`)
+     * off the 25 Hz fast path so socket I/O never adds latency to brake indicator activation.
+     */
+    private void syncLoop() {
+        long lastSettingsMs = 0L;
+        long lastOverlayCheckMs = 0L;
+
+        while (true) {
+            long now = SystemClock.elapsedRealtime();
+            try {
+                if (forceSettingsReload || now - lastSettingsMs >= SETTINGS_REFRESH_MS) {
+                    reloadSettings();
+                    forceSettingsReload = false;
+                    lastSettingsMs = now;
+                }
+
+                if (needVehicleFallback) {
+                    fallbackVehicle = readHmgVehicle();
+                }
+
+                if (!hasSubscribers() && now - lastOverlayCheckMs >= OVERLAY_ENSURE_MS) {
+                    lastOverlayCheckMs = now;
+                    ensureOverlayServiceStarted();
+                }
+            } catch (Throwable ignored) {
+            }
+
+            synchronized (reloadMonitor) {
+                if (!forceSettingsReload) {
+                    try {
+                        reloadMonitor.wait(500L);
+                    } catch (InterruptedException ie) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     private Map<String, String> readHmgVehicle() {
         try {
-            return api.vehicle("brake.pressure", "speed", "pedal.accel", "gear.park", "parking_brake", "moving");
+            return syncApi.vehicle("brake.pressure", "speed", "pedal.accel", "gear.park", "parking_brake", "moving");
         } catch (IOException e) {
             return new LinkedHashMap<String, String>();
         }
@@ -163,7 +219,7 @@ public final class MonitorMain {
 
     private void reloadSettings() {
         try {
-            JSONObject json = api.settings();
+            JSONObject json = syncApi.settings();
             Map<String, String> map = new LinkedHashMap<String, String>();
             Iterator<?> keys = json.keys();
             while (keys.hasNext()) {
@@ -209,7 +265,7 @@ public final class MonitorMain {
                 client.close();
                 return;
             }
-            client.setSoTimeout(3000);
+            client.setSoTimeout(4000);
             BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream(), "UTF-8"), 256);
             String cmd = in.readLine();
             if (cmd == null) {
@@ -243,11 +299,27 @@ public final class MonitorMain {
                 ensureOverlayServiceStarted();
             } else if ("RELOAD".equals(cmd)) {
                 forceSettingsReload = true;
+                synchronized (reloadMonitor) {
+                    reloadMonitor.notifyAll();
+                }
                 out.write("OK\n".getBytes("UTF-8"));
                 out.flush();
             } else if ("REPORT".equals(cmd)) {
                 String report = hscanProbe.buildReport(config, latestSnapshot);
                 out.write((report + "\nEND_REPORT\n").getBytes("UTF-8"));
+                out.flush();
+            } else if ("EXPORT_USB".equals(cmd)) {
+                String report = hscanProbe.buildReport(config, latestSnapshot);
+                List<String> extraFolders = null;
+                try {
+                    extraFolders = HmgApi.connect().timeout(1500).usbFolders();
+                } catch (Exception ignored) {
+                }
+                UsbExporter.ExportResult res = UsbExporter.exportReport(report, extraFolders);
+                String reply = res.ok
+                        ? ("OK\t" + res.savedPath + "\nEND_REPORT\n")
+                        : ("ERR\t" + res.errorMessage + "\nEND_REPORT\n");
+                out.write(reply.getBytes("UTF-8"));
                 out.flush();
             } else if ("SNAPSHOT".equals(cmd)) {
                 out.write((latestStateLine + "\n").getBytes("UTF-8"));

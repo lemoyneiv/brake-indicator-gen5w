@@ -18,6 +18,7 @@ DEX_STRINGS=$(unzip -p "$B/app/BrakeIndicator.apk" classes.dex | strings)
 has "apk contains MonitorMain" "Ldev/lemoyne/brakeindicator/MonitorMain;" "$DEX_STRINGS"
 has "apk contains OverlayService" "Ldev/lemoyne/brakeindicator/OverlayService;" "$DEX_STRINGS"
 has "apk contains MainActivity" "Ldev/lemoyne/brakeindicator/MainActivity;" "$DEX_STRINGS"
+has "apk contains UsbExporter" "Ldev/lemoyne/brakeindicator/UsbExporter;" "$DEX_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$DEX_STRINGS"
 
 # Verify stock-style launcher icons exist and stay well under Mods.java 256 KB limit
@@ -31,7 +32,7 @@ cp -r "$M/icons" "$R/data/hmgapi/mods/brake-indicator-gen5w/"
 eng plan
 check "engine plan succeeds" 0 "$rc"
 has "plan lists BrakeIndicator.apk" "dev.lemoyne.brakeindicator (app/BrakeIndicator.apk)" "$out"
-has "plan lists monitor service as system" "service  brake-indicator-gen5w/monitor as system, at android" "$out"
+has "plan lists monitor service as root" "service  brake-indicator-gen5w/monitor as root, at android" "$out"
 has "plan lists USB folder" "usb      BrakeIndicator/ on a stick" "$out"
 has "plan lists brake.pressure reading" "brake.pressure" "$out"
 check "plan has zero problems" no "$(echo "$out" | grep -q '^problem ' && echo yes || echo no)"
@@ -40,15 +41,16 @@ eng apply
 check "engine apply succeeds" 0 "$rc"
 has "mod published as on" "1 of 1 mods on" "$out"
 has "mod in public state.json" '"brake-indicator-gen5w"' "$(cat "$R/data/hmgapi/public/state.json")"
-has "monitor registered in services.txt" "brake-indicator-gen5w monitor system android yes jar app/BrakeIndicator.apk dev.lemoyne.brakeindicator.MonitorMain" "$(cat "$R/data/hmgapi/state/services.txt")"
+has "default signal_mode is native_and_decel" '"native_and_decel"' "$(cat "$R/data/hmgapi/public/state.json")"
+has "monitor registered in services.txt" "brake-indicator-gen5w monitor root android yes jar app/BrakeIndicator.apk dev.lemoyne.brakeindicator.MonitorMain" "$(cat "$R/data/hmgapi/state/services.txt")"
 has "vehicle hub auto-enabled in services.txt" "hmgapi vehicle root android yes jar" "$(cat "$R/data/hmgapi/state/services.txt")"
 has "brake.pressure in vehicle.txt" "brake-indicator-gen5w brake.pressure" "$(cat "$R/data/hmgapi/state/vehicle.txt")"
 
 # Test owner setting override round-trip
-printf '{"signal_mode":"native_and_decel","off_state":"dim","x_offset":300}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
+printf '{"signal_mode":"native","off_state":"dim","x_offset":300,"standstill_hold":false}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
 eng apply
 check "setting override applies cleanly" 0 "$rc"
-has "public state reflects signal_mode override" '"native_and_decel"' "$(cat "$R/data/hmgapi/public/state.json")"
+has "public state reflects dim override" '"dim"' "$(cat "$R/data/hmgapi/public/state.json")"
 
 eng remove brake-indicator-gen5w
 check "engine remove succeeds" 0 "$rc"

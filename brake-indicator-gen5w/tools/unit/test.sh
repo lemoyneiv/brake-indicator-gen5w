@@ -11,6 +11,7 @@ javac --release 8 -Xlint:-options -d "$W" \
     "$SRC/IndicatorConfig.java" \
     "$SRC/BrakeEvaluator.java" \
     "$SRC/IpcProtocol.java" \
+    "$SRC/UsbExporter.java" \
     "$HERE/TestMain.java"
 
 java -cp "$W" dev.lemoyne.brakeindicator.TestMain

@@ -26,19 +26,26 @@ public final class CandidateFilter {
     }
 
     private static final String[] BLOCKED_SUBSTRINGS = {
-        // Per-car identity, location, credentials, telecom
-        "vin", "gps", "lat", "lon", "coord", "nmea",
-        "imei", "msisdn", "imsi", "usim", "iccid", "eid", "pcid",
-        "serial", "mac", "btaddr", "ssid", "bssid", "passwd", "password",
+        // Per-car identity, location, credentials, telecom (unambiguous multi-char stems)
+        "gps", "coord", "nmea", "latitude", "longitude", "location",
+        "imei", "msisdn", "imsi", "usim", "iccid", "serial",
+        "btaddr", "ssid", "bssid", "passwd", "password",
         "token", "cert", "secret", "crypt", "auth", "login", "account",
-        "phone", "tel", "nad", "modem",
-        // Mutating / request / side-effecting verbs
-        "set", "send", "write", "put", "post", "req", "reset", "clear",
-        "init", "open", "close", "register", "callback", "listener",
-        "notify", "dispatch", "trigger", "exec", "cmd", "command",
-        "diag", "ota", "flash", "reboot", "shutdown", "delete", "remove",
+        "phone", "modem",
+        // Mutating / callback / system-control substrings
+        "write", "register", "callback", "listener",
+        "dispatch", "trigger", "exec", "command",
+        "reboot", "shutdown", "delete", "remove", "flash",
         // Known side-effecting getter on HKMC Gen5W BCM (triggers OSD popup)
         "drivemode"
+    };
+
+    private static final String[] BLOCKED_TOKENS = {
+        // Short acronyms/verbs matched on CamelCase / underscore token boundaries
+        // so e.g. "vin" blocks getVIN / getVINStatus without blocking IsCarMoving
+        "vin", "lat", "lon", "pos", "eid", "pcid", "mac", "tel", "nad",
+        "send", "put", "post", "req", "request", "reset", "clear",
+        "init", "open", "close", "notify", "cmd", "diag", "ota"
     };
 
     private static final String[] STOP_LAMP_FAULTS_OR_PARKING = {
@@ -59,9 +66,16 @@ public final class CandidateFilter {
     };
 
     private static final String[] DIAGNOSTIC_PATTERNS = {
-        "brake", "brk", "stop", "stplmp", "cyl", "prsr",
-        "pedal", "pdl", "regen", "decel", "ieb", "esc",
-        "autohold", "avh", "epb", "hac", "hill"
+        "brake", "brk", "stop", "stplmp", "lamp", "lmp", "cyl", "prsr",
+        "pedal", "pdl", "regen", "decel", "longaccel", "ieb", "esc",
+        "autohold", "avh", "epb", "hac", "hill",
+        "scc", "cruise", "adas", "fca", "vcu", "mcu", "hcu", "ems", "xev"
+    };
+
+    private static final String[] NOISY_CONTINUOUS_PATTERNS = {
+        "accelpdl", "carspeed", "whlspd", "wheelspeed", "sasangle", "steer",
+        "odometer", "odo", "batsoc", "soh", "temp", "volt", "curr",
+        "clock", "timer", "alive", "aliv", "crc"
     };
 
     private CandidateFilter() {}
@@ -79,9 +93,34 @@ public final class CandidateFilter {
                 || returnType == Double.TYPE;
     }
 
-    public static Role classify(String methodName, int paramCount, Class<?> returnType) {
+    /**
+     * Returns true if a zero-argument method is strictly read-only, returns a primitive
+     * boolean/number, and cannot expose per-car identity/location or trigger side effects.
+     */
+    public static boolean isSafeReadOnlyGetter(String methodName, int paramCount, Class<?> returnType) {
+        return extractSafeCompactStem(methodName, paramCount, returnType) != null;
+    }
+
+    /**
+     * Returns true for high-rate analog telemetry (speed, steering angle, throttle, temperatures)
+     * that should appear in the getter inventory snapshot without flooding the transition log.
+     */
+    public static boolean isNoisyContinuousGetter(String methodName) {
+        if (methodName == null) {
+            return false;
+        }
+        String compact = methodName.toLowerCase(Locale.US).replace("_", "");
+        for (String p : NOISY_CONTINUOUS_PATTERNS) {
+            if (compact.contains(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String extractSafeCompactStem(String methodName, int paramCount, Class<?> returnType) {
         if (methodName == null || paramCount != 0 || !isAllowedReturnType(returnType)) {
-            return Role.NONE;
+            return null;
         }
         String lower = methodName.toLowerCase(Locale.US);
         String stem;
@@ -94,23 +133,68 @@ public final class CandidateFilter {
         } else if (lower.startsWith("navi_is")) {
             stem = lower.substring(7);
         } else {
-            return Role.NONE;
+            return null;
         }
         String compact = stem.replace("_", "");
         if (compact.isEmpty()) {
-            return Role.NONE;
+            return null;
         }
         // Reject Object/Binder plumbing
         if ("class".equals(compact) || "hashcode".equals(compact) || "interfacedescriptor".equals(compact)) {
-            return Role.NONE;
+            return null;
         }
         for (String blocked : BLOCKED_SUBSTRINGS) {
             if (lower.contains(blocked) || compact.contains(blocked)) {
-                return Role.NONE;
+                return null;
+            }
+        }
+        java.util.List<String> tokens = tokenizeIdentifier(methodName);
+        for (String tok : tokens) {
+            for (String blockedTok : BLOCKED_TOKENS) {
+                if (blockedTok.equals(tok)) {
+                    return null;
+                }
             }
         }
         // Guard against "start..." methods disguised behind get/is
         if (compact.startsWith("start")) {
+            return null;
+        }
+        return compact;
+    }
+
+    private static java.util.List<String> tokenizeIdentifier(String name) {
+        java.util.List<String> tokens = new java.util.ArrayList<String>(8);
+        String[] parts = name.split("_");
+        for (String part : parts) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            int start = 0;
+            int len = part.length();
+            for (int i = 1; i < len; i++) {
+                char c = part.charAt(i);
+                char prev = part.charAt(i - 1);
+                boolean nextLower = (i + 1 < len) && Character.isLowerCase(part.charAt(i + 1));
+                if (Character.isUpperCase(c) && (Character.isLowerCase(prev) || nextLower)) {
+                    tokens.add(part.substring(start, i).toLowerCase(Locale.US));
+                    start = i;
+                } else if (Character.isDigit(c) && !Character.isDigit(prev)) {
+                    tokens.add(part.substring(start, i).toLowerCase(Locale.US));
+                    start = i;
+                } else if (!Character.isDigit(c) && Character.isDigit(prev)) {
+                    tokens.add(part.substring(start, i).toLowerCase(Locale.US));
+                    start = i;
+                }
+            }
+            tokens.add(part.substring(start).toLowerCase(Locale.US));
+        }
+        return tokens;
+    }
+
+    public static Role classify(String methodName, int paramCount, Class<?> returnType) {
+        String compact = extractSafeCompactStem(methodName, paramCount, returnType);
+        if (compact == null) {
             return Role.NONE;
         }
 

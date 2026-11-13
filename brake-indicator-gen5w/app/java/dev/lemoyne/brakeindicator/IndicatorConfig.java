@@ -14,10 +14,10 @@ public final class IndicatorConfig {
         NATIVE_AND_DECEL;
 
         public static SignalMode fromString(String s) {
-            if ("native_and_decel".equalsIgnoreCase(s)) {
-                return NATIVE_AND_DECEL;
+            if (s != null && "native".equalsIgnoreCase(s.trim())) {
+                return NATIVE;
             }
-            return NATIVE;
+            return NATIVE_AND_DECEL;
         }
     }
 
@@ -57,6 +57,7 @@ public final class IndicatorConfig {
     public final int iconSizePx;
     public final float pressureThreshold;
     public final float decelThresholdMps2;
+    public final boolean standstillHold;
     public final boolean probeLogging;
 
     public IndicatorConfig(
@@ -69,7 +70,31 @@ public final class IndicatorConfig {
             float pressureThreshold,
             float decelThresholdMps2,
             boolean probeLogging) {
-        this.signalMode = signalMode == null ? SignalMode.NATIVE : signalMode;
+        this(
+                signalMode,
+                offState,
+                anchor,
+                xOffsetPx,
+                yOffsetPx,
+                iconSizePx,
+                pressureThreshold,
+                decelThresholdMps2,
+                true,
+                probeLogging);
+    }
+
+    public IndicatorConfig(
+            SignalMode signalMode,
+            OffState offState,
+            Anchor anchor,
+            int xOffsetPx,
+            int yOffsetPx,
+            int iconSizePx,
+            float pressureThreshold,
+            float decelThresholdMps2,
+            boolean standstillHold,
+            boolean probeLogging) {
+        this.signalMode = signalMode == null ? SignalMode.NATIVE_AND_DECEL : signalMode;
         this.offState = offState == null ? OffState.HIDDEN : offState;
         this.anchor = anchor == null ? Anchor.TOP_RIGHT : anchor;
         this.xOffsetPx = clampInt(xOffsetPx, -1920, 1920);
@@ -77,19 +102,21 @@ public final class IndicatorConfig {
         this.iconSizePx = clampInt(iconSizePx, 20, 96);
         this.pressureThreshold = clampFloat(pressureThreshold, 0.1f, 200.0f);
         this.decelThresholdMps2 = clampFloat(decelThresholdMps2, 0.3f, 6.0f);
+        this.standstillHold = standstillHold;
         this.probeLogging = probeLogging;
     }
 
     public static IndicatorConfig defaults() {
         return new IndicatorConfig(
-                SignalMode.NATIVE,
+                SignalMode.NATIVE_AND_DECEL,
                 OffState.HIDDEN,
                 Anchor.TOP_RIGHT,
                 260,
                 6,
                 36,
-                1.5f,
-                1.3f,
+                0.4f,
+                1.2f,
+                true,
                 true);
     }
 
@@ -103,8 +130,9 @@ public final class IndicatorConfig {
         int xOff = parseInt(values.get("x_offset"), 260);
         int yOff = parseInt(values.get("y_offset"), 6);
         int size = parseInt(values.get("icon_size"), 36);
-        int pressureTenths = parseInt(values.get("pressure_threshold"), 15);
-        int decelTenths = parseInt(values.get("decel_threshold"), 13);
+        int pressureTenths = parseInt(values.get("pressure_threshold"), 4);
+        int decelTenths = parseInt(values.get("decel_threshold"), 12);
+        boolean standstill = parseBoolean(values.get("standstill_hold"), true);
         boolean probe = parseBoolean(values.get("probe_logging"), true);
         return new IndicatorConfig(
                 mode,
@@ -115,6 +143,7 @@ public final class IndicatorConfig {
                 size,
                 pressureTenths / 10.0f,
                 decelTenths / 10.0f,
+                standstill,
                 probe);
     }
 

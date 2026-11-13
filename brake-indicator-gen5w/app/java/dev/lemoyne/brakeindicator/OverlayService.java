@@ -268,7 +268,7 @@ public final class OverlayService extends Service {
         LocalSocket s = new LocalSocket();
         try {
             s.connect(new LocalSocketAddress(IpcProtocol.SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
-            s.setSoTimeout(2500);
+            s.setSoTimeout(6000);
             OutputStream out = s.getOutputStream();
             out.write((command + "\n").getBytes("UTF-8"));
             out.flush();

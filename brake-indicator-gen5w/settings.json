@@ -4,18 +4,18 @@
       "key": "signal_mode",
       "type": "choice",
       "title": "Brake signal source",
-      "default": "native",
+      "default": "native_and_decel",
       "options": [
         {
-          "value": "native",
-          "title": "Native OEM signals only (Option 1: ITM_HSCANService + brake.pressure)"
+          "value": "native_and_decel",
+          "title": "OEM signals + Regen / Smart Cruise deceleration (Recommended)"
         },
         {
-          "value": "native_and_decel",
-          "title": "Native OEM signals + CAN speed deceleration fallback (regen >= threshold)"
+          "value": "native",
+          "title": "Native OEM brake signals only (ITM_HSCANService + brake.pressure)"
         }
       ],
-      "description": "Option 1 reads native telematics CAN signals directly from tm_hscan_service and HMG-API brake.pressure. Choose the fallback mode if your firmware does not expose regenerative stop-lamp state or IEB cylinder pressure during pure regen."
+      "description": "Recommended mode combines direct OEM brake-lamp/cylinder-pressure getters with fast CAN speed deceleration and standstill hold so Level 2/3 regen, i-Pedal, and Smart Cruise Control illuminate the indicator reliably."
     },
     {
       "key": "off_state",
@@ -80,22 +80,29 @@
       "key": "pressure_threshold",
       "type": "number",
       "title": "Brake pressure threshold (tenths)",
-      "default": 15,
-      "description": "Minimum getCylPrsrVal / brake.pressure reading in tenths (15 = 1.5) to treat hydraulic/IEB braking as active."
+      "default": 4,
+      "description": "Minimum getCylPrsrVal / brake.pressure reading in tenths (4 = 0.4) to treat foot-pedal or IEB hydraulic braking as active."
     },
     {
       "key": "decel_threshold",
       "type": "number",
-      "title": "Regen deceleration threshold (tenths of m/s^2)",
-      "default": 13,
-      "description": "Minimum deceleration in tenths of m/s^2 (13 = 1.3 m/s^2, UNECE R13-H stop-lamp threshold) when signal_mode includes deceleration fallback."
+      "title": "Regen / cruise deceleration threshold (tenths of m/s^2)",
+      "default": 12,
+      "description": "Minimum longitudinal deceleration in tenths of m/s^2 (12 = 1.2 m/s^2, matching E-GMP UNECE R13-H stop-lamp onset) when Regen / Smart Cruise detection is enabled."
+    },
+    {
+      "key": "standstill_hold",
+      "type": "toggle",
+      "title": "Hold at standstill after regen / cruise stop",
+      "default": true,
+      "description": "Keeps the indicator illuminated at 0 km/h after decelerating to a stop in i-Pedal or Smart Cruise Control until throttle is applied, the car moves, or Park is selected."
     },
     {
       "key": "probe_logging",
       "type": "toggle",
-      "title": "Record ITM_HSCANService candidate transitions",
+      "title": "Record OEM CAN getter transitions",
       "default": true,
-      "description": "Logs read-only brake/stop-lamp getter transitions from com.hkmc.ext.hcan.jar for on-car Option 1 verification and USB export."
+      "description": "Logs read-only getter transitions across ITM_HSCANService and HKMC car services for on-car signal verification and USB export."
     }
   ]
 }

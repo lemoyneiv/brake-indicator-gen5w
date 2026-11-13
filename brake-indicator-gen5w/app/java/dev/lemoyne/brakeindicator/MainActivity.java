@@ -23,13 +23,8 @@ import hmgapi.client.HmgApi;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -95,7 +90,7 @@ public final class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator");
+        title.setText("Brake Light Indicator v0.2");
         title.setTextColor(TEXT_PRIMARY);
         title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 30);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -161,7 +156,7 @@ public final class MainActivity extends Activity {
         previewMeta.addView(sourceLabel);
 
         configSummaryText = new TextView(this);
-        configSummaryText.setText("Mode: NATIVE  |  Anchor: TOP_RIGHT (260, 6)");
+        configSummaryText.setText("Mode: NATIVE_AND_DECEL  |  Anchor: TOP_RIGHT (260, 6)");
         configSummaryText.setTextColor(TEXT_MUTED);
         configSummaryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
         previewMeta.addView(configSummaryText);
@@ -238,7 +233,7 @@ public final class MainActivity extends Activity {
         rightHeader.setGravity(Gravity.CENTER_VERTICAL);
 
         probeHeaderText = new TextView(this);
-        probeHeaderText.setText("Option 1 OEM Signal Probe (ITM_HSCANService)");
+        probeHeaderText.setText("OEM CAN Signal Probe (HSCAN + System + BCM)");
         probeHeaderText.setTextColor(ACCENT_TEAL);
         probeHeaderText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 20);
         probeHeaderText.setTypeface(Typeface.DEFAULT_BOLD);
@@ -475,36 +470,35 @@ public final class MainActivity extends Activity {
     }
 
     private void exportReportToUsb() {
+        actionNoticeText.setText("Exporting probe log to USB drive...");
         Thread t = new Thread("brake-usb-export") {
             @Override
             public void run() {
                 String msg;
+                String toastMsg = null;
                 try {
-                    String report = OverlayService.sendMonitorCommand("REPORT");
-                    if (report == null || report.isEmpty()) {
-                        msg = "Monitor service not running; nothing to export.";
+                    String reply = OverlayService.sendMonitorCommand("EXPORT_USB");
+                    if (reply == null || reply.isEmpty()) {
+                        msg = "Monitor service not running; enable Brake Light Indicator in HMG-API first.";
+                    } else if (reply.startsWith("OK\t")) {
+                        String savedPath = reply.substring(3).trim();
+                        File f = new File(savedPath);
+                        msg = "Saved to USB: " + savedPath;
+                        toastMsg = "Exported " + f.getName();
+                    } else if (reply.startsWith("ERR\t")) {
+                        msg = reply.substring(4).trim();
+                        toastMsg = "USB export: see status note";
                     } else {
-                        HmgApi api = HmgApi.connect().timeout(3000);
-                        List<String> folders = api.usbFolders();
-                        if (folders.isEmpty()) {
-                            msg = "No USB drive detected (insert FAT32/exFAT USB stick).";
-                        } else {
-                            File dir = new File(folders.get(0));
-                            dir.mkdirs();
-                            String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
-                            File out = new File(dir, "hscan-probe-" + stamp + ".txt");
-                            FileOutputStream fos = new FileOutputStream(out);
-                            try {
-                                fos.write(report.getBytes("UTF-8"));
-                            } finally {
-                                fos.close();
-                            }
-                            msg = "Saved " + out.getAbsolutePath();
-                            HmgApi.toast(MainActivity.this, "Exported " + out.getName());
-                        }
+                        msg = "Unexpected monitor response: " + reply;
                     }
                 } catch (Exception e) {
                     msg = "USB export failed: " + e.getMessage();
+                }
+                if (toastMsg != null) {
+                    try {
+                        HmgApi.toast(MainActivity.this, toastMsg);
+                    } catch (Exception ignored) {
+                    }
                 }
                 final String finalMsg = msg;
                 uiHandler.post(new Runnable() {

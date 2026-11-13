@@ -1,0 +1,101 @@
+{
+  "settings": [
+    {
+      "key": "signal_mode",
+      "type": "choice",
+      "title": "Brake signal source",
+      "default": "native",
+      "options": [
+        {
+          "value": "native",
+          "title": "Native OEM signals only (Option 1: ITM_HSCANService + brake.pressure)"
+        },
+        {
+          "value": "native_and_decel",
+          "title": "Native OEM signals + CAN speed deceleration fallback (regen >= threshold)"
+        }
+      ],
+      "description": "Option 1 reads native telematics CAN signals directly from tm_hscan_service and HMG-API brake.pressure. Choose the fallback mode if your firmware does not expose regenerative stop-lamp state or IEB cylinder pressure during pure regen."
+    },
+    {
+      "key": "off_state",
+      "type": "choice",
+      "title": "When brake lights are off",
+      "default": "hidden",
+      "options": [
+        {
+          "value": "hidden",
+          "title": "Hidden (shown only while illuminated)"
+        },
+        {
+          "value": "dim",
+          "title": "Subtle dim outline"
+        }
+      ],
+      "description": "Controls whether the top-bar icon disappears completely or stays faintly visible as a dark-grey outline when unlit."
+    },
+    {
+      "key": "anchor",
+      "type": "choice",
+      "title": "Top-bar horizontal anchor",
+      "default": "top_right",
+      "options": [
+        {
+          "value": "top_right",
+          "title": "Top right (status bar area)"
+        },
+        {
+          "value": "top_center",
+          "title": "Top center"
+        },
+        {
+          "value": "top_left",
+          "title": "Top left"
+        }
+      ],
+      "description": "Selects which edge of the top row x_offset is measured from."
+    },
+    {
+      "key": "x_offset",
+      "type": "number",
+      "title": "Horizontal offset (px)",
+      "default": 260,
+      "description": "Distance in pixels from the anchor (for Top center, signed offset from center). Default 260 sits cleanly to the left of the clock and status icons on 1920x720 screens."
+    },
+    {
+      "key": "y_offset",
+      "type": "number",
+      "title": "Vertical offset from top (px)",
+      "default": 6,
+      "description": "Distance in pixels from the top edge of the screen."
+    },
+    {
+      "key": "icon_size",
+      "type": "number",
+      "title": "Icon height (px)",
+      "default": 36,
+      "description": "Height of the top-bar brake lamp icon in pixels (20 to 96; stock Gen5W status icons are 36 px tall)."
+    },
+    {
+      "key": "pressure_threshold",
+      "type": "number",
+      "title": "Brake pressure threshold (tenths)",
+      "default": 15,
+      "description": "Minimum getCylPrsrVal / brake.pressure reading in tenths (15 = 1.5) to treat hydraulic/IEB braking as active."
+    },
+    {
+      "key": "decel_threshold",
+      "type": "number",
+      "title": "Regen deceleration threshold (tenths of m/s^2)",
+      "default": 13,
+      "description": "Minimum deceleration in tenths of m/s^2 (13 = 1.3 m/s^2, UNECE R13-H stop-lamp threshold) when signal_mode includes deceleration fallback."
+    },
+    {
+      "key": "probe_logging",
+      "type": "toggle",
+      "title": "Record ITM_HSCANService candidate transitions",
+      "default": true,
+      "description": "Logs read-only brake/stop-lamp getter transitions from com.hkmc.ext.hcan.jar for on-car Option 1 verification and USB export."
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "id": "brake-indicator-gen5w",
+  "name": "Brake Light Indicator",
+  "version": "0.1.0",
+  "hmgapi": ">=1.0.0",
+  "authors": ["Kyle"],
+  "license": "AGPL-3.0",
+  "repo": "https://github.com/lemoyneiv/brake-indicator-gen5w",
+  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units, providing in-car confirmation when hydraulic or regenerative braking illuminates the brake lights. Includes a read-only ITM_HSCANService signal probe.",
+  "live": true,
+  "apps": [
+    {
+      "apk": "app/BrakeIndicator.apk",
+      "package": "dev.lemoyne.brakeindicator"
+    }
+  ],
+  "services": [
+    {
+      "name": "monitor",
+      "jar": "app/BrakeIndicator.apk",
+      "class": "dev.lemoyne.brakeindicator.MonitorMain",
+      "user": "system",
+      "start": "android",
+      "restart": true
+    }
+  ],
+  "usb": ["BrakeIndicator"],
+  "vehicle": {
+    "read": [
+      "brake.pressure",
+      "speed",
+      "pedal.accel",
+      "gear.park",
+      "parking_brake",
+      "moving"
+    ]
+  },
+  "provides": {
+    "launcher": [
+      {
+        "title": "Brake Indicator",
+        "package": "dev.lemoyne.brakeindicator",
+        "class": ".MainActivity",
+        "icon": "icons/icon.png",
+        "icon_night": "icons/icon_night.png",
+        "icon_disabled": "icons/icon_disabled.png",
+        "icon_disabled_night": "icons/icon_disabled_night.png"
+      }
+    ],
+    "star_key": [
+      {
+        "id": "open",
+        "title": "Brake Indicator",
+        "activity": {
+          "package": "dev.lemoyne.brakeindicator",
+          "class": ".MainActivity"
+        }
+      }
+    ]
+  }
+}

@@ -1,21 +1,42 @@
 {
   "settings": [
     {
-      "key": "signal_mode",
+      "key": "obd_mode",
       "type": "choice",
-      "title": "Brake signal source",
-      "default": "native_and_decel",
+      "title": "OBD-II & indicator source",
+      "default": "obd_when_connected",
       "options": [
         {
-          "value": "native_and_decel",
-          "title": "OEM signals + Regen / Smart Cruise deceleration (Recommended)"
+          "value": "obd_when_connected",
+          "title": "Real OBD brake lamp when connected, HMG-API model otherwise (Recommended)"
         },
         {
-          "value": "native",
-          "title": "Native OEM brake signals only (ITM_HSCANService + brake.pressure)"
+          "value": "model_only_icon",
+          "title": "HMG-API model drives icon (live accuracy & lag test vs OBD)"
+        },
+        {
+          "value": "disabled",
+          "title": "OBD disabled (HMG-API built-in readings only)"
         }
       ],
-      "description": "Recommended mode combines direct OEM brake-lamp/cylinder-pressure getters with fast CAN speed deceleration and standstill hold so Level 2/3 regen, i-Pedal, and Smart Cruise Control illuminate the indicator reliably."
+      "description": "Connects via @gen5w_ble directly first, falling back automatically to 127.0.0.1:35000 if obd-gen5w holds the BLE link. Both OBD modes log synchronized HMG-API + OBD ground-truth rows in RAM for USB CSV export."
+    },
+    {
+      "key": "signal_mode",
+      "type": "choice",
+      "title": "HMG-API brake model mode",
+      "default": "pressure_and_decel",
+      "options": [
+        {
+          "value": "pressure_and_decel",
+          "title": "Brake pressure + Regen / Smart Cruise deceleration & hold (Recommended)"
+        },
+        {
+          "value": "pressure_only",
+          "title": "Hydraulic brake.pressure only"
+        }
+      ],
+      "description": "Recommended mode combines HMG-API brake.pressure with longitudinal speed deceleration and standstill hold so Level 2/3 regen, i-Pedal, and Smart Cruise Control illuminate the indicator without OBD."
     },
     {
       "key": "off_state",
@@ -81,7 +102,7 @@
       "type": "number",
       "title": "Brake pressure threshold (tenths)",
       "default": 4,
-      "description": "Minimum getCylPrsrVal / brake.pressure reading in tenths (4 = 0.4) to treat foot-pedal or IEB hydraulic braking as active."
+      "description": "Minimum HMG-API brake.pressure reading in tenths (4 = 0.4) to treat foot-pedal or IEB hydraulic braking as active."
     },
     {
       "key": "decel_threshold",
@@ -95,14 +116,14 @@
       "type": "toggle",
       "title": "Hold at standstill after regen / cruise stop",
       "default": true,
-      "description": "Keeps the indicator illuminated at 0 km/h after decelerating to a stop in i-Pedal or Smart Cruise Control until throttle is applied, the car moves, or Park is selected."
+      "description": "Keeps the HMG-API model illuminated at 0 km/h after decelerating to a stop in i-Pedal or Smart Cruise Control until throttle is applied, the car moves, or Park is selected."
     },
     {
-      "key": "probe_logging",
-      "type": "toggle",
-      "title": "Record OEM CAN getter transitions",
-      "default": true,
-      "description": "Logs read-only getter transitions across ITM_HSCANService and HKMC car services for on-car signal verification and USB export."
+      "key": "bridge_port",
+      "type": "number",
+      "title": "Loopback ELM327 fallback port",
+      "default": 35000,
+      "description": "Localhost TCP port (127.0.0.1) tried automatically when @gen5w_ble direct BLE is busy (e.g. obd-gen5w loopback bridge)."
     }
   ]
 }

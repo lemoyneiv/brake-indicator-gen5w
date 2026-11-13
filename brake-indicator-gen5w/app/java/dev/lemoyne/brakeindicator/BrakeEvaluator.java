@@ -1,8 +1,13 @@
 package dev.lemoyne.brakeindicator;
 
 /**
- * Evaluates live vehicle readings and Option 1 OEM CAN signals to determine
- * whether the vehicle's brake lights are illuminated.
+ * Evaluates built-in HMG-API vehicle readings (`brake.pressure`, `speed`, `pedal.accel`,
+ * `gear.park`, `parking_brake`, `moving`, `steering.angle`, `hv.soc`) alongside optional
+ * real-time OBD-II IGMP (`770` -> `778`, UDS `22 BC06`) brake-lamp ground truth.
+ *
+ * Specifically tuned for HMG-API's reading freshness windows (`100 ms` for `brake.pressure`
+ * and `pedal.accel`, `250 ms` for `speed`): unchanged cached `speed` reads within `< 280 ms`
+ * do not inject artificial `0.0 m/s^2` steps between `Hub` refreshes.
  */
 public final class BrakeEvaluator {
 
@@ -10,16 +15,27 @@ public final class BrakeEvaluator {
     public static final float MAX_VALID_PRESSURE = 409.4f;
     public static final float MAX_VALID_SPEED_KMH = 350.0f;
     public static final float MAX_VALID_ACCEL_PEDAL = 250.0f;
+    public static final float MAX_VALID_STEERING_DEG = 1080.0f;
+    public static final float MAX_VALID_SOC_PCT = 105.0f;
+
+    /** Maximum age of an OBD 22BC06 sample before falling back to the HMG-API model. */
+    public static final long MAX_OBD_FRESH_MS = 900L;
 
     private static final float PRESSURE_RELEASE_RATIO = 0.70f;
     private static final float DECEL_RELEASE_RATIO = 0.60f;
-    private static final float DECEL_EMA_ALPHA = 0.60f;
-    private static final long DECEL_HOLD_MS = 180L;
+    private static final float DECEL_EMA_ALPHA = 0.65f;
+    private static final long DECEL_HOLD_MS = 320L;
 
-    private static final long WINDOW_TARGET_MS = 240L;
-    private static final long MIN_WINDOW_MS = 75L;
-    private static final long MAX_WINDOW_MS = 1200L;
-    private static final int SPEED_HISTORY_CAP = 20;
+    /**
+     * HMG-API caches `speed` for 250 ms. When polled at 20 Hz (50 ms), up to 5 consecutive
+     * reads return the exact same cached float before the next CAN refresh arrives.
+     * We treat unchanged values within `< 280 ms` as cached repeats rather than zero-decel ticks.
+     */
+    private static final long SPEED_CACHE_REPEAT_MS = 280L;
+    private static final long WINDOW_TARGET_MS = 350L;
+    private static final long MIN_WINDOW_MS = 100L;
+    private static final long MAX_WINDOW_MS = 1500L;
+    private static final int SPEED_HISTORY_CAP = 24;
 
     /**
      * In i-Pedal / Level 3 regen, drivers often modulate deceleration between 0% and ~20%
@@ -31,35 +47,84 @@ public final class BrakeEvaluator {
     private static final float STANDSTILL_SPEED_MAX_KMH = 1.5f;
     private static final long STANDSTILL_ARM_WINDOW_MS = 2500L;
 
+    public static final class ObdSample {
+        public final boolean connected;
+        public final String transport; // "BLE", "BRIDGE", or ""
+        public final long sampleElapsedMs;
+        public final int rawCode;      // e.g. 0, 4, 36, 40, 41, 44, 45, or -1 if none yet
+        public final boolean brakeLampLit;
+        public final boolean pedalBit;
+
+        public ObdSample(
+                boolean connected,
+                String transport,
+                long sampleElapsedMs,
+                int rawCode,
+                boolean brakeLampLit,
+                boolean pedalBit) {
+            this.connected = connected;
+            this.transport = transport == null ? "" : transport;
+            this.sampleElapsedMs = sampleElapsedMs;
+            this.rawCode = rawCode;
+            this.brakeLampLit = brakeLampLit;
+            this.pedalBit = pedalBit;
+        }
+
+        public static ObdSample disconnected() {
+            return new ObdSample(false, "", 0L, -1, false, false);
+        }
+
+        public boolean isFreshAt(long nowMs) {
+            return connected
+                    && rawCode >= 0
+                    && sampleElapsedMs > 0L
+                    && (nowMs - sampleElapsedMs) >= 0L
+                    && (nowMs - sampleElapsedMs) <= MAX_OBD_FRESH_MS;
+        }
+
+        public long ageMsAt(long nowMs) {
+            if (!connected || rawCode < 0 || sampleElapsedMs <= 0L) {
+                return -1L;
+            }
+            return Math.max(0L, nowMs - sampleElapsedMs);
+        }
+    }
+
     public static final class Input {
         public final long nowMs;
-        public final Boolean nativeStopLamp;
-        public final String nativeStopLampName;
         public final Float brakePressure;
         public final Float speedKmh;
         public final Float accelPedal;
+        public final Float steeringAngleDeg;
         public final Boolean gearPark;
         public final Boolean parkingBrake;
+        public final Boolean moving;
+        public final Float hvSocPct;
+        public final ObdSample obd;
         public final long testUntilMs;
 
         public Input(
                 long nowMs,
-                Boolean nativeStopLamp,
-                String nativeStopLampName,
                 Float brakePressure,
                 Float speedKmh,
                 Float accelPedal,
+                Float steeringAngleDeg,
                 Boolean gearPark,
                 Boolean parkingBrake,
+                Boolean moving,
+                Float hvSocPct,
+                ObdSample obd,
                 long testUntilMs) {
             this.nowMs = nowMs;
-            this.nativeStopLamp = nativeStopLamp;
-            this.nativeStopLampName = nativeStopLampName == null ? "" : nativeStopLampName;
             this.brakePressure = sanitizeRange(brakePressure, 0.0f, MAX_VALID_PRESSURE);
             this.speedKmh = sanitizeRange(speedKmh, 0.0f, MAX_VALID_SPEED_KMH);
             this.accelPedal = sanitizeRange(accelPedal, 0.0f, MAX_VALID_ACCEL_PEDAL);
+            this.steeringAngleDeg = sanitizeRange(steeringAngleDeg, -MAX_VALID_STEERING_DEG, MAX_VALID_STEERING_DEG);
             this.gearPark = gearPark;
             this.parkingBrake = parkingBrake;
+            this.moving = moving;
+            this.hvSocPct = sanitizeRange(hvSocPct, 0.0f, MAX_VALID_SOC_PCT);
+            this.obd = obd == null ? ObdSample.disconnected() : obd;
             this.testUntilMs = testUntilMs;
         }
 
@@ -76,40 +141,61 @@ public final class BrakeEvaluator {
 
     public static final class Snapshot {
         public final long timestampMs;
+        /** Final illumination state rendered on the top-bar icon (respecting ObdMode & manual test). */
         public final boolean illuminated;
         public final String source;
-        public final Boolean nativeStopLamp;
-        public final String nativeStopLampName;
+        /** Pure HMG-API built-in readings model decision (always evaluated for live accuracy scoring). */
+        public final boolean modelIlluminated;
+        public final String modelSource;
+
         public final Float brakePressure;
         public final Float speedKmh;
         public final Float accelPedal;
+        public final Float steeringAngleDeg;
         public final float decelMps2;
         public final Boolean gearPark;
         public final Boolean parkingBrake;
+        public final Boolean moving;
+        public final Float hvSocPct;
+        public final ObdSample obd;
+        public final boolean obdFresh;
+        public final boolean manualTestActive;
 
         public Snapshot(
                 long timestampMs,
                 boolean illuminated,
                 String source,
-                Boolean nativeStopLamp,
-                String nativeStopLampName,
+                boolean modelIlluminated,
+                String modelSource,
                 Float brakePressure,
                 Float speedKmh,
                 Float accelPedal,
+                Float steeringAngleDeg,
                 float decelMps2,
                 Boolean gearPark,
-                Boolean parkingBrake) {
+                Boolean parkingBrake,
+                Boolean moving,
+                Float hvSocPct,
+                ObdSample obd,
+                boolean obdFresh,
+                boolean manualTestActive) {
             this.timestampMs = timestampMs;
             this.illuminated = illuminated;
             this.source = source == null ? "OFF" : source;
-            this.nativeStopLamp = nativeStopLamp;
-            this.nativeStopLampName = nativeStopLampName == null ? "" : nativeStopLampName;
+            this.modelIlluminated = modelIlluminated;
+            this.modelSource = modelSource == null ? "OFF" : modelSource;
             this.brakePressure = brakePressure;
             this.speedKmh = speedKmh;
             this.accelPedal = accelPedal;
+            this.steeringAngleDeg = steeringAngleDeg;
             this.decelMps2 = decelMps2;
             this.gearPark = gearPark;
             this.parkingBrake = parkingBrake;
+            this.moving = moving;
+            this.hvSocPct = hvSocPct;
+            this.obd = obd == null ? ObdSample.disconnected() : obd;
+            this.obdFresh = obdFresh;
+            this.manualTestActive = manualTestActive;
         }
     }
 
@@ -128,10 +214,10 @@ public final class BrakeEvaluator {
     public Snapshot evaluate(IndicatorConfig cfg, Input in) {
         IndicatorConfig config = cfg == null ? IndicatorConfig.defaults() : cfg;
 
-        // 1. Update longitudinal deceleration estimate (-dv/dt) over a ~240 ms sliding window
+        // 1. Update longitudinal deceleration estimate (-dv/dt) across HMG-API's 250 ms speed cache
         updateDecel(in.nowMs, in.speedKmh);
 
-        // 2. Update hydraulic/IEB cylinder pressure latch with hysteresis
+        // 2. Update hydraulic/IEB cylinder pressure latch (`brake.pressure`) with hysteresis
         if (in.brakePressure == null) {
             pressureLatched = false;
         } else if (pressureLatched) {
@@ -163,22 +249,23 @@ public final class BrakeEvaluator {
         }
 
         // 4. Arm & maintain i-Pedal / Smart Cruise Control standstill hold at 0 km/h
-        boolean activeBraking = decelLatched || pressureLatched || Boolean.TRUE.equals(in.nativeStopLamp);
+        boolean activeModelBraking = decelLatched || pressureLatched;
         if (!Boolean.TRUE.equals(in.gearPark)
                 && in.speedKmh != null
                 && in.speedKmh >= 0.5f
-                && in.speedKmh <= 12.0f
-                && activeBraking) {
+                && in.speedKmh <= 14.0f
+                && activeModelBraking) {
             lastBrakingNearStopMs = in.nowMs;
         }
 
-        if (config.signalMode != IndicatorConfig.SignalMode.NATIVE_AND_DECEL || !config.standstillHold) {
+        boolean decelModeEnabled = (config.signalMode == IndicatorConfig.SignalMode.PRESSURE_AND_DECEL);
+        if (!decelModeEnabled || !config.standstillHold) {
             standstillLatched = false;
         } else if (Boolean.TRUE.equals(in.gearPark)
                 || in.speedKmh == null
                 || in.speedKmh >= STANDSTILL_SPEED_MAX_KMH
-                || in.accelPedal == null
-                || in.accelPedal >= STANDSTILL_RELEASE_ACCEL) {
+                || Boolean.TRUE.equals(in.moving) && in.speedKmh >= 2.0f
+                || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
             standstillLatched = false;
             if (Boolean.TRUE.equals(in.gearPark)
                     || (in.speedKmh != null && in.speedKmh >= 3.0f)
@@ -190,39 +277,61 @@ public final class BrakeEvaluator {
             standstillLatched = true;
         }
 
-        // 5. Priority resolution
-        boolean lit = false;
-        String src = "OFF";
+        // 5. Pure HMG-API model resolution (always computed so accuracy vs OBD is scored continuously)
+        boolean modelLit = false;
+        String modelSrc = "OFF";
+        if (pressureLatched) {
+            modelLit = true;
+            modelSrc = "BRAKE_PRESSURE";
+        } else if (decelModeEnabled && decelLatched) {
+            modelLit = true;
+            modelSrc = "REGEN_DECEL";
+        } else if (decelModeEnabled && standstillLatched) {
+            modelLit = true;
+            modelSrc = "STANDSTILL_HOLD";
+        }
 
-        if (in.nowMs < in.testUntilMs) {
-            lit = true;
-            src = "MANUAL_TEST";
-        } else if (Boolean.TRUE.equals(in.nativeStopLamp)) {
-            lit = true;
-            src = in.nativeStopLampName.isEmpty() ? "OEM_LAMP" : "OEM_LAMP:" + in.nativeStopLampName;
-        } else if (pressureLatched) {
-            lit = true;
-            src = "BRAKE_PRESSURE";
-        } else if (config.signalMode == IndicatorConfig.SignalMode.NATIVE_AND_DECEL && decelLatched) {
-            lit = true;
-            src = "REGEN_DECEL";
-        } else if (config.signalMode == IndicatorConfig.SignalMode.NATIVE_AND_DECEL && standstillLatched) {
-            lit = true;
-            src = "STANDSTILL_HOLD";
+        // 6. Top-bar icon resolution based on manual test + ObdMode + live OBD freshness
+        boolean manualTest = in.nowMs < in.testUntilMs;
+        boolean obdFresh = (config.obdMode != IndicatorConfig.ObdMode.DISABLED) && in.obd.isFreshAt(in.nowMs);
+        boolean iconLit;
+        String iconSrc;
+
+        if (manualTest) {
+            iconLit = true;
+            iconSrc = "MANUAL_TEST";
+        } else if (config.obdMode == IndicatorConfig.ObdMode.OBD_WHEN_CONNECTED && obdFresh) {
+            iconLit = in.obd.brakeLampLit;
+            if (iconLit) {
+                iconSrc = in.obd.pedalBit
+                        ? ("OBD_PEDAL[" + in.obd.rawCode + "]")
+                        : ("OBD_REGEN[" + in.obd.rawCode + "]");
+            } else {
+                iconSrc = "OBD_OFF";
+            }
+        } else {
+            iconLit = modelLit;
+            iconSrc = modelSrc;
         }
 
         return new Snapshot(
                 in.nowMs,
-                lit,
-                src,
-                in.nativeStopLamp,
-                in.nativeStopLampName,
+                iconLit,
+                iconSrc,
+                modelLit,
+                modelSrc,
                 in.brakePressure,
                 in.speedKmh,
                 in.accelPedal,
+                in.steeringAngleDeg,
                 smoothedDecelMps2,
                 in.gearPark,
-                in.parkingBrake);
+                in.parkingBrake,
+                in.moving,
+                in.hvSocPct,
+                in.obd,
+                obdFresh,
+                manualTest);
     }
 
     public static Float parseReadingFloat(String text) {
@@ -270,6 +379,13 @@ public final class BrakeEvaluator {
             }
         }
 
+        if (speedKmh < 0.3f) {
+            smoothedDecelMps2 = 0.0f;
+            hasDecelSample = true;
+            pushHistorySample(nowMs, speedKmh);
+            return;
+        }
+
         // Prune samples older than MAX_WINDOW_MS
         int expired = 0;
         while (expired < histCount && (nowMs - histTimeMs[expired]) > MAX_WINDOW_MS) {
@@ -284,7 +400,17 @@ public final class BrakeEvaluator {
             histCount = remain;
         }
 
-        // Choose newest sample at least WINDOW_TARGET_MS old, or oldest sample once MIN_WINDOW_MS has elapsed
+        // Detect cached duplicate speed reads inside HMG-API's 250 ms freshness window:
+        // hold current smoothedDecelMps2 until either speed steps OR 280 ms elapses unchanged.
+        if (histCount > 0) {
+            float prevSpeed = histSpeedKmh[histCount - 1];
+            long sincePrevMs = nowMs - histTimeMs[histCount - 1];
+            if (Math.abs(speedKmh - prevSpeed) < 0.04f && sincePrevMs < SPEED_CACHE_REPEAT_MS) {
+                return;
+            }
+        }
+
+        // Choose newest distinct sample at least WINDOW_TARGET_MS old, or oldest once MIN_WINDOW_MS elapsed
         int anchorIdx = -1;
         for (int i = histCount - 1; i >= 0; i--) {
             if (nowMs - histTimeMs[i] >= WINDOW_TARGET_MS) {
@@ -309,18 +435,22 @@ public final class BrakeEvaluator {
             }
         }
 
-        // Record sample if at least 20 ms elapsed since last stored sample
-        if (histCount == 0 || (nowMs - histTimeMs[histCount - 1]) >= 20L) {
-            if (histCount == SPEED_HISTORY_CAP) {
-                for (int i = 0; i < SPEED_HISTORY_CAP - 1; i++) {
-                    histTimeMs[i] = histTimeMs[i + 1];
-                    histSpeedKmh[i] = histSpeedKmh[i + 1];
-                }
-                histCount = SPEED_HISTORY_CAP - 1;
-            }
-            histTimeMs[histCount] = nowMs;
-            histSpeedKmh[histCount] = speedKmh;
-            histCount++;
+        pushHistorySample(nowMs, speedKmh);
+    }
+
+    private void pushHistorySample(long nowMs, float speedKmh) {
+        if (histCount > 0 && (nowMs - histTimeMs[histCount - 1]) < 20L) {
+            return;
         }
+        if (histCount == SPEED_HISTORY_CAP) {
+            for (int i = 0; i < SPEED_HISTORY_CAP - 1; i++) {
+                histTimeMs[i] = histTimeMs[i + 1];
+                histSpeedKmh[i] = histSpeedKmh[i + 1];
+            }
+            histCount = SPEED_HISTORY_CAP - 1;
+        }
+        histTimeMs[histCount] = nowMs;
+        histSpeedKmh[histCount] = speedKmh;
+        histCount++;
     }
 }

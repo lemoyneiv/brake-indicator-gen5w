@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -14,24 +15,15 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Reliable root-side USB drive detector and log exporter for Gen5W head units.
+ * Non-root external USB storage locator and atomic dataset exporter for Gen5W head units.
  *
- * Why hmgapid's `usb` command alone was not enough in v0.1.0:
- *   1. `op_usb` in hmgapid only returns `/storage/usbX/BrakeIndicator` if the
- *      `BrakeIndicator/` directory ALREADY exists on the USB stick beforehand.
- *   2. An unprivileged Android 4.4 app UID cannot `mkdirs()` on `/storage/usb0`
- *      without `WRITE_MEDIA_STORAGE`.
- *   3. Checking `new File("/storage/usb0").isDirectory()` as root without checking
- *      `/proc/mounts` would match an unmounted empty tmpfs stub directory.
- *
- * UsbExporter parses `/proc/mounts` to locate genuinely mounted USB filesystems,
- * creates `BrakeIndicator/` on the stick as root, writes and `fsync`s the report,
- * and saves a world-readable fallback copy to `/data/local/tmp/brake-indicator-probe.txt`.
+ * Strictly writes ONLY to removable USB media under {@code <usb>/BrakeIndicator/} using
+ * temporary {@code .part} files + {@code FileDescriptor.sync()} + {@code renameTo()} so
+ * sudden 12V power cuts never corrupt FAT32/exFAT sticks and internal eMMC flash is never touched.
  */
 public final class UsbExporter {
 
     public static final String SUBFOLDER = "BrakeIndicator";
-    public static final String FALLBACK_PATH = "/data/local/tmp/brake-indicator-probe.txt";
 
     private static final String[] USB_MOUNT_PREFIXES = {
         "/storage/usb",
@@ -42,6 +34,16 @@ public final class UsbExporter {
         "/storage/udisk",
         "/mnt/udisk",
         "/udisk"
+    };
+
+    private static final String[] DIRECT_USB_CANDIDATES = {
+        "/storage/usb0",
+        "/storage/usb1",
+        "/storage/usb2",
+        "/mnt/media_rw/usb0",
+        "/mnt/media_rw/usb1",
+        "/mnt/usb0",
+        "/mnt/usb1"
     };
 
     private static final String[] INTERNAL_PREFIXES = {
@@ -63,21 +65,25 @@ public final class UsbExporter {
 
     public static final class ExportResult {
         public final boolean ok;
-        public final String savedPath;
+        public final String csvPath;
+        public final String summaryPath;
         public final String errorMessage;
 
-        public ExportResult(boolean ok, String savedPath, String errorMessage) {
+        public ExportResult(boolean ok, String csvPath, String summaryPath, String errorMessage) {
             this.ok = ok;
-            this.savedPath = savedPath;
+            this.csvPath = csvPath;
+            this.summaryPath = summaryPath;
             this.errorMessage = errorMessage;
         }
     }
 
     private UsbExporter() {}
 
-    public static ExportResult exportReport(String reportContent, List<String> extraUsbFolders) {
-        String mountsText = readProcMounts();
-        List<String> roots = new ArrayList<String>(parseUsbMountPoints(mountsText));
+    public static ExportResult exportDatasetAndSummary(
+            String csvContent,
+            String summaryContent,
+            List<String> extraUsbFolders) {
+        Set<String> roots = new LinkedHashSet<String>();
         if (extraUsbFolders != null) {
             for (String folder : extraUsbFolders) {
                 if (folder == null || folder.trim().isEmpty()) {
@@ -85,52 +91,53 @@ public final class UsbExporter {
                 }
                 File f = new File(folder.trim());
                 File parent = SUBFOLDER.equals(f.getName()) ? f.getParentFile() : f;
-                if (parent != null && !roots.contains(parent.getAbsolutePath())) {
+                if (parent != null) {
                     roots.add(parent.getAbsolutePath());
                 }
             }
         }
-        return exportToDirectories(reportContent, roots, SUBFOLDER, new File(FALLBACK_PATH));
+        String mountsText = readProcMounts();
+        List<String> mountedUsb = parseUsbMountPoints(mountsText);
+        roots.addAll(mountedUsb);
+
+        // Include direct /storage/usb* candidates only if /proc/mounts could not be read
+        if (mountsText.isEmpty()) {
+            for (int i = 0; i < DIRECT_USB_CANDIDATES.length; i++) {
+                File dir = new File(DIRECT_USB_CANDIDATES[i]);
+                if (dir.isDirectory() && dir.canWrite()) {
+                    roots.add(dir.getAbsolutePath());
+                }
+            }
+        }
+
+        return exportToDirectories(csvContent, summaryContent, new ArrayList<String>(roots), SUBFOLDER);
     }
 
     public static ExportResult exportToDirectories(
-            String reportContent,
+            String csvContent,
+            String summaryContent,
             List<String> candidateMountRoots,
-            String subfolderName,
-            File fallbackFile) {
-        byte[] payload;
+            String subfolderName) {
+        byte[] csvBytes;
+        byte[] summaryBytes;
         try {
-            payload = (reportContent == null ? "" : reportContent).getBytes("UTF-8");
+            csvBytes = (csvContent == null ? "" : csvContent).getBytes("UTF-8");
+            summaryBytes = (summaryContent == null ? "" : summaryContent).getBytes("UTF-8");
         } catch (Exception e) {
-            return new ExportResult(false, null, "UTF-8 encoding failed: " + e.getMessage());
-        }
-
-        boolean wroteFallback = false;
-        if (fallbackFile != null) {
-            try {
-                File parent = fallbackFile.getParentFile();
-                if (parent != null && !parent.isDirectory()) {
-                    parent.mkdirs();
-                }
-                writeAndSync(fallbackFile, payload);
-                fallbackFile.setReadable(true, false);
-                wroteFallback = true;
-            } catch (Exception ignored) {
-                // Non-fatal
-            }
+            return new ExportResult(false, null, null, "UTF-8 encoding failed: " + e.getMessage());
         }
 
         if (candidateMountRoots == null || candidateMountRoots.isEmpty()) {
-            String note = "No mounted USB stick found in /proc/mounts. "
-                    + "Check FAT32/exFAT stick (note: USB ADB puts the USB port in device mode).";
-            if (wroteFallback) {
-                note += " Saved fallback to " + fallbackFile.getAbsolutePath();
-            }
-            return new ExportResult(false, null, note);
+            return new ExportResult(
+                    false,
+                    null,
+                    null,
+                    "No mounted USB stick found. Insert a FAT32/exFAT USB drive (ensure USB port is in host mode).");
         }
 
         String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
-        String fileName = "hscan-probe-" + stamp + ".txt";
+        String desiredCsv = "brake-dataset-" + stamp + ".csv";
+        String desiredSummary = "brake-summary-" + stamp + ".txt";
         String lastErr = "unable to write to USB mount";
 
         for (String mountRoot : candidateMountRoots) {
@@ -149,15 +156,16 @@ public final class UsbExporter {
                     lastErr = "mkdirs failed on " + targetDir.getAbsolutePath();
                     continue;
                 }
-                targetDir.setReadable(true, false);
-                targetDir.setExecutable(true, false);
 
-                File outFile = new File(targetDir, fileName);
-                writeAndSync(outFile, payload);
-                outFile.setReadable(true, false);
+                File csvOut = writeBytesAtomically(targetDir, desiredCsv, csvBytes);
+                File sumOut = writeBytesAtomically(targetDir, desiredSummary, summaryBytes);
 
-                if (outFile.isFile() && outFile.length() > 0) {
-                    return new ExportResult(true, outFile.getAbsolutePath(), null);
+                if (csvOut.isFile() && csvOut.length() > 0) {
+                    return new ExportResult(
+                            true,
+                            csvOut.getAbsolutePath(),
+                            sumOut.getAbsolutePath(),
+                            null);
                 }
             } catch (Exception e) {
                 lastErr = mountRoot + ": " + e.getClass().getSimpleName()
@@ -165,11 +173,57 @@ public final class UsbExporter {
             }
         }
 
-        String err = "USB write failed (" + lastErr + ").";
-        if (wroteFallback) {
-            err += " Saved fallback to " + fallbackFile.getAbsolutePath();
+        return new ExportResult(false, null, null, "USB write failed (" + lastErr + ").");
+    }
+
+    public static File writeBytesAtomically(File targetDir, String baseFileName, byte[] data) throws IOException {
+        File out = uniqueFile(targetDir, baseFileName);
+        File tmp = new File(targetDir, "." + out.getName() + ".part");
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(tmp);
+            if (data != null && data.length > 0) {
+                fos.write(data);
+            }
+            fos.flush();
+            try {
+                fos.getFD().sync();
+            } catch (Throwable ignored) {
+                // Some host/virtual filesystems do not support fsync
+            }
+            fos.close();
+            fos = null;
+            if (!tmp.renameTo(out)) {
+                throw new IOException("Failed to rename temporary file to " + out.getAbsolutePath());
+            }
+            out.setReadable(true, false);
+            return out;
+        } finally {
+            if (fos != null) {
+                try { fos.close(); } catch (Throwable ignored) {}
+            }
+            if (tmp.exists()) {
+                tmp.delete();
+            }
         }
-        return new ExportResult(false, null, err);
+    }
+
+    private static File uniqueFile(File dir, String desiredName) {
+        File candidate = new File(dir, desiredName);
+        if (!candidate.exists()) {
+            return candidate;
+        }
+        int dot = desiredName.lastIndexOf('.');
+        String stem = dot > 0 ? desiredName.substring(0, dot) : desiredName;
+        String ext = dot > 0 ? desiredName.substring(dot) : "";
+        int n = 1;
+        while (true) {
+            File next = new File(dir, stem + "_" + n + ext);
+            if (!next.exists()) {
+                return next;
+            }
+            n++;
+        }
     }
 
     /**
@@ -204,7 +258,6 @@ public final class UsbExporter {
             if (matchesAnyExact(fsType, VIRTUAL_FS) || startsWithAny(mountPoint, INTERNAL_PREFIXES)) {
                 continue;
             }
-            // Ignore internal eMMC block partitions
             if (dev.startsWith("/dev/block/mmcblk") || dev.startsWith("/dev/mmcblk")) {
                 continue;
             }
@@ -215,13 +268,7 @@ public final class UsbExporter {
                     || dev.startsWith("/dev/block/sd"))
                     && matchesAnyExact(fsType, STORAGE_FS);
 
-            if (usbPath && matchesAnyExact(fsType, STORAGE_FS)) {
-                if (mountPoint.startsWith("/storage/")) {
-                    storageMounts.add(mountPoint);
-                } else {
-                    rawMounts.add(mountPoint);
-                }
-            } else if (usbDev) {
+            if ((usbPath && matchesAnyExact(fsType, STORAGE_FS)) || usbDev) {
                 if (mountPoint.startsWith("/storage/")) {
                     storageMounts.add(mountPoint);
                 } else {
@@ -234,21 +281,6 @@ public final class UsbExporter {
         ordered.addAll(storageMounts);
         ordered.addAll(rawMounts);
         return ordered;
-    }
-
-    private static void writeAndSync(File file, byte[] data) throws Exception {
-        FileOutputStream fos = new FileOutputStream(file);
-        try {
-            fos.write(data);
-            fos.flush();
-            try {
-                fos.getFD().sync();
-            } catch (Exception ignored) {
-                // Some virtual/host filesystems do not support fsync
-            }
-        } finally {
-            fos.close();
-        }
     }
 
     private static String readProcMounts() {
@@ -296,7 +328,6 @@ public final class UsbExporter {
         String lower = value.toLowerCase(Locale.US);
         for (String p : prefixes) {
             if (lower.equals(p) || lower.startsWith(p + "/") || lower.startsWith(p)) {
-                // Ensure "/mnt/usb" matches "/mnt/usb0" and "/mnt/usb/..." while "/data" doesn't match "/database"
                 if (p.endsWith("usb") || p.endsWith("udisk") || p.endsWith("usbdisk")) {
                     return true;
                 }

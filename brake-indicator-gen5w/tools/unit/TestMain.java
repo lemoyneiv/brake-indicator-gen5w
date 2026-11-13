@@ -1,15 +1,28 @@
 package dev.lemoyne.brakeindicator;
 
+import gen5w.ble.Gen5wBleClient;
+
 import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Host unit tests for CandidateFilter, IndicatorConfig, BrakeEvaluator, IpcProtocol, and UsbExporter.
+ * Host JVM unit tests for v0.3.0:
+ * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder, LNEX BVM02 exclusion, VIN/write safety)
+ * - ObdBrakeClient (@gen5w_ble direct BLE primary session + ALREADY_CONNECTED 127.0.0.1 loopback fallback)
+ * - IndicatorConfig & BrakeEvaluator (250 ms cached HMG-API speed handling, i-Pedal/SCC regen, standstill hold, ObdMode)
+ * - TelemetryRecorder & UsbExporter (confusion matrix, regen recall, onset lag, CSV + summary atomic USB export)
  */
 public final class TestMain {
 
@@ -17,15 +30,14 @@ public final class TestMain {
     private static int failed;
 
     public static void main(String[] args) throws Exception {
-        testCandidateFilterSafetyAndRoles();
-        testSafeReadOnlyGetterInventory();
-        testInterpretBinaryLampValue();
-        testIndicatorConfigParsingAndClamping();
-        testBrakeEvaluatorNativeAndPressure();
-        testBrakeEvaluatorSlidingWindowAndModulatedIpedal();
-        testBrakeEvaluatorStandstillHoldAndCruiseStop();
-        testUsbExporterMountsAndWrite();
-        testIpcProtocolRoundTrip();
+        testElm327IgmpBrakeDecoding();
+        testElm327SafetyAndBvm02Exclusion();
+        testObdBrakeClientBleAndLoopbackFallback();
+        testIndicatorConfigModesAndLegacyCompatibility();
+        testBrakeEvaluatorCachedSpeedAndObdModes();
+        testBrakeEvaluatorStandstillHoldAndRelease();
+        testTelemetryRecorderScoringAndCsv();
+        testUsbExporterMountsAndAtomicWrite();
 
         System.out.println(passed + " ok, " + failed + " failed");
         if (failed > 0) {
@@ -33,231 +45,403 @@ public final class TestMain {
         }
     }
 
-    private static void testCandidateFilterSafetyAndRoles() {
-        // Direct stop-lamp / brake-switch getters (including underscore & navi_get styles)
-        eq("getStopLampSw", CandidateFilter.Role.DIRECT_STOP_LAMP,
-                CandidateFilter.classify("getStopLampSw", 0, Integer.TYPE));
-        eq("isBrakeLampOn", CandidateFilter.Role.DIRECT_STOP_LAMP,
-                CandidateFilter.classify("isBrakeLampOn", 0, Boolean.TYPE));
-        eq("get_IEB_BrkLampSta", CandidateFilter.Role.DIRECT_STOP_LAMP,
-                CandidateFilter.classify("get_IEB_BrkLampSta", 0, Byte.TYPE));
-        eq("navi_getBrakeSw", CandidateFilter.Role.DIRECT_STOP_LAMP,
-                CandidateFilter.classify("navi_getBrakeSw", 0, Integer.TYPE));
-        eq("getActBrkLmpSta", CandidateFilter.Role.DIRECT_STOP_LAMP,
-                CandidateFilter.classify("getActBrkLmpSta", 0, Integer.TYPE));
+    private static void testElm327IgmpBrakeDecoding() {
+        // 1. Real 11-byte multi-frame EV6 / Ioniq 5 IGMP 22BC06 OFF response (rawCode = 0x00)
+        String offResp = "778100B62BC0670400003\r7782100000000000000\r";
+        Elm327BrakeProtocol.IgmpBrakeReading off = Elm327BrakeProtocol.decodeIgmpBrakeResponse(offResp);
+        eq("IGMP OFF decoded", Boolean.TRUE, Boolean.valueOf(off != null));
+        eq("IGMP OFF rawCode=0", Integer.valueOf(0), Integer.valueOf(off.rawCode));
+        eq("IGMP OFF brakeLampLit=false", Boolean.FALSE, Boolean.valueOf(off.brakeLampLit));
+        eq("IGMP OFF pedalBit=false", Boolean.FALSE, Boolean.valueOf(off.pedalBit));
 
-        // Cylinder pressure getter
-        eq("getCylPrsrVal", CandidateFilter.Role.BRAKE_PRESSURE,
-                CandidateFilter.classify("getCylPrsrVal", 0, Float.TYPE));
+        // 2. MY25 8-byte multi-frame IGMP 22BC06 OFF response
+        String my25OffResp = "778100862BC06004000\r7782100000000000000\r";
+        Elm327BrakeProtocol.IgmpBrakeReading my25Off = Elm327BrakeProtocol.decodeIgmpBrakeResponse(my25OffResp);
+        eq("MY25 8-byte OFF decoded", Boolean.TRUE, Boolean.valueOf(my25Off != null && !my25Off.brakeLampLit));
 
-        // Parking brake, fluid switch, notch, lamp fault, SCC, XEV must be diagnostic candidates
-        eq("getParkBrakeStatus -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getParkBrakeStatus", 0, Integer.TYPE));
-        eq("getBrakeFluidSw -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getBrakeFluidSw", 0, Integer.TYPE));
-        eq("getBrakeNotchStatus -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getBrakeNotchStatus", 0, Integer.TYPE));
-        eq("getStopLampFail -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getStopLampFail", 0, Integer.TYPE));
-        eq("getAccelPdlVal -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getAccelPdlVal", 0, Float.TYPE));
-        eq("getSCC_MainInfo -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getSCC_MainInfo", 0, Integer.TYPE));
-        eq("getXEV_HcuRegenLv -> diag", CandidateFilter.Role.DIAGNOSTIC_CANDIDATE,
-                CandidateFilter.classify("getXEV_HcuRegenLv", 0, Integer.TYPE));
+        // 3. Pure Regen / Smart Cruise Control brake lamps ON without pedal (0x24 = 36 and 0x04 = 4)
+        String regen36Resp = "778100B62BC0670400003\r7782124000000000000\r";
+        Elm327BrakeProtocol.IgmpBrakeReading regen36 = Elm327BrakeProtocol.decodeIgmpBrakeResponse(regen36Resp);
+        eq("IGMP Regen 36 lit=true", Boolean.TRUE, Boolean.valueOf(regen36 != null && regen36.brakeLampLit));
+        eq("IGMP Regen 36 rawCode=36", Integer.valueOf(36), Integer.valueOf(regen36.rawCode));
+        eq("IGMP Regen 36 pedalBit=false", Boolean.FALSE, Boolean.valueOf(regen36.pedalBit));
 
-        // Hard safety blocks: VIN, GPS, IMEI, MSISDN, USIM, getDriveMode, setters, String returns, args > 0
-        eq("getVIN blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getVIN", 0, String.class));
-        eq("getVinStatus blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getVinStatus", 0, Integer.TYPE));
-        eq("getGpsBrake blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getGpsBrake", 0, Integer.TYPE));
-        eq("getImei blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getImei", 0, Integer.TYPE));
-        eq("getMsisdn blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getMsisdn", 0, Integer.TYPE));
-        eq("getDriveMode blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getDriveMode", 0, Integer.TYPE));
-        eq("setBrakeLamp blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("setBrakeLamp", 0, Integer.TYPE));
-        eq("getStopLampReq blocked", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getStopLampReq", 0, Integer.TYPE));
-        eq("getCarSpeed(byte) blocked due to param", CandidateFilter.Role.NONE,
-                CandidateFilter.classify("getCarSpeed", 1, Float.TYPE));
+        String regen4Resp = "778100B62BC0670400003\r7782104000000000000\r";
+        Elm327BrakeProtocol.IgmpBrakeReading regen4 = Elm327BrakeProtocol.decodeIgmpBrakeResponse(regen4Resp);
+        eq("IGMP Regen 4 lit=true, pedalBit=false",
+                Boolean.TRUE, Boolean.valueOf(regen4 != null && regen4.brakeLampLit && !regen4.pedalBit));
+
+        // 4. Foot pedal / brake switch active codes: 40 (0x28), 41 (0x29), 44 (0x2C), 45 (0x2D)
+        int[] pedalCodes = {40, 41, 44, 45};
+        for (int i = 0; i < pedalCodes.length; i++) {
+            int code = pedalCodes[i];
+            String hex = String.format("%02X", Integer.valueOf(code));
+            String resp = "778100B62BC0670400003\r77821" + hex + "000000000000\r";
+            Elm327BrakeProtocol.IgmpBrakeReading r = Elm327BrakeProtocol.decodeIgmpBrakeResponse(resp);
+            eq("IGMP Pedal code " + code + " lit+pedalBit",
+                    Boolean.TRUE, Boolean.valueOf(r != null && r.rawCode == code && r.brakeLampLit && r.pedalBit));
+        }
+
+        // 5. Reject asleep/placeholder IGMP frames padded with 0xAA
+        String asleepAa = "778100B62BC06AAAAAA\r77821AAAAAAAAAA0000\r";
+        eq("IGMP 0xAA asleep frame rejected", null, Elm327BrakeProtocol.decodeIgmpBrakeResponse(asleepAa));
+
+        // 6. Chunked 20-byte BLE GATT notification reassembly via PromptBuffer
+        Elm327BrakeProtocol.PromptBuffer pb = new Elm327BrakeProtocol.PromptBuffer();
+        List<String> c1 = pb.feed("778100B62BC06704000".getBytes(Elm327BrakeProtocol.ASCII));
+        eq("PromptBuffer partial chunk -> 0 prompts", Integer.valueOf(0), Integer.valueOf(c1.size()));
+        List<String> c2 = pb.feed("03\r778212400000000>".getBytes(Elm327BrakeProtocol.ASCII));
+        eq("PromptBuffer '>' completes 1 prompt", Integer.valueOf(1), Integer.valueOf(c2.size()));
+        Elm327BrakeProtocol.IgmpBrakeReading chunked = Elm327BrakeProtocol.decodeIgmpBrakeResponse(c2.get(0));
+        eq("Chunked BLE prompt decodes rawCode=36",
+                Boolean.TRUE, Boolean.valueOf(chunked != null && chunked.rawCode == 36 && chunked.brakeLampLit));
     }
 
-    private static void testSafeReadOnlyGetterInventory() {
-        eq("obscure safe int getter allowed", Boolean.TRUE,
-                CandidateFilter.isSafeReadOnlyGetter("getCF_Clu_GearSelDisp", 0, Integer.TYPE));
-        eq("IsCarMoving allowed", Boolean.TRUE,
-                CandidateFilter.isSafeReadOnlyGetter("IsCarMoving", 0, Boolean.TYPE));
-        eq("getVIN rejected in safe inventory", Boolean.FALSE,
-                CandidateFilter.isSafeReadOnlyGetter("getVIN", 0, Integer.TYPE));
-        eq("getGpsLat rejected in safe inventory", Boolean.FALSE,
-                CandidateFilter.isSafeReadOnlyGetter("getGpsLat", 0, Double.TYPE));
-        eq("getDriveMode rejected in safe inventory", Boolean.FALSE,
-                CandidateFilter.isSafeReadOnlyGetter("getDriveMode", 0, Integer.TYPE));
-        eq("request method rejected in safe inventory", Boolean.FALSE,
-                CandidateFilter.isSafeReadOnlyGetter("getBatteryReq", 0, Integer.TYPE));
-        eq("String return rejected in safe inventory", Boolean.FALSE,
-                CandidateFilter.isSafeReadOnlyGetter("getGearText", 0, String.class));
-        eq("getAccelPdlVal marked noisy continuous", Boolean.TRUE,
-                CandidateFilter.isNoisyContinuousGetter("getAccelPdlVal"));
-        eq("getSCC_TakeOverReq NOT marked noisy", Boolean.FALSE,
-                CandidateFilter.isNoisyContinuousGetter("getSCC_TakeOverReq"));
+    private static void testElm327SafetyAndBvm02Exclusion() {
+        // Strict VIN & write command blocking
+        eq("ATSH770 allowed", Boolean.TRUE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("ATSH770")));
+        eq("22BC06 allowed", Boolean.TRUE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("22 BC 06")));
+        eq("VIN 0902 blocked", Boolean.FALSE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("0902")));
+        eq("VIN 22F190 blocked", Boolean.FALSE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("22F190")));
+        eq("VIN 1A90 blocked", Boolean.FALSE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("1A90")));
+        eq("UDS WriteDataByIdentifier 2EBC06 blocked",
+                Boolean.FALSE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("2EBC0600")));
+        eq("ClearDTC 14FFFFFF blocked",
+                Boolean.FALSE, Boolean.valueOf(Elm327BrakeProtocol.isSafeCommand("14FFFFFF")));
+
+        // LNEX BVM02 battery sensor exclusion (name + GATT fingerprint)
+        eq("BVM02 name flagged", Boolean.TRUE, Boolean.valueOf(Elm327BrakeProtocol.isLikelyBvm02Device("LNEX BVM02")));
+        eq("BL-680A name flagged", Boolean.TRUE, Boolean.valueOf(Elm327BrakeProtocol.isLikelyBvm02Device("BL-680A")));
+        eq("BVM02 never classified as OBD adapter even with FFF0 UUID",
+                Boolean.FALSE,
+                Boolean.valueOf(Elm327BrakeProtocol.isLikelyObdAdapter("BVM02", Arrays.asList("fff0"))));
+        eq("OBDCheck BLE+ classified as OBD adapter",
+                Boolean.TRUE,
+                Boolean.valueOf(Elm327BrakeProtocol.isLikelyObdAdapter("OBDCheck BLE+", Arrays.asList("fff0"))));
+
+        // BVM02 GATT table: fff1 READ-only (0x02), fff2 WRITE (0x08), fff4 NOTIFY (0x10) -> MUST reject!
+        Map<String, Integer> bvmGatt = new LinkedHashMap<String, Integer>();
+        bvmGatt.put("fff1", Integer.valueOf(Elm327BrakeProtocol.PROP_READ));
+        bvmGatt.put("fff2", Integer.valueOf(Elm327BrakeProtocol.PROP_WRITE));
+        bvmGatt.put("fff4", Integer.valueOf(Elm327BrakeProtocol.PROP_NOTIFY));
+        eq("BVM02 GATT table rejected (0 bindings)",
+                Integer.valueOf(0), Integer.valueOf(Elm327BrakeProtocol.resolveAdapterBindings(bvmGatt).size()));
+
+        // Veepeak BLE GATT table: fff1 NOTIFY (0x10), fff2 WRITE_NO_RESP | WRITE (0x0C) -> accepted!
+        Map<String, Integer> veepeakGatt = new LinkedHashMap<String, Integer>();
+        veepeakGatt.put("fff1", Integer.valueOf(Elm327BrakeProtocol.PROP_NOTIFY));
+        veepeakGatt.put("fff2", Integer.valueOf(Elm327BrakeProtocol.PROP_WRITE | Elm327BrakeProtocol.PROP_WRITE_NO_RESP));
+        List<Elm327BrakeProtocol.GattBinding> vp = Elm327BrakeProtocol.resolveAdapterBindings(veepeakGatt);
+        eq("Veepeak FFF0 resolved", Boolean.TRUE, Boolean.valueOf(!vp.isEmpty()));
+        eq("Veepeak notify=fff1", "fff1", Elm327BrakeProtocol.normUuid(vp.get(0).notifyUuid));
+        eq("Veepeak write=fff2", "fff2", Elm327BrakeProtocol.normUuid(vp.get(0).writeUuid));
     }
 
-    private static void testInterpretBinaryLampValue() {
-        eq("boolean true", Boolean.TRUE, CandidateFilter.interpretBinaryLampValue(Boolean.TRUE));
-        eq("boolean false", Boolean.FALSE, CandidateFilter.interpretBinaryLampValue(Boolean.FALSE));
-        eq("int 0 -> false", Boolean.FALSE, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(0)));
-        eq("int 1 -> true", Boolean.TRUE, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(1)));
-        eq("2-bit CAN error 2 -> null", null, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(2)));
-        eq("2-bit CAN invalid 3 -> null", null, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(3)));
-        eq("0xFF CAN invalid -> null", null, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(0xFF)));
-        eq("0xFFFF CAN invalid -> null", null, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(0xFFFF)));
-        eq("negative error -> null", null, CandidateFilter.interpretBinaryLampValue(Integer.valueOf(-1)));
+    private static void testObdBrakeClientBleAndLoopbackFallback() throws Exception {
+        final List<String> sentBleLines = Collections.synchronizedList(new ArrayList<String>());
+
+        // Start a mock 127.0.0.1 loopback ELM327 bridge server (simulating obd-gen5w's TcpElmBridgeServer)
+        final ServerSocket server = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"));
+        final int port = server.getLocalPort();
+        Thread mockBridgeThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                Socket client = null;
+                try {
+                    server.setSoTimeout(4000);
+                    client = server.accept();
+                    InputStream in = client.getInputStream();
+                    OutputStream out = client.getOutputStream();
+                    StringBuilder line = new StringBuilder();
+                    int b;
+                    while ((b = in.read()) != -1) {
+                        if (b == '\r' || b == '\n') {
+                            String cmd = line.toString().trim();
+                            line.setLength(0);
+                            if (cmd.isEmpty()) continue;
+                            String reply;
+                            if ("ATI".equalsIgnoreCase(cmd)) {
+                                reply = "ELM327 v1.5\r>";
+                            } else if ("22BC06".equalsIgnoreCase(cmd)) {
+                                reply = "778100B62BC0670400003\r7782124000000000000\r>";
+                            } else {
+                                reply = "OK\r>";
+                            }
+                            out.write(reply.getBytes(Elm327BrakeProtocol.ASCII));
+                            out.flush();
+                        } else {
+                            line.append((char) b);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (client != null) {
+                        try { client.close(); } catch (Throwable ignored) {}
+                    }
+                    try { server.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "MockLoopbackBridge");
+        mockBridgeThread.setDaemon(true);
+        mockBridgeThread.start();
+
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        final ObdBrakeClient[] ref = new ObdBrakeClient[1];
+        Gen5wBleClient.LineChannel channel = new Gen5wBleClient.LineChannel() {
+            @Override
+            public void sendLine(String line) {
+                sentBleLines.add(line);
+                // When WRITE_CHAR_NR 22BC06 arrives over @gen5w_ble, reply with CHAR_NOTIFY 22BC06 pedal=40!
+                if (line.startsWith("@AA:BB:CC:DD:EE:01 WRITE_CHAR_NR ")
+                        && line.toLowerCase().endsWith("3232424330360d")) {
+                    final ObdBrakeClient c = ref[0];
+                    if (c != null) {
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                String payloadHex = Elm327BrakeProtocol.bytesToHex(
+                                        "778100B62BC0670400003\r778212800000000>\r"
+                                                .getBytes(Elm327BrakeProtocol.ASCII));
+                                c.getBleClientForTest().handleServerLine(
+                                        "@AA:BB:CC:DD:EE:01 CHAR_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb "
+                                                + payloadHex);
+                            }
+                        }).start();
+                    }
+                }
+            }
+
+            @Override
+            public void close() {}
+        };
+
+        ObdBrakeClient client = ObdBrakeClient.createForTest(store, channel, port);
+        ref[0] = client;
+        try {
+            // 1. Pairing refuses BVM02 battery sensor
+            eq("pairAdapter refuses BVM02",
+                    Boolean.FALSE, Boolean.valueOf(client.pairAdapter("11:22:33:44:55:66", "LNEX BVM02", 0)));
+
+            // 2. Pairing accepts Veepeak BLE adapter and issues @gen5w_ble CONNECT first
+            eq("pairAdapter accepts Veepeak",
+                    Boolean.TRUE, Boolean.valueOf(client.pairAdapter("AA:BB:CC:DD:EE:01", "OBDCheck BLE", 0)));
+            eq("sent CONNECT on @gen5w_ble",
+                    Boolean.TRUE, Boolean.valueOf(sentBleLines.contains("CONNECT AA:BB:CC:DD:EE:01 0 *")));
+
+            // 3. Simulate @gen5w_ble GATT_READY + direct BLE 22BC06 command round-trip
+            Gen5wBleClient ble = client.getBleClientForTest();
+            ble.handleServerLine("GATT_READY AA:BB:CC:DD:EE:01 0000fff1-0000-1000-8000-00805f9b34fb:10,0000fff2-0000-1000-8000-00805f9b34fb:0c");
+            ble.handleServerLine("@AA:BB:CC:DD:EE:01 OP_OK ENABLE_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb");
+
+            String bleRaw = client.sendBleCommandBlocking("22BC06", 1000L);
+            Elm327BrakeProtocol.IgmpBrakeReading bleDecoded = Elm327BrakeProtocol.decodeIgmpBrakeResponse(bleRaw);
+            eq("Direct @gen5w_ble 22BC06 round-trip decoded rawCode=40",
+                    Boolean.TRUE, Boolean.valueOf(bleDecoded != null && bleDecoded.rawCode == 40 && bleDecoded.pedalBit));
+            eq("Direct @gen5w_ble blocks unsafe VIN 0902", null, client.sendBleCommandBlocking("0902", 300L));
+
+            // 4. Simulate obd-gen5w holding BLE link (status=253 reason=ALREADY_CONNECTED) -> fallback to 127.0.0.1:<port>
+            ble.handleServerLine("CONN_STATE DISCONNECTED AA:BB:CC:DD:EE:01 status=253 reason=ALREADY_CONNECTED");
+            eq("Status reflects fallback after ALREADY_CONNECTED",
+                    Boolean.TRUE, Boolean.valueOf(client.getStatusSummary().contains("127.0.0.1:" + port)));
+
+            boolean okBridge = client.tryRunLoopbackBridgeSession(port);
+            eq("127.0.0.1 loopback fallback session succeeds", Boolean.TRUE, Boolean.valueOf(okBridge));
+            BrakeEvaluator.ObdSample bridgeSample = client.currentSample();
+            eq("Loopback sample transport=BRIDGE", "BRIDGE", bridgeSample.transport);
+            eq("Loopback sample rawCode=36 (Regen ON)", Integer.valueOf(36), Integer.valueOf(bridgeSample.rawCode));
+            eq("Loopback sample brakeLampLit=true", Boolean.TRUE, Boolean.valueOf(bridgeSample.brakeLampLit));
+            eq("Loopback sample pedalBit=false", Boolean.FALSE, Boolean.valueOf(bridgeSample.pedalBit));
+        } finally {
+            client.close();
+            try { server.close(); } catch (Throwable ignored) {}
+        }
     }
 
-    private static void testIndicatorConfigParsingAndClamping() {
+    private static void testIndicatorConfigModesAndLegacyCompatibility() {
         IndicatorConfig def = IndicatorConfig.defaults();
-        eq("default mode is NATIVE_AND_DECEL", IndicatorConfig.SignalMode.NATIVE_AND_DECEL, def.signalMode);
-        eq("default offState", IndicatorConfig.OffState.HIDDEN, def.offState);
-        eq("default anchor", IndicatorConfig.Anchor.TOP_RIGHT, def.anchor);
-        eq("default pressureThreshold 0.4", Boolean.TRUE, Math.abs(def.pressureThreshold - 0.4f) < 0.001f);
-        eq("default decelThreshold 1.2", Boolean.TRUE, Math.abs(def.decelThresholdMps2 - 1.2f) < 0.001f);
-        eq("default standstillHold true", Boolean.TRUE, Boolean.valueOf(def.standstillHold));
-        eq("default iconWidthPx", Integer.valueOf(51), Integer.valueOf(def.iconWidthPx()));
+        eq("default obdMode is OBD_WHEN_CONNECTED",
+                IndicatorConfig.ObdMode.OBD_WHEN_CONNECTED, def.obdMode);
+        eq("default signalMode is PRESSURE_AND_DECEL",
+                IndicatorConfig.SignalMode.PRESSURE_AND_DECEL, def.signalMode);
+        eq("default bridgePort is 35000", Integer.valueOf(35000), Integer.valueOf(def.bridgePort));
 
         Map<String, String> m = new HashMap<String, String>();
-        m.put("signal_mode", "native");
+        m.put("obd_mode", "model_only_icon");
+        m.put("signal_mode", "native"); // v0.2.0 legacy value -> maps cleanly to PRESSURE_ONLY
         m.put("off_state", "dim");
         m.put("anchor", "top_left");
-        m.put("x_offset", "120");
-        m.put("y_offset", "8");
-        m.put("icon_size", "10"); // below 20 -> clamped to 20
-        m.put("pressure_threshold", "22"); // 2.2
-        m.put("decel_threshold", "15"); // 1.5 m/s^2
+        m.put("icon_size", "12"); // clamped to 20
+        m.put("pressure_threshold", "15"); // 1.5
+        m.put("decel_threshold", "14"); // 1.4 m/s^2
         m.put("standstill_hold", "false");
-        m.put("probe_logging", "false");
+        m.put("bridge_port", "35100");
 
         IndicatorConfig parsed = IndicatorConfig.fromMap(m);
-        eq("parsed mode native", IndicatorConfig.SignalMode.NATIVE, parsed.signalMode);
-        eq("parsed off", IndicatorConfig.OffState.DIM, parsed.offState);
-        eq("parsed anchor", IndicatorConfig.Anchor.TOP_LEFT, parsed.anchor);
-        eq("clamped icon_size", Integer.valueOf(20), Integer.valueOf(parsed.iconSizePx));
-        eq("parsed pressure_threshold", Boolean.TRUE, Math.abs(parsed.pressureThreshold - 2.2f) < 0.001f);
-        eq("parsed decel_threshold", Boolean.TRUE, Math.abs(parsed.decelThresholdMps2 - 1.5f) < 0.001f);
-        eq("parsed standstill_hold", Boolean.FALSE, Boolean.valueOf(parsed.standstillHold));
-        eq("parsed probe_logging", Boolean.FALSE, Boolean.valueOf(parsed.probeLogging));
+        eq("parsed obd_mode", IndicatorConfig.ObdMode.MODEL_ONLY_ICON, parsed.obdMode);
+        eq("legacy 'native' maps to PRESSURE_ONLY",
+                IndicatorConfig.SignalMode.PRESSURE_ONLY, parsed.signalMode);
+        eq("clamped icon_size=20", Integer.valueOf(20), Integer.valueOf(parsed.iconSizePx));
+        eq("parsed pressure_threshold=1.5", Boolean.TRUE, Boolean.valueOf(Math.abs(parsed.pressureThreshold - 1.5f) < 0.001f));
+        eq("parsed decel_threshold=1.4", Boolean.TRUE, Boolean.valueOf(Math.abs(parsed.decelThresholdMps2 - 1.4f) < 0.001f));
+        eq("parsed bridge_port=35100", Integer.valueOf(35100), Integer.valueOf(parsed.bridgePort));
+        eq("ObdMode cycle order", IndicatorConfig.ObdMode.DISABLED, parsed.obdMode.next());
     }
 
-    private static void testBrakeEvaluatorNativeAndPressure() {
-        IndicatorConfig cfg = IndicatorConfig.defaults(); // pressureThreshold = 0.4
+    private static void testBrakeEvaluatorCachedSpeedAndObdModes() {
+        IndicatorConfig defaultCfg = IndicatorConfig.defaults(); // OBD_WHEN_CONNECTED + PRESSURE_AND_DECEL (1.2 m/s^2)
+        Map<String, String> modelOnlyMap = new HashMap<String, String>();
+        modelOnlyMap.put("obd_mode", "model_only_icon");
+        IndicatorConfig modelIconCfg = IndicatorConfig.fromMap(modelOnlyMap);
+
         BrakeEvaluator ev = new BrakeEvaluator();
 
-        // 1. CAN invalid sentinel 409.5 must NOT illuminate brake indicator
-        BrakeEvaluator.Snapshot s1 = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                1000L, null, "", 409.5f, 50.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("409.5 invalid pressure ignored", Boolean.FALSE, Boolean.valueOf(s1.illuminated));
+        // 1. CAN invalid pressure sentinel 409.5 must be ignored
+        BrakeEvaluator.Snapshot sInvalid = ev.evaluate(defaultCfg, new BrakeEvaluator.Input(
+                1000L, 409.5f, 60.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L));
+        eq("409.5 invalid brake.pressure ignored", Boolean.FALSE, Boolean.valueOf(sInvalid.illuminated));
 
-        // 2. Light initial pedal cylinder pressure (0.5 >= 0.4) lights immediately with hysteresis down to 0.28
-        BrakeEvaluator.Snapshot s2 = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                1040L, null, "", 0.5f, 50.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("light pedal pressure 0.5 lights immediately", Boolean.TRUE, Boolean.valueOf(s2.illuminated));
-        eq("pressure source", "BRAKE_PRESSURE", s2.source);
-
-        BrakeEvaluator.Snapshot s3 = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                1080L, null, "", 0.32f, 50.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("hysteresis holds at 0.32", Boolean.TRUE, Boolean.valueOf(s3.illuminated));
-
-        BrakeEvaluator.Snapshot s4 = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                1120L, null, "", 0.1f, 50.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("releases below 0.28", Boolean.FALSE, Boolean.valueOf(s4.illuminated));
-
-        // 3. Direct OEM stop-lamp getter takes precedence even at 0 hydraulic pressure
-        BrakeEvaluator.Snapshot s5 = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                1160L, Boolean.TRUE, "getStopLampSw=1", 0.0f, 65.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("native stop lamp lights at 0 pressure", Boolean.TRUE, Boolean.valueOf(s5.illuminated));
-        eq("native stop lamp source", "OEM_LAMP:getStopLampSw=1", s5.source);
-    }
-
-    private static void testBrakeEvaluatorSlidingWindowAndModulatedIpedal() {
-        IndicatorConfig defaultCfg = IndicatorConfig.defaults(); // NATIVE_AND_DECEL, 1.2 m/s^2
-        Map<String, String> m = new HashMap<String, String>();
-        m.put("signal_mode", "native");
-        IndicatorConfig nativeOnlyCfg = IndicatorConfig.fromMap(m);
-
-        BrakeEvaluator evNative = new BrakeEvaluator();
-        BrakeEvaluator evDefault = new BrakeEvaluator();
-
-        // Simulate 25 Hz (40 ms) polling where CAN speed updates only every 120 ms (every 3rd tick)
-        // in 0.7 km/h steps (~1.62 m/s^2) while driver feathers i-Pedal at 12% throttle!
-        float canSpeed = 72.0f;
-        BrakeEvaluator.Snapshot snapNative = null;
-        BrakeEvaluator.Snapshot snapDefault = null;
+        // 2. Simulate HMG-API's 250 ms `speed` cache polled at 20 Hz (50 ms):
+        // Speed updates ONLY every 5th tick (every 250 ms) by -1.30 km/h (~1.44 m/s^2) at 12% i-Pedal throttle!
+        BrakeEvaluator evRegen = new BrakeEvaluator();
+        float cachedSpeed = 80.0f;
         int litTicksAfterOnset = 0;
-
-        for (int tick = 0; tick < 15; tick++) {
-            long t = 2000L + tick * 40L;
-            if (tick > 0 && tick % 3 == 0) {
-                canSpeed -= 0.7f;
+        BrakeEvaluator.Snapshot lastSnap = null;
+        for (int tick = 0; tick < 20; tick++) {
+            long t = 2000L + tick * 50L;
+            if (tick > 0 && tick % 5 == 0) {
+                cachedSpeed -= 1.30f;
             }
-            BrakeEvaluator.Input in = new BrakeEvaluator.Input(
-                    t, null, "", 0.0f, canSpeed, 12.0f, Boolean.FALSE, Boolean.FALSE, 0L);
-            snapNative = evNative.evaluate(nativeOnlyCfg, in);
-            snapDefault = evDefault.evaluate(defaultCfg, in);
-            if (tick >= 6 && snapDefault.illuminated) {
+            lastSnap = evRegen.evaluate(defaultCfg, new BrakeEvaluator.Input(
+                    t, 0.0f, cachedSpeed, 12.0f, -2.5f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.5f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            if (tick >= 6 && lastSnap.illuminated) {
                 litTicksAfterOnset++;
             }
         }
-        eq("NATIVE mode ignores pure regen decel", Boolean.FALSE, Boolean.valueOf(snapNative.illuminated));
-        eq("default NATIVE_AND_DECEL lights on quantized CAN decel + 12% i-Pedal",
-                Boolean.TRUE, Boolean.valueOf(snapDefault.illuminated));
-        eq("stay lit across all 9 ticks without sawtooth dropout",
-                Integer.valueOf(9), Integer.valueOf(litTicksAfterOnset));
-        eq("regen source", "REGEN_DECEL", snapDefault.source);
+        eq("250 ms cached HMG-API speed lights regen cleanly",
+                Boolean.TRUE, Boolean.valueOf(lastSnap != null && lastSnap.illuminated));
+        eq("Zero sawtooth dropout across all 14 ticks (including 4x cached speed repeats)",
+                Integer.valueOf(14), Integer.valueOf(litTicksAfterOnset));
+        eq("Model source is REGEN_DECEL", "REGEN_DECEL", lastSnap.modelSource);
+
+        // 3. Verify OBD_WHEN_CONNECTED vs MODEL_ONLY_ICON when OBD and Model disagree:
+        // Suppose speed is steady 70 km/h (Model = OFF), while OBD 22BC06 reports Regen ON (rawCode=36)
+        BrakeEvaluator evObd = new BrakeEvaluator();
+        BrakeEvaluator.ObdSample obdOn = new BrakeEvaluator.ObdSample(true, "BLE", 5000L, 36, true, false);
+        BrakeEvaluator.Snapshot sObdIcon = evObd.evaluate(defaultCfg, new BrakeEvaluator.Input(
+                5040L, 0.0f, 70.0f, 5.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
+        eq("OBD_WHEN_CONNECTED lights icon from OBD", Boolean.TRUE, Boolean.valueOf(sObdIcon.illuminated));
+        eq("OBD_WHEN_CONNECTED source OBD_REGEN[36]", "OBD_REGEN[36]", sObdIcon.source);
+        eq("Model still independently evaluated as OFF for scoring",
+                Boolean.FALSE, Boolean.valueOf(sObdIcon.modelIlluminated));
+
+        BrakeEvaluator.Snapshot sModelIcon = evObd.evaluate(modelIconCfg, new BrakeEvaluator.Input(
+                5090L, 0.0f, 70.0f, 5.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f, obdOn, 0L));
+        eq("MODEL_ONLY_ICON keeps icon driven by HMG-API model (OFF)",
+                Boolean.FALSE, Boolean.valueOf(sModelIcon.illuminated));
+        eq("MODEL_ONLY_ICON still keeps obdFresh=true for background scoring",
+                Boolean.TRUE, Boolean.valueOf(sModelIcon.obdFresh));
     }
 
-    private static void testBrakeEvaluatorStandstillHoldAndCruiseStop() {
+    private static void testBrakeEvaluatorStandstillHoldAndRelease() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
         BrakeEvaluator ev = new BrakeEvaluator();
 
-        // Simulate Smart Cruise Control / i-Pedal decelerating smoothly from 14.4 km/h (4 m/s) to 0 km/h at 2.0 m/s^2
-        long t = 5000L;
-        float speed = 14.4f;
+        // Decelerate from 15 km/h to 0 km/h at ~2.0 m/s^2 in 250 ms HMG-API speed steps (-1.8 km/h per 250 ms)
+        long t = 10000L;
+        float spd = 14.4f;
         BrakeEvaluator.Snapshot snap = null;
-        while (speed > 0.0f) {
+        for (int tick = 0; tick <= 45; tick++) {
+            if (tick > 0 && tick % 5 == 0) {
+                spd = Math.max(0.0f, spd - 1.8f);
+            }
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                    t, null, "", 0.0f, speed, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-            t += 40L;
-            speed = Math.max(0.0f, speed - 0.288f); // 2.0 m/s^2 = 7.2 km/h/s = 0.288 km/h per 40 ms
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE,
+                    Boolean.valueOf(spd > 0.1f), 68.0f, BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
         }
-
-        // Now stopped at 0.0 km/h for 3 seconds (0 hydraulic pressure, 0 throttle, in Drive)
-        for (int i = 0; i < 20; i++) {
+        // Hold at 0.0 km/h for 2 seconds
+        for (int i = 0; i < 10; i++) {
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                    t, null, "", 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-            t += 150L;
+                    t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE,
+                    Boolean.FALSE, 68.0f, BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 200L;
         }
-        eq("stays illuminated at 0 km/h after regen/SCC stop", Boolean.TRUE, Boolean.valueOf(snap.illuminated));
-        eq("source transitions to STANDSTILL_HOLD", "STANDSTILL_HOLD", snap.source);
+        eq("Standstill hold stays lit at 0 km/h", Boolean.TRUE, Boolean.valueOf(snap.illuminated));
+        eq("Standstill hold source", "STANDSTILL_HOLD", snap.source);
 
-        // Driver taps accelerator (3.0%) -> releases standstill hold immediately
+        // Tap throttle (2.5%) -> immediately releases standstill hold
         BrakeEvaluator.Snapshot released = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                t + 40L, null, "", 0.0f, 0.0f, 3.0f, Boolean.FALSE, Boolean.FALSE, 0L));
-        eq("throttle tap releases standstill hold immediately", Boolean.FALSE, Boolean.valueOf(released.illuminated));
-
-        // Manual 3s test overrides everything even in Park
-        BrakeEvaluator.Snapshot manual = ev.evaluate(cfg, new BrakeEvaluator.Input(
-                t + 100L, null, "", 0.0f, 0.0f, 0.0f, Boolean.TRUE, Boolean.TRUE, t + 3000L));
-        eq("manual test lights", Boolean.TRUE, Boolean.valueOf(manual.illuminated));
-        eq("manual test source", "MANUAL_TEST", manual.source);
+                t, 0.0f, 0.0f, 2.5f, 0.0f, Boolean.FALSE, Boolean.FALSE,
+                Boolean.FALSE, 68.0f, BrakeEvaluator.ObdSample.disconnected(), 0L));
+        eq("Throttle >= 2% releases standstill hold", Boolean.FALSE, Boolean.valueOf(released.illuminated));
     }
 
-    private static void testUsbExporterMountsAndWrite() throws Exception {
-        // 1. Unmounted system (only internal eMMC + tmpfs /storage): must return empty mount list
+    private static void testTelemetryRecorderScoringAndCsv() {
+        TelemetryRecorder rec = new TelemetryRecorder();
+        long wall = 1763000000000L;
+
+        // Tick 0 (t=1000): Both OFF -> TN
+        rec.record(makeScoredSnapshot(1000L, false, "OFF", 0, false, false), wall);
+        // Tick 1 (t=1050): OBD turns ON via Regen (36), Model still OFF -> FN (pending OBD rise at rel=50ms)
+        rec.record(makeScoredSnapshot(1050L, false, "OFF", 36, true, false), wall + 50L);
+        // Tick 2 (t=1150): Model turns ON via REGEN_DECEL -> TP, onset lag = 150 - 50 = +100 ms!
+        rec.record(makeScoredSnapshot(1150L, true, "REGEN_DECEL", 36, true, false), wall + 150L);
+        // Tick 3 (t=1200): Both ON via Regen -> TP
+        rec.record(makeScoredSnapshot(1200L, true, "REGEN_DECEL", 36, true, false), wall + 200L);
+        // Tick 4 (t=1250): OBD turns OFF (0), Model still holding -> FP (pending OBD fall at rel=250ms)
+        rec.record(makeScoredSnapshot(1250L, true, "REGEN_DECEL", 0, false, false), wall + 250L);
+        // Tick 5 (t=1330): Model turns OFF -> TN, release lag = 330 - 250 = +80 ms!
+        rec.record(makeScoredSnapshot(1330L, false, "OFF", 0, false, false), wall + 330L);
+
+        TelemetryRecorder.ScoreSnapshot sc = rec.scoreSnapshot();
+        eq("6 buffered rows", Integer.valueOf(6), Integer.valueOf(sc.bufferedRows));
+        eq("6 scored ticks", Long.valueOf(6L), Long.valueOf(sc.scoredSamples));
+        eq("TP=2", Long.valueOf(2L), Long.valueOf(sc.tp));
+        eq("FP=1", Long.valueOf(1L), Long.valueOf(sc.fp));
+        eq("TN=2", Long.valueOf(2L), Long.valueOf(sc.tn));
+        eq("FN=1", Long.valueOf(1L), Long.valueOf(sc.fn));
+        eq("Regen recall 2/3 ticks", Long.valueOf(2L), Long.valueOf(sc.regenModelMatchedSamples));
+        eq("Onset lag +100 ms", Long.valueOf(100L), Long.valueOf(sc.meanOnsetLagMs));
+        eq("Release lag +80 ms", Long.valueOf(80L), Long.valueOf(sc.meanReleaseLagMs));
+
+        String csv = rec.toCsvString();
+        String[] lines = csv.trim().split("\n");
+        eq("CSV has header + 6 data rows", Integer.valueOf(7), Integer.valueOf(lines.length));
+        eq("CSV header includes obd_lamp_raw", Boolean.TRUE, Boolean.valueOf(lines[0].contains("obd_lamp_raw")));
+        eq("CSV row 3 records REGEN_DECEL and raw 36",
+                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].contains(",36,1,0")));
+
+        String summary = rec.buildSummaryReport(IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)");
+        eq("Summary includes confusion matrix",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")));
+    }
+
+    private static BrakeEvaluator.Snapshot makeScoredSnapshot(
+            long tMs, boolean modelLit, String modelSrc, int obdRaw, boolean obdLit, boolean pedalBit) {
+        BrakeEvaluator.ObdSample obd = new BrakeEvaluator.ObdSample(true, "BLE", tMs - 10L, obdRaw, obdLit, pedalBit);
+        return new BrakeEvaluator.Snapshot(
+                tMs,
+                obdLit,
+                obdLit ? "OBD_BLE:REGEN(36)" : "OBD_BLE:OFF(0)",
+                modelLit,
+                modelSrc,
+                Float.valueOf(0.0f),
+                Float.valueOf(64.0f),
+                Float.valueOf(4.0f),
+                Float.valueOf(0.0f),
+                modelLit ? 1.55f : 0.10f,
+                Boolean.FALSE,
+                Boolean.FALSE,
+                Boolean.TRUE,
+                Float.valueOf(72.0f),
+                obd,
+                true,
+                false);
+    }
+
+    private static void testUsbExporterMountsAndAtomicWrite() throws Exception {
         String unmountedProcMounts =
                 "rootfs / rootfs ro,relatime 0 0\n"
                 + "tmpfs /storage tmpfs rw,relatime,mode=0555,gid=1028 0 0\n"
@@ -266,62 +450,74 @@ public final class TestMain {
         List<String> none = UsbExporter.parseUsbMountPoints(unmountedProcMounts);
         eq("no USB stick -> 0 mount points", Integer.valueOf(0), Integer.valueOf(none.size()));
 
-        // 2. Mounted USB stick (vold vfat on /mnt/media_rw/usb0 + FUSE mirror on /storage/usb0)
         String mountedProcMounts = unmountedProcMounts
                 + "/dev/block/vold/8:1 /mnt/media_rw/usb0 vfat rw,dirsync,nosuid,nodev 0 0\n"
                 + "/dev/fuse /storage/usb0 fuse rw,nosuid,nodev,relatime 0 0\n";
         List<String> mounts = UsbExporter.parseUsbMountPoints(mountedProcMounts);
-        eq("mounted USB -> 2 candidate paths", Integer.valueOf(2), Integer.valueOf(mounts.size()));
         eq("prefers /storage/usb0 ahead of /mnt/media_rw/usb0", "/storage/usb0", mounts.get(0));
-        eq("includes /mnt/media_rw/usb0 fallback", "/mnt/media_rw/usb0", mounts.get(1));
 
-        // 3. Export onto a fresh empty USB root directory (no pre-existing BrakeIndicator/ subfolder!)
-        File tmpRoot = Files.createTempDirectory("brake-usb-test").toFile();
+        File tmpRoot = Files.createTempDirectory("brake-usb-v3").toFile();
         try {
             File fakeUsb0 = new File(tmpRoot, "usb0");
             fakeUsb0.mkdirs();
-            File fallback = new File(tmpRoot, "fallback-probe.txt");
 
             UsbExporter.ExportResult emptyRes = UsbExporter.exportToDirectories(
-                    "probe-content", Collections.<String>emptyList(), "BrakeIndicator", fallback);
+                    "a,b\n1,2\n", "summary\n", Collections.<String>emptyList(), "BrakeIndicator");
             eq("empty mounts returns ok=false", Boolean.FALSE, Boolean.valueOf(emptyRes.ok));
-            eq("fallback written even when no USB mounted", Boolean.TRUE, Boolean.valueOf(fallback.isFile()));
 
             UsbExporter.ExportResult okRes = UsbExporter.exportToDirectories(
-                    "=== Probe Report v0.2.0 ===\n", Arrays.asList(fakeUsb0.getAbsolutePath()), "BrakeIndicator", fallback);
-            eq("export creates BrakeIndicator/ and succeeds", Boolean.TRUE, Boolean.valueOf(okRes.ok));
-            eq("saved file exists and non-empty", Boolean.TRUE,
-                    Boolean.valueOf(okRes.savedPath != null && new File(okRes.savedPath).length() > 10));
-            eq("BrakeIndicator subfolder created automatically", Boolean.TRUE,
-                    Boolean.valueOf(new File(fakeUsb0, "BrakeIndicator").isDirectory()));
+                    "elapsed_ms,obd_lamp_lit\n0,1\n",
+                    "=== Summary ===\n",
+                    Arrays.asList(fakeUsb0.getAbsolutePath()),
+                    "BrakeIndicator");
+            eq("export dataset+summary succeeds", Boolean.TRUE, Boolean.valueOf(okRes.ok));
+            eq("CSV file written", Boolean.TRUE,
+                    Boolean.valueOf(okRes.csvPath != null && new File(okRes.csvPath).isFile()));
+            eq("Summary file written", Boolean.TRUE,
+                    Boolean.valueOf(okRes.summaryPath != null && new File(okRes.summaryPath).isFile()));
+            // Ensure no leftover .part files remain after atomic rename
+            String[] names = new File(fakeUsb0, "BrakeIndicator").list();
+            boolean anyPart = false;
+            if (names != null) {
+                for (int i = 0; i < names.length; i++) {
+                    if (names[i].endsWith(".part")) anyPart = true;
+                }
+            }
+            eq("no temporary .part files left behind", Boolean.FALSE, Boolean.valueOf(anyPart));
         } finally {
             deleteRecursive(tmpRoot);
         }
     }
 
-    private static void testIpcProtocolRoundTrip() {
-        IndicatorConfig cfg = IndicatorConfig.defaults();
-        BrakeEvaluator.Snapshot snap = new BrakeEvaluator.Snapshot(
-                1000L, true, "OEM_LAMP:getStopLampSw=1", Boolean.TRUE, "getStopLampSw=1",
-                0.0f, 62.5f, 0.0f, 1.85f, Boolean.FALSE, Boolean.FALSE);
-        String line = IpcProtocol.encodeSnapshot(snap, cfg, true, 1, 4, "getStopLampSw=1, getCylPrsrVal=0.0");
-        Map<String, String> decoded = IpcProtocol.decodeLine(line);
-        eq("ipc type", "STATE", decoded.get("_type"));
-        eq("ipc lit", "1", decoded.get("lit"));
-        eq("ipc src", "OEM_LAMP:getStopLampSw=1", decoded.get("src"));
-        eq("ipc spd", "62.5", decoded.get("spd"));
-        eq("ipc hscan", "1", decoded.get("hscan"));
+    private static final class InMemoryPairingStore implements ObdBrakeClient.PairingStore {
+        String mac = "";
+        String name = "";
+        int addrType = -1;
+
+        @Override public String getMac() { return mac; }
+        @Override public String getName() { return name; }
+        @Override public int getAddrType() { return addrType; }
+
+        @Override
+        public void save(String mac, String name, int addrType) {
+            this.mac = mac;
+            this.name = name;
+            this.addrType = addrType;
+        }
+
+        @Override
+        public void clear() {
+            this.mac = "";
+            this.name = "";
+            this.addrType = -1;
+        }
     }
 
     private static void deleteRecursive(File f) {
-        if (f == null || !f.exists()) {
-            return;
-        }
+        if (f == null || !f.exists()) return;
         File[] children = f.listFiles();
         if (children != null) {
-            for (File c : children) {
-                deleteRecursive(c);
-            }
+            for (File c : children) deleteRecursive(c);
         }
         f.delete();
     }

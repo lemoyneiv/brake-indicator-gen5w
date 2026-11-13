@@ -1,12 +1,12 @@
 {
   "id": "brake-indicator-gen5w",
   "name": "Brake Light Indicator",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "hmgapi": ">=1.0.0",
   "authors": ["Kyle"],
   "license": "AGPL-3.0",
   "repo": "https://github.com/lemoyneiv/brake-indicator-gen5w",
-  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units, providing in-car confirmation when brake pedal, regenerative braking, or Smart Cruise Control illuminates the brake lights. Includes an on-car OEM CAN signal probe with one-tap USB export.",
+  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units using HMG-API built-in vehicle readings and optional OBD-II ground-truth brake lamp telemetry (@gen5w_ble direct BLE + 127.0.0.1:35000 fallback) with synchronized USB CSV dataset export.",
   "live": true,
   "apps": [
     {
@@ -16,12 +16,11 @@
   ],
   "services": [
     {
-      "name": "monitor",
-      "jar": "app/BrakeIndicator.apk",
-      "class": "dev.lemoyne.brakeindicator.MonitorMain",
-      "user": "root",
+      "name": "starter",
+      "script": "svc/start.sh",
+      "user": "system",
       "start": "android",
-      "restart": true
+      "restart": false
     }
   ],
   "usb": ["BrakeIndicator"],
@@ -32,7 +31,9 @@
       "pedal.accel",
       "gear.park",
       "parking_brake",
-      "moving"
+      "moving",
+      "steering.angle",
+      "hv.soc"
     ]
   },
   "provides": {

@@ -5,19 +5,68 @@ import java.util.Map;
 /**
  * Immutable configuration parsed from HMG-API settings.json values.
  * Note: HMG-API's SettingsForm stores "number" inputs via Long.parseLong,
- * so fractional thresholds are stored in integer tenths (e.g. 15 -> 1.5).
+ * so fractional thresholds are stored in integer tenths (e.g. 12 -> 1.2).
  */
 public final class IndicatorConfig {
 
+    public enum ObdMode {
+        OBD_WHEN_CONNECTED("obd_when_connected"),
+        MODEL_ONLY_ICON("model_only_icon"),
+        DISABLED("disabled");
+
+        public final String wireValue;
+
+        ObdMode(String wireValue) {
+            this.wireValue = wireValue;
+        }
+
+        public static ObdMode fromString(String s) {
+            if (s == null) {
+                return OBD_WHEN_CONNECTED;
+            }
+            String t = s.trim();
+            if ("model_only_icon".equalsIgnoreCase(t)) {
+                return MODEL_ONLY_ICON;
+            }
+            if ("disabled".equalsIgnoreCase(t) || "off".equalsIgnoreCase(t)) {
+                return DISABLED;
+            }
+            return OBD_WHEN_CONNECTED;
+        }
+
+        public ObdMode next() {
+            if (this == OBD_WHEN_CONNECTED) {
+                return MODEL_ONLY_ICON;
+            }
+            if (this == MODEL_ONLY_ICON) {
+                return DISABLED;
+            }
+            return OBD_WHEN_CONNECTED;
+        }
+
+        public String shortLabel() {
+            if (this == MODEL_ONLY_ICON) {
+                return "Model Icon (Score vs OBD)";
+            }
+            if (this == DISABLED) {
+                return "OBD Disabled (HMG-API Only)";
+            }
+            return "Real OBD -> Model Fallback";
+        }
+    }
+
     public enum SignalMode {
-        NATIVE,
-        NATIVE_AND_DECEL;
+        PRESSURE_ONLY,
+        PRESSURE_AND_DECEL;
 
         public static SignalMode fromString(String s) {
-            if (s != null && "native".equalsIgnoreCase(s.trim())) {
-                return NATIVE;
+            if (s != null) {
+                String t = s.trim();
+                if ("pressure_only".equalsIgnoreCase(t) || "native".equalsIgnoreCase(t)) {
+                    return PRESSURE_ONLY;
+                }
             }
-            return NATIVE_AND_DECEL;
+            return PRESSURE_AND_DECEL;
         }
     }
 
@@ -49,6 +98,7 @@ public final class IndicatorConfig {
         }
     }
 
+    public final ObdMode obdMode;
     public final SignalMode signalMode;
     public final OffState offState;
     public final Anchor anchor;
@@ -58,32 +108,10 @@ public final class IndicatorConfig {
     public final float pressureThreshold;
     public final float decelThresholdMps2;
     public final boolean standstillHold;
-    public final boolean probeLogging;
+    public final int bridgePort;
 
     public IndicatorConfig(
-            SignalMode signalMode,
-            OffState offState,
-            Anchor anchor,
-            int xOffsetPx,
-            int yOffsetPx,
-            int iconSizePx,
-            float pressureThreshold,
-            float decelThresholdMps2,
-            boolean probeLogging) {
-        this(
-                signalMode,
-                offState,
-                anchor,
-                xOffsetPx,
-                yOffsetPx,
-                iconSizePx,
-                pressureThreshold,
-                decelThresholdMps2,
-                true,
-                probeLogging);
-    }
-
-    public IndicatorConfig(
+            ObdMode obdMode,
             SignalMode signalMode,
             OffState offState,
             Anchor anchor,
@@ -93,8 +121,9 @@ public final class IndicatorConfig {
             float pressureThreshold,
             float decelThresholdMps2,
             boolean standstillHold,
-            boolean probeLogging) {
-        this.signalMode = signalMode == null ? SignalMode.NATIVE_AND_DECEL : signalMode;
+            int bridgePort) {
+        this.obdMode = obdMode == null ? ObdMode.OBD_WHEN_CONNECTED : obdMode;
+        this.signalMode = signalMode == null ? SignalMode.PRESSURE_AND_DECEL : signalMode;
         this.offState = offState == null ? OffState.HIDDEN : offState;
         this.anchor = anchor == null ? Anchor.TOP_RIGHT : anchor;
         this.xOffsetPx = clampInt(xOffsetPx, -1920, 1920);
@@ -103,12 +132,13 @@ public final class IndicatorConfig {
         this.pressureThreshold = clampFloat(pressureThreshold, 0.1f, 200.0f);
         this.decelThresholdMps2 = clampFloat(decelThresholdMps2, 0.3f, 6.0f);
         this.standstillHold = standstillHold;
-        this.probeLogging = probeLogging;
+        this.bridgePort = clampInt(bridgePort, 1024, 65535);
     }
 
     public static IndicatorConfig defaults() {
         return new IndicatorConfig(
-                SignalMode.NATIVE_AND_DECEL,
+                ObdMode.OBD_WHEN_CONNECTED,
+                SignalMode.PRESSURE_AND_DECEL,
                 OffState.HIDDEN,
                 Anchor.TOP_RIGHT,
                 260,
@@ -117,13 +147,14 @@ public final class IndicatorConfig {
                 0.4f,
                 1.2f,
                 true,
-                true);
+                35000);
     }
 
     public static IndicatorConfig fromMap(Map<String, String> values) {
         if (values == null || values.isEmpty()) {
             return defaults();
         }
+        ObdMode obdMode = ObdMode.fromString(values.get("obd_mode"));
         SignalMode mode = SignalMode.fromString(values.get("signal_mode"));
         OffState off = OffState.fromString(values.get("off_state"));
         Anchor anchor = Anchor.fromString(values.get("anchor"));
@@ -133,8 +164,9 @@ public final class IndicatorConfig {
         int pressureTenths = parseInt(values.get("pressure_threshold"), 4);
         int decelTenths = parseInt(values.get("decel_threshold"), 12);
         boolean standstill = parseBoolean(values.get("standstill_hold"), true);
-        boolean probe = parseBoolean(values.get("probe_logging"), true);
+        int bridgePort = parseInt(values.get("bridge_port"), 35000);
         return new IndicatorConfig(
+                obdMode,
                 mode,
                 off,
                 anchor,
@@ -144,7 +176,7 @@ public final class IndicatorConfig {
                 pressureTenths / 10.0f,
                 decelTenths / 10.0f,
                 standstill,
-                probe);
+                bridgePort);
     }
 
     /** Icon cell width matches Gen5W's ~1.42:1 status bar cell aspect ratio (51x36 at height 36). */

@@ -5,8 +5,6 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -21,18 +19,20 @@ import android.widget.TextView;
 
 import hmgapi.client.HmgApi;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.util.Map;
+import java.util.List;
+import java.util.Locale;
 
 /**
- * Gen5W landscape status & Option 1 OEM CAN signal probe screen.
- * Displays a live brake-lamp preview, vehicle telemetry, discovered
- * ITM_HSCANService getters, a 3-second overlay test button, and USB export.
+ * Gen5W landscape dashboard for Brake Light Indicator v0.3:
+ *  - Left card: Live brake-lamp preview, configurable OBD vs HMG-API icon mode toggle,
+ *    built-in HMG-API readings vs real OBD (`770`/`22BC06`) ground truth, live accuracy/lag
+ *    scorecard, 3-second test, dataset reset, and atomic USB CSV export.
+ *  - Right card: `@gen5w_ble` direct BLE scanner pairing (with automatic `127.0.0.1:35000`
+ *    loopback fallback) and live discrete transition log.
  */
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity
+        implements BrakeEngine.StateListener, ObdBrakeClient.Listener {
 
     private static final int BG_DARK = Color.rgb(20, 21, 24);
     private static final int CARD_BG = Color.rgb(31, 34, 41);
@@ -40,49 +40,85 @@ public final class MainActivity extends Activity {
     private static final int TEXT_PRIMARY = Color.rgb(230, 234, 240);
     private static final int TEXT_MUTED = Color.rgb(146, 155, 168);
     private static final int ACCENT_TEAL = Color.rgb(35, 228, 197);
+    private static final int ACCENT_AMBER = Color.rgb(245, 179, 66);
     private static final int BADGE_LIT = Color.rgb(214, 38, 38);
     private static final int BADGE_OFF = Color.rgb(45, 50, 60);
+    private static final int BADGE_OBD_OK = Color.rgb(23, 98, 84);
     private static final int BTN_BG = Color.rgb(43, 48, 58);
+    private static final int BTN_OBD_PAIR = Color.rgb(28, 72, 68);
 
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private BrakeEngine engine;
+
     private BrakeLampView previewLamp;
+    private TextView obdHeaderBadge;
     private TextView statusBadge;
     private TextView sourceLabel;
-    private TextView telemetryText;
     private TextView configSummaryText;
-    private TextView probeHeaderText;
-    private TextView probeReportText;
+    private Button modeToggleBtn;
+    private TextView telemetryText;
     private TextView actionNoticeText;
 
-    private volatile boolean streaming;
-    private volatile LocalSocket streamSocket;
+    private TextView obdStatusLineText;
+    private Button scanBleBtn;
+    private LinearLayout deviceListContainer;
+    private TextView transitionLogText;
+
+    private long lastRightRefreshMs;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // Ensure top-bar overlay service is running whenever app is opened
         startService(new Intent(this, OverlayService.class));
+        engine = BrakeEngine.getInstance(this);
+        engine.ensureStarted();
         setContentView(buildContentView());
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        startStream();
-        refreshProbeReport();
+        engine.addListener(this);
+        engine.getObdClient().addListener(this);
+        engine.requestSettingsReload();
+        refreshObdPanel();
     }
 
     @Override
     protected void onPause() {
-        stopStream();
+        engine.removeListener(this);
+        engine.getObdClient().removeListener(this);
         super.onPause();
+    }
+
+    @Override
+    public void onEngineState(
+            final IndicatorConfig config,
+            final BrakeEvaluator.Snapshot snapshot,
+            final boolean hmgConnected) {
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                renderTelemetry(config, snapshot, hmgConnected);
+            }
+        });
+    }
+
+    @Override
+    public void onObdStateChanged() {
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                refreshObdPanel();
+            }
+        });
     }
 
     private View buildContentView() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG_DARK);
-        root.setPadding(28, 20, 28, 20);
+        root.setPadding(26, 18, 26, 18);
 
         // Header bar
         LinearLayout header = new LinearLayout(this);
@@ -90,24 +126,35 @@ public final class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator v0.2");
+        title.setText("Brake Light Indicator v0.3");
         title.setTextColor(TEXT_PRIMARY);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 30);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        header.addView(title, titleLp);
+        header.addView(title, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        obdHeaderBadge = new TextView(this);
+        obdHeaderBadge.setText("OBD: IDLE");
+        obdHeaderBadge.setTextColor(TEXT_PRIMARY);
+        obdHeaderBadge.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
+        obdHeaderBadge.setTypeface(Typeface.DEFAULT_BOLD);
+        obdHeaderBadge.setPadding(16, 9, 16, 9);
+        obdHeaderBadge.setBackground(roundedRect(BADGE_OFF, 16, 0, 0));
+        LinearLayout.LayoutParams obdBadgeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        obdBadgeLp.rightMargin = 12;
+        header.addView(obdHeaderBadge, obdBadgeLp);
 
         statusBadge = new TextView(this);
-        statusBadge.setText("WAITING FOR MONITOR");
+        statusBadge.setText("BRAKE LIGHTS OFF");
         statusBadge.setTextColor(TEXT_PRIMARY);
-        statusBadge.setTextSize(TypedValue.COMPLEX_UNIT_PX, 18);
+        statusBadge.setTextSize(TypedValue.COMPLEX_UNIT_PX, 17);
         statusBadge.setTypeface(Typeface.DEFAULT_BOLD);
-        statusBadge.setPadding(22, 10, 22, 10);
-        statusBadge.setBackground(roundedRect(BADGE_OFF, 18, 0, 0));
+        statusBadge.setPadding(20, 9, 20, 9);
+        statusBadge.setBackground(roundedRect(BADGE_OFF, 16, 0, 0));
         LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        badgeLp.rightMargin = 18;
+        badgeLp.rightMargin = 14;
         header.addView(statusBadge, badgeLp);
 
         Button closeBtn = styledButton("Close", new View.OnClickListener() {
@@ -122,17 +169,17 @@ public final class MainActivity extends Activity {
         root.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Main two-column body
+        // Two-column landscape body
         LinearLayout columns = new LinearLayout(this);
         columns.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams colsLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        colsLp.topMargin = 18;
+        colsLp.topMargin = 14;
 
-        // Left column: Live lamp preview + telemetry + controls
+        // ================= LEFT CARD =================
         LinearLayout leftCard = cardLayout();
         LinearLayout.LayoutParams leftLp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.46f);
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.50f);
         leftLp.rightMargin = 14;
 
         LinearLayout previewRow = new LinearLayout(this);
@@ -141,25 +188,36 @@ public final class MainActivity extends Activity {
 
         previewLamp = new BrakeLampView(this);
         previewLamp.setPreviewBackdrop(true);
-        LinearLayout.LayoutParams lampLp = new LinearLayout.LayoutParams(128, 90);
-        lampLp.rightMargin = 20;
+        LinearLayout.LayoutParams lampLp = new LinearLayout.LayoutParams(116, 82);
+        lampLp.rightMargin = 16;
         previewRow.addView(previewLamp, lampLp);
 
         LinearLayout previewMeta = new LinearLayout(this);
         previewMeta.setOrientation(LinearLayout.VERTICAL);
 
         sourceLabel = new TextView(this);
-        sourceLabel.setText("Trigger: OFF");
+        sourceLabel.setText("Icon Trigger: OFF");
         sourceLabel.setTextColor(TEXT_PRIMARY);
-        sourceLabel.setTextSize(TypedValue.COMPLEX_UNIT_PX, 22);
+        sourceLabel.setTextSize(TypedValue.COMPLEX_UNIT_PX, 20);
         sourceLabel.setTypeface(Typeface.DEFAULT_BOLD);
         previewMeta.addView(sourceLabel);
 
         configSummaryText = new TextView(this);
-        configSummaryText.setText("Mode: NATIVE_AND_DECEL  |  Anchor: TOP_RIGHT (260, 6)");
+        configSummaryText.setText("HMG-API built-in readings + OBD calibration");
         configSummaryText.setTextColor(TEXT_MUTED);
-        configSummaryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
+        configSummaryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
         previewMeta.addView(configSummaryText);
+
+        modeToggleBtn = styledButton("Mode: Real OBD -> Model Fallback", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                cycleObdMode();
+            }
+        });
+        LinearLayout.LayoutParams modeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        modeLp.topMargin = 6;
+        previewMeta.addView(modeToggleBtn, modeLp);
 
         previewRow.addView(previewMeta, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -168,98 +226,144 @@ public final class MainActivity extends Activity {
         telemetryText = new TextView(this);
         telemetryText.setTypeface(Typeface.MONOSPACE);
         telemetryText.setTextColor(TEXT_PRIMARY);
-        telemetryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 18);
-        telemetryText.setLineSpacing(6.0f, 1.0f);
-        telemetryText.setText("Connecting to monitor service...");
+        telemetryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
+        telemetryText.setLineSpacing(5.0f, 1.0f);
+        telemetryText.setText("Starting HMG-API vehicle polling...");
         LinearLayout.LayoutParams teleLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        teleLp.topMargin = 16;
+        teleLp.topMargin = 12;
         leftCard.addView(telemetryText, teleLp);
 
-        // Action row
+        // Left action buttons
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
 
         Button testBtn = styledButton("Test Icon (3s)", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                triggerTestOverlay();
+                startService(new Intent(MainActivity.this, OverlayService.class));
+                engine.triggerManualTest(3000L);
+                actionNoticeText.setText("Illuminating top-bar brake indicator for 3 seconds.");
             }
         });
         LinearLayout.LayoutParams b1 = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        b1.rightMargin = 10;
+        b1.rightMargin = 8;
         actions.addView(testBtn, b1);
 
-        Button reloadBtn = styledButton("Reload Settings", new View.OnClickListener() {
+        Button clearBtn = styledButton("Clear Dataset", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                triggerReload();
+                engine.getRecorder().clear();
+                refreshObdPanel();
+                actionNoticeText.setText("Cleared in-RAM calibration dataset and scorecard.");
             }
         });
         LinearLayout.LayoutParams b2 = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-        b2.rightMargin = 10;
-        actions.addView(reloadBtn, b2);
+        b2.rightMargin = 8;
+        actions.addView(clearBtn, b2);
 
-        Button exportBtn = styledButton("Export USB", new View.OnClickListener() {
+        Button exportBtn = styledButton("Export CSV to USB", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                exportReportToUsb();
+                exportDatasetToUsb();
             }
         });
         actions.addView(exportBtn, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.15f));
 
         leftCard.addView(actions, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         actionNoticeText = new TextView(this);
         actionNoticeText.setTextColor(ACCENT_TEAL);
-        actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
-        actionNoticeText.setPadding(2, 8, 2, 0);
-        actionNoticeText.setText("Configure placement & thresholds in HMG-API -> Mods -> Brake Light Indicator.");
+        actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
+        actionNoticeText.setPadding(2, 6, 2, 0);
+        actionNoticeText.setText("Exports synchronized HMG-API + OBD 22BC06 CSV & summary to <usb>/BrakeIndicator/.");
         leftCard.addView(actionNoticeText);
 
         columns.addView(leftCard, leftLp);
 
-        // Right column: Option 1 ITM_HSCANService probe inspector
+        // ================= RIGHT CARD =================
         LinearLayout rightCard = cardLayout();
         LinearLayout.LayoutParams rightLp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.54f);
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.50f);
 
         LinearLayout rightHeader = new LinearLayout(this);
         rightHeader.setOrientation(LinearLayout.HORIZONTAL);
         rightHeader.setGravity(Gravity.CENTER_VERTICAL);
 
-        probeHeaderText = new TextView(this);
-        probeHeaderText.setText("OEM CAN Signal Probe (HSCAN + System + BCM)");
-        probeHeaderText.setTextColor(ACCENT_TEAL);
-        probeHeaderText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 20);
-        probeHeaderText.setTypeface(Typeface.DEFAULT_BOLD);
-        rightHeader.addView(probeHeaderText, new LinearLayout.LayoutParams(
+        TextView obdTitle = new TextView(this);
+        obdTitle.setText("OBD-II Ground Truth (@gen5w_ble + Loopback)");
+        obdTitle.setTextColor(ACCENT_TEAL);
+        obdTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, 19);
+        obdTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        rightHeader.addView(obdTitle, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        Button refreshProbeBtn = styledButton("Refresh Probe", new View.OnClickListener() {
+        scanBleBtn = styledButton("Scan BLE", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                refreshProbeReport();
+                ObdBrakeClient obd = engine.getObdClient();
+                if (obd.isBleScanning()) {
+                    obd.stopBleScan();
+                } else {
+                    obd.startBleScan();
+                }
             }
         });
-        rightHeader.addView(refreshProbeBtn);
+        LinearLayout.LayoutParams scanLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        scanLp.rightMargin = 8;
+        rightHeader.addView(scanBleBtn, scanLp);
+
+        Button reconnBtn = styledButton("Reconnect", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.getObdClient().requestReconnect();
+                actionNoticeText.setText("Retrying @gen5w_ble direct -> 127.0.0.1 fallback...");
+            }
+        });
+        LinearLayout.LayoutParams recLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        recLp.rightMargin = 8;
+        rightHeader.addView(reconnBtn, recLp);
+
+        Button unpairBtn = styledButton("Unpair", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.getObdClient().unpairAdapter();
+                actionNoticeText.setText("Cleared paired BLE adapter (127.0.0.1 loopback fallback still active).");
+            }
+        });
+        rightHeader.addView(unpairBtn);
         rightCard.addView(rightHeader);
+
+        obdStatusLineText = new TextView(this);
+        obdStatusLineText.setTextColor(TEXT_MUTED);
+        obdStatusLineText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
+        obdStatusLineText.setPadding(0, 6, 0, 6);
+        obdStatusLineText.setText("Priority: 1) Direct BLE via @gen5w_ble  ->  2) 127.0.0.1:35000 loopback");
+        rightCard.addView(obdStatusLineText);
+
+        deviceListContainer = new LinearLayout(this);
+        deviceListContainer.setOrientation(LinearLayout.VERTICAL);
+        rightCard.addView(deviceListContainer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        scrollLp.topMargin = 12;
+        scrollLp.topMargin = 8;
 
-        probeReportText = new TextView(this);
-        probeReportText.setTypeface(Typeface.MONOSPACE);
-        probeReportText.setTextColor(TEXT_PRIMARY);
-        probeReportText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
-        probeReportText.setText("Loading ITM_HSCANService getter report...");
-        scroll.addView(probeReportText);
+        transitionLogText = new TextView(this);
+        transitionLogText.setTypeface(Typeface.MONOSPACE);
+        transitionLogText.setTextColor(TEXT_PRIMARY);
+        transitionLogText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
+        transitionLogText.setLineSpacing(4.0f, 1.0f);
+        transitionLogText.setText("No brake-lamp or HMG-API model transitions recorded yet.");
+        scroll.addView(transitionLogText);
         rightCard.addView(scroll, scrollLp);
 
         columns.addView(rightCard, rightLp);
@@ -267,10 +371,181 @@ public final class MainActivity extends Activity {
         return root;
     }
 
+    private void renderTelemetry(
+            IndicatorConfig cfg,
+            BrakeEvaluator.Snapshot snap,
+            boolean hmgConnected) {
+        if (cfg == null || snap == null) {
+            return;
+        }
+        previewLamp.updateState(snap.illuminated, IndicatorConfig.OffState.DIM);
+
+        statusBadge.setText(snap.illuminated ? "BRAKE LIGHTS ON" : "BRAKE LIGHTS OFF");
+        statusBadge.setBackground(roundedRect(snap.illuminated ? BADGE_LIT : BADGE_OFF, 16, 0, 0));
+
+        ObdBrakeClient obdClient = engine.getObdClient();
+        float hz = obdClient.getPollHz();
+        if (snap.obdFresh) {
+            obdHeaderBadge.setText(String.format(Locale.US, "OBD %s %.1fHz",
+                    snap.obd.transport, Float.valueOf(hz)));
+            obdHeaderBadge.setBackground(roundedRect(BADGE_OBD_OK, 16, 0, 0));
+        } else {
+            obdHeaderBadge.setText(cfg.obdMode == IndicatorConfig.ObdMode.DISABLED ? "OBD: OFF" : "OBD: STANDBY");
+            obdHeaderBadge.setBackground(roundedRect(BADGE_OFF, 16, 0, 0));
+        }
+
+        sourceLabel.setText("Icon Trigger: " + snap.source);
+        configSummaryText.setText(cfg.anchor + " (" + cfg.xOffsetPx + ", " + cfg.yOffsetPx + ") "
+                + cfg.iconSizePx + "px  |  HMG-API: " + (hmgConnected ? "OK" : "WAITING"));
+        modeToggleBtn.setText("Mode: " + cfg.obdMode.shortLabel() + " (tap to switch)");
+
+        TelemetryRecorder.ScoreSnapshot sc = engine.getRecorder().scoreSnapshot();
+
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("Real OBD (770/22BC06) : ");
+        if (snap.obdFresh) {
+            sb.append(snap.obd.brakeLampLit ? "ON " : "OFF")
+              .append(" [raw=").append(snap.obd.rawCode);
+            if (snap.obd.brakeLampLit) {
+                sb.append(snap.obd.pedalBit ? " PEDAL" : " REGEN/SCC");
+            }
+            sb.append(", ").append(snap.obd.transport)
+              .append(", age=").append(snap.obd.ageMsAt(snap.timestampMs)).append("ms]\n");
+        } else {
+            sb.append(obdClient.getStatusSummary()).append('\n');
+        }
+
+        sb.append("HMG-API Model         : ")
+          .append(snap.modelIlluminated ? ("ON  [" + snap.modelSource + "]") : "OFF").append('\n');
+        sb.append("Speed / Decel (-dv/dt): ")
+          .append(fmtObjFloat(snap.speedKmh, "%.1f")).append(" km/h  |  ")
+          .append(String.format(Locale.US, "%.2f m/s^2", Float.valueOf(snap.decelMps2))).append('\n');
+        sb.append("Brake Prsr / Accel    : prsr=")
+          .append(fmtObjFloat(snap.brakePressure, "%.1f")).append("  |  accel=")
+          .append(fmtObjFloat(snap.accelPedal, "%.1f")).append("%\n");
+        sb.append("Steer / Park / HV SOC : ")
+          .append(fmtObjFloat(snap.steeringAngleDeg, "%+.1f")).append(" deg  |  P=")
+          .append(fmtFlag(snap.gearPark)).append(" EPB=").append(fmtFlag(snap.parkingBrake))
+          .append("  |  SOC=").append(fmtObjFloat(snap.hvSocPct, "%.1f")).append("%\n");
+
+        sb.append("Model vs OBD Accuracy : ");
+        if (sc.scoredSamples > 0L) {
+            sb.append(String.format(Locale.US, "Agree %.1f%% | RegenRec %s | Lag %s\n",
+                    Float.valueOf(sc.agreementPct()),
+                    Float.isNaN(sc.regenRecallPct()) ? "n/a"
+                            : String.format(Locale.US, "%.1f%%", Float.valueOf(sc.regenRecallPct())),
+                    sc.onsetCount > 0 ? (sc.meanOnsetLagMs + "ms") : "n/a"));
+        } else {
+            sb.append("awaiting live OBD 22BC06 samples\n");
+        }
+        sb.append("RAM Dataset Buffer    : ")
+          .append(sc.bufferedRows).append(" / ").append(TelemetryRecorder.CAPACITY)
+          .append(" rows (").append(sc.scoredSamples).append(" scored)");
+
+        telemetryText.setText(sb.toString());
+
+        long now = System.currentTimeMillis();
+        if (now - lastRightRefreshMs >= 450L) {
+            lastRightRefreshMs = now;
+            transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
+        }
+    }
+
+    private void refreshObdPanel() {
+        ObdBrakeClient obd = engine.getObdClient();
+        scanBleBtn.setText(obd.isBleScanning() ? "Stop Scan" : "Scan BLE");
+
+        String pairedMac = obd.getPairedMac();
+        String pairedInfo = pairedMac.isEmpty()
+                ? "Paired BLE: none"
+                : ("Paired BLE: " + obd.getPairedName() + " [" + pairedMac + "]");
+        obdStatusLineText.setText(pairedInfo + "  |  " + obd.getStatusSummary());
+
+        deviceListContainer.removeAllViews();
+        List<ObdBrakeClient.DiscoveredDevice> devs = obd.getDiscoveredDevices();
+        int shown = 0;
+        for (int i = 0; i < devs.size() && shown < 4; i++) {
+            final ObdBrakeClient.DiscoveredDevice d = devs.get(i);
+            shown++;
+            String prefix = d.likelyBvm02 ? "[BVM02 - Ignored] " : (d.likelyObd ? "[OBD] " : "");
+            String label = prefix + d.name + "  (" + d.mac + ", " + d.rssi + " dBm)";
+            Button rowBtn = styledButton(label, new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (d.likelyBvm02) {
+                        actionNoticeText.setText("Refused BVM02 battery sensor (hardware safety guard).");
+                        return;
+                    }
+                    boolean ok = engine.getObdClient().pairAdapter(d.mac, d.name, d.addrType);
+                    if (ok) {
+                        actionNoticeText.setText("Paired BLE OBD adapter " + d.name + " (" + d.mac + ").");
+                    }
+                }
+            });
+            rowBtn.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
+            if (d.likelyObd) {
+                rowBtn.setBackground(roundedRect(BTN_OBD_PAIR, 10, 1, ACCENT_TEAL));
+            } else if (d.likelyBvm02) {
+                rowBtn.setTextColor(ACCENT_AMBER);
+            }
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = 6;
+            deviceListContainer.addView(rowBtn, lp);
+        }
+
+        transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
+    }
+
+    private void cycleObdMode() {
+        Thread worker = new Thread("BrakeModeCycle") {
+            @Override
+            public void run() {
+                final IndicatorConfig.ObdMode next = engine.cycleObdModeAndSave();
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        modeToggleBtn.setText("Mode: " + next.shortLabel() + " (tap to switch)");
+                        actionNoticeText.setText("Switched indicator mode to: " + next.shortLabel());
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void exportDatasetToUsb() {
+        actionNoticeText.setText("Exporting synchronized CSV + summary to USB...");
+        Thread worker = new Thread("BrakeUsbExport") {
+            @Override
+            public void run() {
+                final UsbExporter.ExportResult res = engine.exportDatasetToUsb();
+                if (res.ok && res.csvPath != null) {
+                    try {
+                        HmgApi.toast(MainActivity.this, "Exported " + new File(res.csvPath).getName());
+                    } catch (Exception ignored) {}
+                }
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (res.ok) {
+                            actionNoticeText.setText("Saved to USB: " + res.csvPath);
+                        } else {
+                            actionNoticeText.setText(res.errorMessage);
+                        }
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
     private LinearLayout cardLayout() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(22, 18, 22, 18);
+        card.setPadding(20, 16, 20, 16);
         card.setBackground(roundedRect(CARD_BG, 16, 2, CARD_BORDER));
         return card;
     }
@@ -280,9 +555,9 @@ public final class MainActivity extends Activity {
         b.setText(label);
         b.setAllCaps(false);
         b.setTextColor(TEXT_PRIMARY);
-        b.setTextSize(TypedValue.COMPLEX_UNIT_PX, 17);
-        b.setPadding(18, 10, 18, 10);
-        b.setBackground(roundedRect(BTN_BG, 12, 1, CARD_BORDER));
+        b.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16);
+        b.setPadding(16, 9, 16, 9);
+        b.setBackground(roundedRect(BTN_BG, 10, 1, CARD_BORDER));
         b.setOnClickListener(listener);
         return b;
     }
@@ -297,224 +572,12 @@ public final class MainActivity extends Activity {
         return d;
     }
 
-    private void startStream() {
-        if (streaming) {
-            return;
-        }
-        streaming = true;
-        Thread t = new Thread("brake-ui-stream") {
-            @Override
-            public void run() {
-                while (streaming) {
-                    LocalSocket s = new LocalSocket();
-                    try {
-                        s.connect(new LocalSocketAddress(
-                                IpcProtocol.SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
-                        streamSocket = s;
-                        OutputStream out = s.getOutputStream();
-                        out.write("STREAM\n".getBytes("UTF-8"));
-                        out.flush();
-                        BufferedReader in = new BufferedReader(
-                                new InputStreamReader(s.getInputStream(), "UTF-8"), 512);
-                        String line;
-                        while (streaming && (line = in.readLine()) != null) {
-                            final Map<String, String> msg = IpcProtocol.decodeLine(line);
-                            if ("STATE".equals(msg.get("_type"))) {
-                                uiHandler.post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        renderState(msg);
-                                    }
-                                });
-                            }
-                        }
-                    } catch (Exception ignored) {
-                    } finally {
-                        streamSocket = null;
-                        try {
-                            s.close();
-                        } catch (Exception ignored) {
-                        }
-                    }
-                    if (streaming) {
-                        try {
-                            Thread.sleep(1000L);
-                        } catch (InterruptedException ie) {
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-        t.setDaemon(true);
-        t.start();
+    private static String fmtObjFloat(Float v, String fmt) {
+        return v == null ? "-" : String.format(Locale.US, fmt, v);
     }
 
-    private void stopStream() {
-        streaming = false;
-        LocalSocket s = streamSocket;
-        streamSocket = null;
-        if (s != null) {
-            try {
-                s.close();
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
-    private void renderState(Map<String, String> m) {
-        boolean lit = "1".equals(m.get("lit"));
-        previewLamp.updateState(lit, IndicatorConfig.OffState.DIM);
-
-        statusBadge.setText(lit ? "BRAKE LIGHTS ON" : "BRAKE LIGHTS OFF");
-        statusBadge.setBackground(roundedRect(lit ? BADGE_LIT : BADGE_OFF, 18, 0, 0));
-
-        sourceLabel.setText("Trigger: " + val(m, "src", "OFF"));
-        configSummaryText.setText("Mode: " + val(m, "mode", "NATIVE")
-                + "  |  Off: " + val(m, "off", "HIDDEN")
-                + "  |  " + val(m, "anchor", "TOP_RIGHT")
-                + " (" + val(m, "x", "260") + ", " + val(m, "y", "6") + ") "
-                + val(m, "size", "36") + "px");
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("Brake Pressure (HSCAN) : ").append(val(m, "prsr", "-")).append('\n');
-        sb.append("Direct OEM Lamp Getter : ").append(val(m, "lamp", "-"));
-        String lampName = val(m, "lamp_name", "");
-        if (!lampName.isEmpty()) {
-            sb.append(" (").append(lampName).append(')');
-        }
-        sb.append('\n');
-        sb.append("Vehicle Speed          : ").append(val(m, "spd", "-")).append(" km/h\n");
-        sb.append("Deceleration (-dv/dt)  : ").append(val(m, "decel", "0.00")).append(" m/s^2\n");
-        sb.append("Accelerator Pedal      : ").append(val(m, "accel", "-")).append('\n');
-        sb.append("Gear Park / EPB        : P=").append(val(m, "park", "-"))
-                .append("  EPB=").append(val(m, "epb", "-")).append('\n');
-        sb.append("tm_hscan_service       : ")
-                .append("1".equals(m.get("hscan")) ? "CONNECTED" : "DISCONNECTED")
-                .append(" (lamp=").append(val(m, "n_lamp", "0"))
-                .append(", diag=").append(val(m, "n_diag", "0")).append(")\n");
-        String cands = val(m, "cands", "");
-        if (!cands.isEmpty()) {
-            sb.append("Live HSCAN Getters     : ").append(cands);
-        }
-        telemetryText.setText(sb.toString());
-    }
-
-    private void triggerTestOverlay() {
-        startService(new Intent(this, OverlayService.class));
-        Thread t = new Thread("brake-ui-test") {
-            @Override
-            public void run() {
-                final String res = OverlayService.sendMonitorCommand("TEST 3000");
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        actionNoticeText.setText(res != null
-                                ? "Illuminating top-bar brake indicator for 3 seconds."
-                                : "Monitor service not reachable yet (enable mod in HMG-API).");
-                    }
-                });
-            }
-        };
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void triggerReload() {
-        Thread t = new Thread("brake-ui-reload") {
-            @Override
-            public void run() {
-                final String res = OverlayService.sendMonitorCommand("RELOAD");
-                final String rep = OverlayService.sendMonitorCommand("REPORT");
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (rep != null && !rep.isEmpty()) {
-                            probeReportText.setText(rep);
-                        }
-                        actionNoticeText.setText(res != null
-                                ? "Settings reloaded from HMG-API."
-                                : "Monitor service not reachable.");
-                    }
-                });
-            }
-        };
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void refreshProbeReport() {
-        Thread t = new Thread("brake-ui-report") {
-            @Override
-            public void run() {
-                final String rep = OverlayService.sendMonitorCommand("REPORT");
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (rep != null && !rep.isEmpty()) {
-                            probeReportText.setText(rep);
-                        } else {
-                            probeReportText.setText(
-                                    "Monitor service is not connected yet.\n"
-                                    + "Once enabled in HMG-API on a Gen5W unit, this panel lists every\n"
-                                    + "read-only brake/stop-lamp/regen getter discovered in\n"
-                                    + "/system/framework/com.hkmc.ext.hcan.jar (ITM_HSCANService)\n"
-                                    + "and logs live value transitions during regenerative braking.");
-                        }
-                    }
-                });
-            }
-        };
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void exportReportToUsb() {
-        actionNoticeText.setText("Exporting probe log to USB drive...");
-        Thread t = new Thread("brake-usb-export") {
-            @Override
-            public void run() {
-                String msg;
-                String toastMsg = null;
-                try {
-                    String reply = OverlayService.sendMonitorCommand("EXPORT_USB");
-                    if (reply == null || reply.isEmpty()) {
-                        msg = "Monitor service not running; enable Brake Light Indicator in HMG-API first.";
-                    } else if (reply.startsWith("OK\t")) {
-                        String savedPath = reply.substring(3).trim();
-                        File f = new File(savedPath);
-                        msg = "Saved to USB: " + savedPath;
-                        toastMsg = "Exported " + f.getName();
-                    } else if (reply.startsWith("ERR\t")) {
-                        msg = reply.substring(4).trim();
-                        toastMsg = "USB export: see status note";
-                    } else {
-                        msg = "Unexpected monitor response: " + reply;
-                    }
-                } catch (Exception e) {
-                    msg = "USB export failed: " + e.getMessage();
-                }
-                if (toastMsg != null) {
-                    try {
-                        HmgApi.toast(MainActivity.this, toastMsg);
-                    } catch (Exception ignored) {
-                    }
-                }
-                final String finalMsg = msg;
-                uiHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        actionNoticeText.setText(finalMsg);
-                    }
-                });
-            }
-        };
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private static String val(Map<String, String> m, String key, String fallback) {
-        String v = m.get(key);
-        return v == null || v.isEmpty() ? fallback : v;
+    private static String fmtFlag(Boolean b) {
+        if (b == null) return "-";
+        return b.booleanValue() ? "1" : "0";
     }
 }

@@ -1,7 +1,9 @@
 out/
+dist/
 *.key
 *.key.pub
 *.p12
+*.keystore
 *.pass
 *.pyc
 __pycache__/

@@ -60,9 +60,27 @@ Because public Gen5W Binder dumps omitted `/system/framework/com.hkmc.ext.hcan.j
 
 ---
 
-## Building & Testing Locally
+## Installation
 
-Requires Java 17+, Python 3, the Android SDK (`ANDROID_HOME` with `platforms/android-19` and `build-tools`), and an unpacked HMG-API Mod SDK (`HMGAPI_SDK`):
+Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
+
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.1.0-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.1.0.zip`), plug into the head unit's data USB port, and install from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.1.0-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly (even on cars without an HMG-API launcher hook map).
+- **Direct Packages:** `brake-indicator-gen5w-v0.1.0.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.1.0-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+
+---
+
+## Building & Signing Installable Packages
+
+Requires Java 17+, Python 3, the Android SDK (`ANDROID_HOME` with `platforms/android-19` and `build-tools`), and an unpacked HMG-API Mod SDK (`HMGAPI_SDK` or `../HMG-API`):
+
+```sh
+./build.sh
+```
+
+`./build.sh` compiles the APK, runs both test suites and `check-scripts.sh`, signs with `${HMGAPI_KEY:-~/.hmgapi/author.key}`, and writes all four installable `.zip` archives plus `SHA256SUMS` into `dist/`.
+
+To run individual HMG-API Mod SDK steps manually:
 
 ```sh
 # 1. Verify HMG-API floor & hook points
@@ -77,10 +95,6 @@ sh brake-indicator-gen5w/tools/unit/test.sh
 
 # 4. Verify head-unit script compatibility
 sh "$HMGAPI_SDK/bin/check-scripts.sh" brake-indicator-gen5w
-
-# 5. Package signed HMG-API mod zip (and optional NEMESIS zip)
-sh "$HMGAPI_SDK/bin/mkmodpkg.sh" brake-indicator-gen5w /path/to/author.key
-sh "$HMGAPI_SDK/bin/mknemesismod.sh" out/packages/brake-indicator-gen5w-0.1.0.zip
 ```
 
 ## License

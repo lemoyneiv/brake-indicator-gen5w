@@ -1,7 +1,7 @@
-# Draft a release of brake-indicator-gen5w from a version tag (e.g. v0.1.0).
-# Secrets in the "release" environment (v* tags only):
-#   MOD_KEY, MOD_KEY_PUB (base64 of the author signing key and .pub)
-#   Optional: AUTHOR_KEY (expected author key UUID)
+# Draft a release of brake-indicator-gen5w from a version tag (e.g. v0.1.0) when
+# MOD_KEY and MOD_KEY_PUB secrets are configured. If releases are signed locally via
+# ./build.sh and uploaded with gh release create, this workflow skips cleanly when
+# MOD_KEY is not set in repository secrets.
 name: Release
 
 on:
@@ -16,7 +16,26 @@ env:
   HMGAPI_REPO: Open-HMG/HMG-API
 
 jobs:
+  check-secrets:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_key: ${{ steps.k.outputs.has_key }}
+    steps:
+      - id: k
+        env:
+          MOD_KEY: ${{ secrets.MOD_KEY }}
+          MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+        run: |
+          if [ -n "$MOD_KEY" ] && [ -n "$MOD_KEY_PUB" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "No MOD_KEY secret configured; skipping CI signing (use ./build.sh locally)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   release:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_key == 'true'
     runs-on: ubuntu-24.04
     environment: release
     steps:
@@ -89,45 +108,19 @@ jobs:
           echo "HMGAPI_SDK=$S" >> "$GITHUB_ENV"
           pip install --require-hashes -r "$S/requirements.txt"
 
-      - name: Build and test
-        run: |
-          python3 "$HMGAPI_SDK/bin/check-points.py" "$MOD" --repo "$HMGAPI_REPO"
-          sh "$HMGAPI_SDK/bin/build-mod.sh" "$MOD" "out/build/$MOD" "out/work/$MOD"
-          for t in "$MOD/test.sh" "$MOD"/tools/*/test.sh; do
-            [ -f "$t" ] || continue
-            HMGAPI_MOD_BUILD="$PWD/out/build/$MOD" sh "$t"
-          done
-          sh "$HMGAPI_SDK/bin/check-scripts.sh" "$MOD"
-
-      - name: Key
+      - name: Build and ship packages
         env:
           MOD_KEY: ${{ secrets.MOD_KEY }}
           MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
-          EXPECTED_AUTHOR_KEY: ${{ secrets.AUTHOR_KEY }}
         run: |
           umask 077
           k="$RUNNER_TEMP/keys"
           mkdir -p "$k"
-          echo "$MOD_KEY" | base64 -d > "$k/mod.key"
-          echo "$MOD_KEY_PUB" | base64 -d > "$k/mod.key.pub"
-          for f in mod.key mod.key.pub; do test -s "$k/$f" || { echo "secret for $f is missing (MOD_KEY, MOD_KEY_PUB)"; exit 1; }; done
-          uuid=$(java -cp "$HMGAPI_SDK/lib/hmgapi-engine.jar" hmgapi.engine.Signing uuid "$k/mod.key.pub")
-          if [ -n "$EXPECTED_AUTHOR_KEY" ]; then
-            test "$uuid" = "$EXPECTED_AUTHOR_KEY" || { echo "MOD_KEY is author key $uuid, not $EXPECTED_AUTHOR_KEY"; exit 1; }
-          fi
-          echo "AUTHOR_UUID=$uuid" >> "$GITHUB_ENV"
-          echo "MOD_KEY_FILE=$k/mod.key" >> "$GITHUB_ENV"
-
-      - name: Packages
-        run: |
-          out=$(HMGAPI_MOD_BUILD="$PWD/out/build/$MOD" sh "$HMGAPI_SDK/bin/mkmodpkg.sh" "$MOD" "$MOD_KEY_FILE")
-          echo "$out"
-          Z=$(echo "$out" | tail -1)
-          test "$(basename "$Z")" = "$MOD-$VERSION.zip" || { echo "wanted $MOD-$VERSION.zip, got $Z"; exit 1; }
-          sh "$HMGAPI_SDK/bin/mknemesismod.sh" "$Z"
-          mkdir -p out/assets
-          cp "$Z" out/dist/*-nemesis*.zip out/assets/
-          (cd out/assets && sha256sum *.zip > SHA256SUMS)
+          echo "$MOD_KEY" | base64 -d > "$k/author.key"
+          echo "$MOD_KEY_PUB" | base64 -d > "$k/author.key.pub"
+          umask 022
+          HMGAPI_KEY="$k/author.key" sh ./build.sh
+          rm -rf "$k"
 
       - name: Draft release
         env:
@@ -135,14 +128,8 @@ jobs:
         run: |
           name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$MOD/mod.json")
           notes="$RUNNER_TEMP/notes.md"
-          { echo "$name $VERSION, signed with author key $AUTHOR_UUID."
+          { echo "$name $VERSION"
             echo
-            echo "Built with the HMG-API mod SDK $(cat "$HMGAPI_SDK/VERSION") ($(cat "$HMGAPI_SDK/BUILD"))."
-            echo
-            echo '```'; cat out/assets/SHA256SUMS; echo '```'; } > "$notes"
+            echo '```'; cat dist/SHA256SUMS; echo '```'; } > "$notes"
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease --latest=false" ;; esac
-          gh release create "$GITHUB_REF_NAME" --draft $pre --title "$name $VERSION" --notes-file "$notes" out/assets/*
-
-      - name: Forget the key
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/keys"
+          gh release create "$GITHUB_REF_NAME" --draft $pre --title "$name $VERSION" --notes-file "$notes" dist/*.zip dist/SHA256SUMS

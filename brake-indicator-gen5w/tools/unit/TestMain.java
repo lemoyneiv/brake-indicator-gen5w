@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.0:
+ * Host JVM unit tests for v0.7.1:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -377,7 +377,7 @@ public final class TestMain {
                     Boolean.TRUE, Boolean.valueOf(bleDecoded != null && bleDecoded.rawCode == 45 && bleDecoded.pedalBit));
             eq("Direct @hmgapi-ble blocks unsafe VIN 0902", null, client.sendBleCommandBlocking("0902", 300L));
 
-            // 4. Simulate @hmgapi-ble ERR CONNECT_TIMEOUT -> clean backoff status
+            // 4. Simulate @hmgapi-ble ERR CONNECT_TIMEOUT -> AUTO addrType (-1), wake scan, & CONNECT_ALREADY_EXISTS reset
             sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 ERR CONNECT_TIMEOUT AA:BB:CC:DD:EE:01");
             long errDeadline = System.currentTimeMillis() + 1000L;
             while (!client.getStatusSummary().contains("BLE retry pending") && System.currentTimeMillis() < errDeadline) {
@@ -385,6 +385,38 @@ public final class TestMain {
             }
             eq("ERR CONNECT_TIMEOUT transitions to retry backoff",
                     Boolean.TRUE, Boolean.valueOf(client.getStatusSummary().contains("BLE retry pending")));
+            eq("ERR CONNECT_TIMEOUT switches effectiveConnectAddrType to -1 (AUTO)",
+                    Integer.valueOf(-1), Integer.valueOf(client.effectiveConnectAddrType()));
+
+            // 4b. Wake scan wakes sleeping adapter, parses zero-padded ADV, & heals stored addrType (0 -> 1)
+            sentBleLines.clear();
+            Thread advFeeder = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (waitForBleLine(sentBleLines, "SCAN_START", 500L)) {
+                            sendBleServerEvent(serverWriter,
+                                    "ADV AA:BB:CC:DD:EE:01 1 -59 02010608095645455045414b00000000000000");
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }, "MockWakeScanFeeder");
+            advFeeder.setDaemon(true);
+            advFeeder.start();
+            boolean woke = client.performWakeScanBeforeConnect(client.getBleSessionForTest(), 800L);
+            eq("performWakeScanBeforeConnect detects paired adapter ADV", Boolean.TRUE, Boolean.valueOf(woke));
+            eq("performWakeScanBeforeConnect stops scan cleanly",
+                    Boolean.TRUE, Boolean.valueOf(waitForBleLine(sentBleLines, "SCAN_STOP", 500L)));
+            eq("ADV heals persisted addrType in PairingStore (0 -> 1)",
+                    Integer.valueOf(1), Integer.valueOf(store.getAddrType()));
+
+            // 4c. ERR CONNECT_ALREADY_EXISTS explicitly disconnects stale link
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 ERR CONNECT_ALREADY_EXISTS AA:BB:CC:DD:EE:01");
+            eq("CONNECT_ALREADY_EXISTS sends immediate @mac DISCONNECT",
+                    Boolean.TRUE,
+                    Boolean.valueOf(waitForBleLine(sentBleLines, "@AA:BB:CC:DD:EE:01 DISCONNECT", 1000L)));
+            eq("CONNECT_ALREADY_EXISTS surfaces busy reset status",
+                    Boolean.TRUE, Boolean.valueOf(client.getStatusSummary().contains("BLE link busy; resetting")));
 
             // 5. Defense-in-depth BVM02 GATT table on unnamed device -> PROTECT_CHAR fff1 + DISCONNECT
             eq("pairAdapter allows unnamed device for GATT inspection",
@@ -987,8 +1019,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.0",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.0 Calibration Summary")));
+        eq("Summary banner is v0.7.1",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.1 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")

@@ -127,7 +127,7 @@ public final class MainActivity extends Activity
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator v0.5");
+        title.setText("Brake Light Indicator v0.6");
         title.setTextColor(TEXT_PRIMARY);
         title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -442,8 +442,8 @@ public final class MainActivity extends Activity
           .append(fmtObjFloat(snap.accelPedal, "%.1f")).append("%\n");
 
         sb.append("Detected Regen Mode   : ")
-          .append(snap.inferredRegenLevel >= 0
-                  ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)
+          .append((snap.inferredRegenLevel >= 0 || snap.sccActive)
+                  ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive)
                   : "learning (coast >= 21 km/h)")
           .append('\n');
 

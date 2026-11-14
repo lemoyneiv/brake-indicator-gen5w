@@ -48,6 +48,7 @@ public final class TestMain {
         testBrakeEvaluatorLegacyHub650msPollAlignment();
         testBrakeEvaluatorCoastingRegenAndIpedalInference();
         testBrakeEvaluatorStandstillHoldAndRelease();
+        testBrakeEvaluatorV060SccAutoHoldAeroAndRelease();
         testHevRegenProbeSafetyAndBaselineDiff();
         testTelemetryRecorderScoringAndCsv();
         testUsbExporterMountsAndAtomicWrite();
@@ -610,6 +611,141 @@ public final class TestMain {
         eq("Throttle >= 2% releases standstill hold", Boolean.FALSE, Boolean.valueOf(released.illuminated));
     }
 
+    private static void testBrakeEvaluatorV060SccAutoHoldAeroAndRelease() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Auto-Hold regression test (Drive 2 880.5s..933.0s):
+        //    Braking briskly across 12.9 -> 4.8 -> 0.0 km/h on 650 ms Hub, holding foot brake
+        //    at 0.0 km/h for 18 seconds, then releasing foot brake into Auto-Hold for 30 seconds.
+        BrakeEvaluator evAutoHold = new BrakeEvaluator();
+        long t = 50000L;
+        evAutoHold.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 5.0f, 12.9f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 650L;
+        evAutoHold.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 13.4f, 4.8f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 650L;
+        // Hold foot brake at 0.0 km/h for 18 seconds
+        for (int i = 0; i < 28; i++) {
+            evAutoHold.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 19.3f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 650L;
+        }
+        // Release foot brake (prsr -> 0.0) into Auto-Hold for 30 seconds
+        BrakeEvaluator.Snapshot autoHoldSnap = null;
+        for (int i = 0; i < 46; i++) {
+            autoHoldSnap = evAutoHold.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 650L;
+        }
+        eq("Auto-Hold stays STANDSTILL_HOLD after 4.8->0.0 km/h stop and 18s foot hold",
+                Boolean.TRUE,
+                Boolean.valueOf(autoHoldSnap.modelIlluminated && "STANDSTILL_HOLD".equals(autoHoldSnap.modelSource)));
+
+        // Engaging EPB (`parking_brake = true`) immediately releases standstill hold
+        BrakeEvaluator.Snapshot epbSnap = evAutoHold.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.TRUE, Boolean.FALSE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("EPB (parking_brake=true) releases standstill hold",
+                Boolean.FALSE, Boolean.valueOf(epbSnap.modelIlluminated));
+
+        // 2. Smart Cruise Control (SCC) stop-and-go detection, L2 mode preservation, & exit:
+        BrakeEvaluator evScc = new BrakeEvaluator();
+        t = 100000L;
+        float spd = 56.0f;
+        BrakeEvaluator.Snapshot sccSnap = null;
+        // First learn L2 (~0.98 m/s^2 coasting)
+        for (int tick = 0; tick <= 30; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.35f;
+            sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("Pre-SCC learned mode is L2", Integer.valueOf(2), Integer.valueOf(sccSnap.inferredRegenLevel));
+
+        // Driver engages SCC in a new segment: 0% pedal while vehicle accelerates from 38.6 -> 42.2 km/h over 2.2s
+        t += 2500L;
+        spd = 38.6f;
+        for (int tick = 0; tick <= 44; tick++) {
+            if (tick >= 16 && tick % 4 == 0) spd += 0.6f;
+            sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("Zero-pedal acceleration activates sccActive", Boolean.TRUE, Boolean.valueOf(sccSnap.sccActive));
+        eq("regenLevelLabel appends (SCC)", "L2 (SCC)",
+                BrakeEvaluator.regenLevelLabel(sccSnap.inferredRegenLevel, sccSnap.sccActive));
+
+        // SCC brakes briskly through low speed (12 -> 4 km/h at ~2.5 m/s^2): MUST NOT corrupt L2 -> i-Pedal!
+        spd = 12.6f;
+        for (int tick = 0; tick <= 20; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.90f;
+            sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, Math.max(2.5f, spd), 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("SCC low-speed full-stop braking lights REGEN_DECEL", Boolean.TRUE, Boolean.valueOf(sccSnap.modelIlluminated));
+        eq("SCC freezes driver regen mode at L2 (does NOT corrupt to i-Pedal)",
+                Integer.valueOf(2), Integer.valueOf(sccSnap.inferredRegenLevel));
+
+        // Driver taps physical brake pedal -> cancels SCC immediately
+        sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 4.5f, 2.5f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L));
+        eq("Foot brake cancels sccActive immediately", Boolean.FALSE, Boolean.valueOf(sccSnap.sccActive));
+
+        // 3. Creep-taper gate (< 20.5 km/h in L2) & L2 gentle throttle release (5.5% >= 4.8%):
+        t += 1000L;
+        // Release brake and coast at 18.0 km/h with mild 0.40 m/s^2 creep-taper decel -> must stay OFF
+        spd = 18.4f;
+        for (int tick = 0; tick <= 12; tick++) {
+            if (tick > 0 && tick % 4 == 0) spd -= 0.28f;
+            sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("L2 low-speed (<20.5 km/h) creep-taper coast does not false-trigger",
+                Boolean.FALSE, Boolean.valueOf(sccSnap.modelIlluminated));
+
+        // Lift off at 44 km/h in L2 -> immediate onset, then gentle 5.5% throttle -> immediate release!
+        sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 44.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L));
+        eq("L2 lift-off at 44 km/h lights immediately", Boolean.TRUE, Boolean.valueOf(sccSnap.modelIlluminated));
+        t += 50L;
+        sccSnap = evScc.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 43.8f, 5.5f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L));
+        eq("L2 gentle 5.5% throttle releases REGEN_DECEL immediately without 1.5s tail",
+                Boolean.FALSE, Boolean.valueOf(sccSnap.modelIlluminated));
+
+        // 4. Highway 70 mph (108 km/h) aerodynamic drag compensation:
+        //    L1 coasting at 108 km/h has total decel ~0.86 m/s^2 (~0.67 motor + ~0.19 wind drag) -> stays L1!
+        BrakeEvaluator evHwy = new BrakeEvaluator();
+        t = 200000L;
+        spd = 108.0f;
+        BrakeEvaluator.Snapshot hwySnap = null;
+        for (int tick = 0; tick <= 30; tick++) {
+            if (tick > 0 && tick % 2 == 0) spd -= 0.31f; // ~0.86 m/s^2 total decel
+            hwySnap = evHwy.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 70.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L));
+            t += 50L;
+        }
+        eq("108 km/h highway L1 coast (~0.86 m/s^2 total) compensates aero drag and stays L1",
+                Integer.valueOf(1), Integer.valueOf(hwySnap.inferredRegenLevel));
+        eq("108 km/h highway L1 coast keeps brake lamps OFF",
+                Boolean.FALSE, Boolean.valueOf(hwySnap.modelIlluminated));
+    }
+
     @SuppressWarnings("unused")
     private interface FakeOemService {
         int getRecuperationLevel();
@@ -737,8 +873,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.5.0",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.5.0 Calibration Summary")));
+        eq("Summary banner is v0.6.0",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.6.0 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")

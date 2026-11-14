@@ -181,6 +181,7 @@ public final class TelemetryRecorder {
     private boolean prevObdLit;
     private int prevObdRaw = -1;
     private int prevInferredRegen = -1;
+    private boolean prevSccActive;
 
     private long lastModelRiseMs = -1L;
     private long lastModelFallMs = -1L;
@@ -219,6 +220,7 @@ public final class TelemetryRecorder {
         prevObdLit = false;
         prevObdRaw = -1;
         prevInferredRegen = -1;
+        prevSccActive = false;
         lastModelRiseMs = -1L;
         lastModelFallMs = -1L;
         pendingObdRiseMs = -1L;
@@ -375,12 +377,14 @@ public final class TelemetryRecorder {
             prevObdLit = obdLit;
             prevObdRaw = obdRaw;
             prevInferredRegen = snap.inferredRegenLevel;
+            prevSccActive = snap.sccActive;
             return;
         }
 
         boolean modelChanged = (modelLit != prevModelLit) || !snap.modelSource.equals(prevModelSource);
         boolean obdChanged = (snap.obdFresh != prevObdFresh) || (snap.obdFresh && obdRaw != prevObdRaw);
         boolean regenChanged = (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel != prevInferredRegen);
+        boolean sccChanged = (snap.sccActive != prevSccActive);
 
         // Edge lag Pairing (signed: positive = HMG-API model lagged behind real OBD)
         if (modelLit && !prevModelLit) {
@@ -419,6 +423,15 @@ public final class TelemetryRecorder {
             }
         }
 
+        if (sccChanged) {
+            pushTransitionLine(String.format(Locale.US,
+                    "[%7.2fs] SmartCruiseEst: %s (spd=%s km/h, reg=%s)",
+                    Float.valueOf(relMs / 1000.0f),
+                    snap.sccActive ? "ACTIVE" : "OFF",
+                    fmtFloat(unboxFloat(snap.speedKmh), "%.1f"),
+                    BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)));
+        }
+
         if (regenChanged) {
             String fromLbl = BrakeEvaluator.regenLevelLabel(prevInferredRegen);
             String toLbl = BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel);
@@ -447,8 +460,8 @@ public final class TelemetryRecorder {
                     .append(" decel=").append(String.format(Locale.US, "%.2f", Float.valueOf(snap.decelMps2)))
                     .append(" prsr=").append(fmtFloat(unboxFloat(snap.brakePressure), "%.1f"))
                     .append(" acc=").append(fmtFloat(unboxFloat(snap.accelPedal), "%.1f"));
-            if (snap.inferredRegenLevel >= 0) {
-                line.append(" reg=").append(BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel));
+            if (snap.inferredRegenLevel >= 0 || snap.sccActive) {
+                line.append(" reg=").append(BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive));
             }
             pushTransitionLine(line.toString());
         }
@@ -459,6 +472,7 @@ public final class TelemetryRecorder {
         prevObdLit = obdLit;
         prevObdRaw = obdRaw;
         prevInferredRegen = snap.inferredRegenLevel;
+        prevSccActive = snap.sccActive;
     }
 
     private void pushTransitionLine(String s) {
@@ -565,7 +579,7 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.5.0 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.6.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');

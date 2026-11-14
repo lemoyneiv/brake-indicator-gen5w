@@ -203,7 +203,7 @@ public final class BrakeEngine {
         int n = markSeq.incrementAndGet();
         BrakeEvaluator.Snapshot snap = latestSnapshot;
         String reg = snap != null
-                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)
+                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive)
                 : "?";
         String spd = (snap != null && snap.speedKmh != null)
                 ? String.format(java.util.Locale.US, "%.1f km/h", snap.speedKmh)

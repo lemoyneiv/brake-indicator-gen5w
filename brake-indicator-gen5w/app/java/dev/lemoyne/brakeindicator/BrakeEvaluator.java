@@ -4,20 +4,26 @@ package dev.lemoyne.brakeindicator;
  * Evaluates built-in HMG-API vehicle readings (`brake.pressure`, `speed`, `pedal.accel`,
  * `gear.park`, `parking_brake`, `moving`, `steering.angle`, `hv.soc`) alongside optional
  * real-time OBD-II IGMP (`770` -> `778`, UDS `22 BC06`) brake-lamp ground truth and
- * poll-rate-independent regenerative mode auto-detection (`L0 / L1 / L2 / L3 / i-Pedal`).
+ * poll-rate-independent regenerative mode (`L0 / L1 / L2 / L3 / i-Pedal`) + Smart Cruise
+ * Control (`SCC`) auto-detection.
  *
- * Calibrated directly against multi-mode E-GMP drive logs on both `50-100 ms` patched
- * HMG-API `Hub`s and `650 ms` legacy KitKat `Hub`s:
+ * Calibrated directly against multi-mode city, arterial, Auto-Hold, Smart Cruise Control
+ * stop-and-go, and `70 mph` (`112.6 km/h`) highway E-GMP drive logs on both `50-100 ms`
+ * patched HMG-API `Hub`s and `650 ms` legacy KitKat `Hub`s:
  * - Aligns `-dv/dt` updates to actual HMG-API poll timestamps (`hmgSampleElapsedMs`) and
- *   suppresses `< 380 ms` `0.8 km/h` cluster speed-quantization repeats so intermediate
- *   `20 Hz` ticks never inject artificial `0.0 m/s^2` sawtooth dropouts.
- * - Uses a settled `>= 21 km/h` 2-slot rolling coasting chord to separate `L0`, `L1`, `L2`,
- *   and `L3+` (above E-GMP's `< 20 km/h` creep taper), and distinguishes `i-Pedal` (`4`)
- *   from `L3` (`3`) via low-speed full-stop regen (`< 14 km/h` without creep taper) and
- *   steady-speed high neutral pedal (`23-30%` cruise neutral point).
- * - Models E-GMP's UN ECE R13-H regen brake-lamp law (`22 BC06` `0x2C`): immediate lift-off
- *   onset in `L2 / L3 / i-Pedal`, feathered one-pedal regen, latch hysteresis down to
- *   `0.55 m/s^2` while `pedal.accel < 11.5%`, and `i-Pedal` / SCC standstill hold at `0 km/h`.
+ *   suppresses `< 380 ms` `0.8 km/h` cluster speed-quantization repeats.
+ * - Compensates passive aerodynamic drag excess above `36 km/h` (`10 m/s`) so highway wind
+ *   drag neither inflates `L0..L3` coasting classification nor false-triggers UN ECE R13-H
+ *   motor-torque brake-lamp estimation.
+ * - Uses a settled `>= 21 km/h` history-ring coasting chord (`1.05-1.95 s` preferred) to
+ *   separate `L0`, `L1`, `L2`, and `L3+`, and distinguishes `i-Pedal` (`4`) from `L3` (`3`)
+ *   via low-speed full-stop regen and urban neutral-pedal signatures.
+ * - Automatically detects Smart Cruise Control (`sccActive`) from settled zero-pedal
+ *   acceleration or sustained zero-pedal cruise, freezing driver paddle regen inference and
+ *   applying SCC braking thresholds until cancelled by brake, Park/EPB, or sustained throttle.
+ * - Preserves standstill hold arming across `<= 14 km/h` -> `0 km/h` stops (including
+ *   extended foot-brake holds into Auto-Hold), releasing immediately on EPB, Park, `0.7 km/h`
+ *   creep, `moving`, or `>= 1.5%` throttle.
  */
 public final class BrakeEvaluator {
 
@@ -41,11 +47,29 @@ public final class BrakeEvaluator {
     private static final float PRESSURE_RELEASE_RATIO = 0.70f;
     private static final float DEFAULT_DECEL_THRESHOLD_MPS2 = 1.20f;
     private static final float BASE_ONSET_STANDARD_MPS2 = 1.15f;
-    private static final float BASE_ONSET_HIGH_REGEN_MPS2 = 0.95f;
+    private static final float BASE_ONSET_HIGH_REGEN_MPS2 = 0.92f;
+    private static final float BASE_ONSET_SCC_MPS2 = 0.48f;
+    private static final float BASE_SUSTAINED_SCC_MPS2 = 0.28f;
+    private static final long SUSTAINED_SCC_CONFIRM_MS = 550L;
     private static final float BASE_RELEASE_HYST_MPS2 = 0.55f;
-    private static final float REGEN_RELEASE_ACCEL_PCT = 11.5f;
+    private static final float BASE_RELEASE_SCC_MPS2 = 0.26f;
+
+    // Mode-specific neutral-pedal release thresholds calibrated from 4-drive E-GMP logs:
+    private static final float RELEASE_ACCEL_LOW_PCT = 4.0f;
+    private static final float RELEASE_ACCEL_L2_PCT = 4.8f;
+    private static final float RELEASE_ACCEL_L3_PCT = 7.5f;
+    private static final float RELEASE_ACCEL_IPEDAL_PCT = 11.5f;
+
     private static final float DECEL_EMA_ALPHA = 0.72f;
-    private static final long DECEL_HOLD_MS = 450L;
+    private static final long DECEL_HOLD_MS = 140L;
+
+    /**
+     * Passive aerodynamic drag excess above 36 km/h (10 m/s):
+     * a_aero_excess = K_AERO * max(0, v_mps^2 - 10^2).
+     * E-GMP triggers UN ECE R13-H regen lamps from motor regen torque rather than passive wind drag.
+     */
+    private static final float AERO_REF_SPEED_MPS = 10.0f;
+    private static final float AERO_DRAG_COEFF_PER_M = 0.00024f;
 
     /**
      * Suppresses duplicate speed samples for `< 380 ms` so neither HMG-API's `100/250 ms`
@@ -60,19 +84,21 @@ public final class BrakeEvaluator {
     private static final int SPEED_HISTORY_CAP = 24;
 
     private static final float MAX_REGEN_ACCEL_PEDAL = 25.0f;
-    /** Any deliberate throttle press (>= 2%) from standstill immediately releases hold. */
-    private static final float STANDSTILL_RELEASE_ACCEL = 2.0f;
-    private static final float STANDSTILL_SPEED_MAX_KMH = 1.5f;
+    /** Any deliberate throttle press (>= 1.5%) or creep (>= 0.7 km/h) releases standstill hold. */
+    private static final float STANDSTILL_RELEASE_ACCEL = 1.5f;
+    private static final float STANDSTILL_SPEED_MAX_KMH = 0.7f;
     private static final long STANDSTILL_ARM_WINDOW_MS = 3000L;
 
-    // Settled 2-slot rolling coasting-chord Regen Level (L0..L3) estimator parameters:
+    // History-ring settled coasting-chord Regen Level (L0..L3) estimator parameters:
     // Sampled above 21 km/h (above E-GMP's < 20 km/h creep taper) when off both pedals.
     private static final float COAST_MIN_SPEED_KMH = 21.0f;
+    private static final float LIFTOFF_MIN_SPEED_L2_L3_KMH = 20.5f;
     private static final float COAST_MAX_ACCEL_PCT = 1.0f;
     private static final float COAST_MAX_PRESSURE = 0.25f;
     private static final long COAST_SETTLE_MS = 520L;
-    private static final long COAST_CHORD_MIN_MS = 520L;
-    private static final long COAST_CHORD_SLIDE_MS = 1400L;
+    private static final long COAST_CHORD_PREF_MS = 1050L;
+    private static final long COAST_CHORD_MIN_MS = 580L;
+    private static final long COAST_CHORD_MAX_MS = 1950L;
     private static final float REGEN_L0_L1_MPS2 = 0.44f;
     private static final float REGEN_L1_L2_MPS2 = 0.78f;
     private static final float REGEN_L2_L3_MPS2 = 1.22f;
@@ -83,8 +109,16 @@ public final class BrakeEvaluator {
     private static final float IPEDAL_LOW_SPD_MAX_KMH = 14.0f;
     private static final float IPEDAL_LOW_SPD_DECEL_MPS2 = 1.35f;
     private static final long IPEDAL_LOW_SPD_CONFIRM_MS = 250L;
+    private static final float IPEDAL_CRUISE_MAX_SPD_KMH = 56.0f;
     private static final long IPEDAL_CRUISE_CONFIRM_MS = 1100L;
     private static final long CREEP_TAPER_CONFIRM_MS = 450L;
+    private static final long IPEDAL_LOW_PEDAL_CRUISE_CONFIRM_MS = 1200L;
+
+    // Smart Cruise Control (SCC / HDA) zero-pedal travel detection:
+    private static final long SCC_SETTLE_MS = 700L;
+    private static final long SCC_ACCEL_CHORD_MS = 1100L;
+    private static final long SCC_CRUISE_CHORD_MS = 2600L;
+    private static final long SCC_MANUAL_OVERRIDE_EXIT_MS = 2500L;
 
     public static String regenLevelLabel(int level) {
         if (level < 0) {
@@ -94,6 +128,26 @@ public final class BrakeEvaluator {
             return "i-Pedal";
         }
         return "L" + level;
+    }
+
+    public static String regenLevelLabel(int level, boolean sccActive) {
+        String base = regenLevelLabel(level);
+        if (!sccActive) {
+            return base;
+        }
+        return "?".equals(base) ? "SCC" : (base + " (SCC)");
+    }
+
+    public static float aeroDragExcessMps2(Float speedKmh) {
+        if (speedKmh == null) {
+            return 0.0f;
+        }
+        float vMps = speedKmh.floatValue() / 3.6f;
+        float excessSq = (vMps * vMps) - (AERO_REF_SPEED_MPS * AERO_REF_SPEED_MPS);
+        if (excessSq <= 0.0f) {
+            return 0.0f;
+        }
+        return AERO_DRAG_COEFF_PER_M * excessSq;
     }
 
     public static final class ObdSample {
@@ -252,6 +306,8 @@ public final class BrakeEvaluator {
         public final int inferredRegenLevel;
         /** Optional direct OEM regen raw candidate value, or -1 if none. */
         public final int hevRegenRaw;
+        /** True when Smart Cruise Control / HDA zero-pedal travel is active. */
+        public final boolean sccActive;
 
         public Snapshot(
                 long timestampMs,
@@ -273,7 +329,7 @@ public final class BrakeEvaluator {
                 boolean manualTestActive) {
             this(timestampMs, illuminated, source, modelIlluminated, modelSource,
                     brakePressure, speedKmh, accelPedal, steeringAngleDeg, decelMps2,
-                    gearPark, parkingBrake, moving, hvSocPct, obd, obdFresh, manualTestActive, -1, -1);
+                    gearPark, parkingBrake, moving, hvSocPct, obd, obdFresh, manualTestActive, -1, -1, false);
         }
 
         public Snapshot(
@@ -296,6 +352,33 @@ public final class BrakeEvaluator {
                 boolean manualTestActive,
                 int inferredRegenLevel,
                 int hevRegenRaw) {
+            this(timestampMs, illuminated, source, modelIlluminated, modelSource,
+                    brakePressure, speedKmh, accelPedal, steeringAngleDeg, decelMps2,
+                    gearPark, parkingBrake, moving, hvSocPct, obd, obdFresh, manualTestActive,
+                    inferredRegenLevel, hevRegenRaw, false);
+        }
+
+        public Snapshot(
+                long timestampMs,
+                boolean illuminated,
+                String source,
+                boolean modelIlluminated,
+                String modelSource,
+                Float brakePressure,
+                Float speedKmh,
+                Float accelPedal,
+                Float steeringAngleDeg,
+                float decelMps2,
+                Boolean gearPark,
+                Boolean parkingBrake,
+                Boolean moving,
+                Float hvSocPct,
+                ObdSample obd,
+                boolean obdFresh,
+                boolean manualTestActive,
+                int inferredRegenLevel,
+                int hevRegenRaw,
+                boolean sccActive) {
             this.timestampMs = timestampMs;
             this.illuminated = illuminated;
             this.source = source == null ? "OFF" : source;
@@ -315,6 +398,7 @@ public final class BrakeEvaluator {
             this.manualTestActive = manualTestActive;
             this.inferredRegenLevel = inferredRegenLevel;
             this.hevRegenRaw = hevRegenRaw;
+            this.sccActive = sccActive;
         }
     }
 
@@ -333,14 +417,18 @@ public final class BrakeEvaluator {
     private boolean hasDecelSample;
 
     private long coastStartMs = -1L;
-    private long coastAnchor0Ms = -1L;
-    private float coastAnchor0SpeedKmh;
-    private long coastAnchor1Ms = -1L;
-    private float coastAnchor1SpeedKmh;
     private long ipedalLowSpdSinceMs = -1L;
     private long ipedalCruiseSinceMs = -1L;
     private long creepTaperSinceMs = -1L;
+    private long lowPedalCruiseSinceMs = -1L;
     private int inferredRegenLevel = REGEN_LEVEL_UNKNOWN;
+
+    private boolean sccActive;
+    private long sccZeroPedalStartMs = -1L;
+    private long sccAnchorMs = -1L;
+    private float sccAnchorSpeedKmh;
+    private long sccManualThrottleSinceMs = -1L;
+    private long sccSustainedDecelSinceMs = -1L;
 
     public Snapshot evaluate(IndicatorConfig cfg, Input in) {
         IndicatorConfig config = cfg == null ? IndicatorConfig.defaults() : cfg;
@@ -349,11 +437,7 @@ public final class BrakeEvaluator {
         // 1. Update poll-aligned longitudinal deceleration (-dv/dt)
         boolean decelUpdated = updateDecel(in.nowMs, in.hmgSampleElapsedMs, in.speedKmh);
 
-        // 2. Update off-throttle coasting + i-Pedal Regen Mode estimator (L0 / L1 / L2 / L3 / i-Pedal)
-        boolean obdFresh = (config.obdMode != IndicatorConfig.ObdMode.DISABLED) && in.obd.isFreshAt(in.nowMs);
-        updateRegenModeEstimate(in, obdFresh, decelUpdated, effPollMs);
-
-        // 3. Update hydraulic/IEB cylinder pressure latch (`brake.pressure`) with hysteresis
+        // 2. Update hydraulic/IEB cylinder pressure latch (`brake.pressure`) with hysteresis
         if (in.brakePressure == null) {
             pressureLatched = false;
         } else if (pressureLatched) {
@@ -364,75 +448,108 @@ public final class BrakeEvaluator {
             pressureLatched = true;
         }
 
+        // 3. Update Smart Cruise Control (`sccActive`) & Regen Mode (`L0..i-Pedal`) estimators
+        boolean obdFresh = (config.obdMode != IndicatorConfig.ObdMode.DISABLED) && in.obd.isFreshAt(in.nowMs);
+        updateSccState(in, obdFresh, effPollMs);
+        updateRegenModeEstimate(in, obdFresh, decelUpdated, effPollMs);
+
         // 4. Update E-GMP regenerative / Smart Cruise Control deceleration latch
         float threshScale = config.decelThresholdMps2 / DEFAULT_DECEL_THRESHOLD_MPS2;
-        float onsetThresh = (inferredRegenLevel >= REGEN_LEVEL_2
-                ? BASE_ONSET_HIGH_REGEN_MPS2 : BASE_ONSET_STANDARD_MPS2) * threshScale;
-        float releaseThresh = BASE_RELEASE_HYST_MPS2 * threshScale;
+        float aeroExcess = aeroDragExcessMps2(in.speedKmh);
+        float motorDecelMps2 = smoothedDecelMps2 - aeroExcess;
+
+        float onsetThresh;
+        float releaseThresh;
+        if (sccActive) {
+            onsetThresh = BASE_ONSET_SCC_MPS2 * threshScale;
+            releaseThresh = BASE_RELEASE_SCC_MPS2 * threshScale;
+        } else {
+            onsetThresh = (inferredRegenLevel >= REGEN_LEVEL_2
+                    ? BASE_ONSET_HIGH_REGEN_MPS2 : BASE_ONSET_STANDARD_MPS2) * threshScale;
+            releaseThresh = BASE_RELEASE_HYST_MPS2 * threshScale;
+        }
+
+        float evalDecelMps2 = sccActive ? smoothedDecelMps2 : motorDecelMps2;
+        float releaseAccelPct = regenReleaseAccelPct(inferredRegenLevel, sccActive);
 
         boolean canRegenBrake = !Boolean.TRUE.equals(in.gearPark)
+                && !Boolean.TRUE.equals(in.parkingBrake)
                 && in.speedKmh != null
                 && in.speedKmh >= 1.2f
                 && (in.accelPedal == null || in.accelPedal < MAX_REGEN_ACCEL_PEDAL);
 
-        // In L2/L3/i-Pedal, E-GMP illuminates 22BC06 (44) immediately on full throttle lift-off
-        boolean liftoffAnticipation = inferredRegenLevel >= REGEN_LEVEL_2
-                && in.speedKmh != null
-                && in.speedKmh >= 13.0f
-                && in.accelPedal != null
-                && in.accelPedal < COAST_MAX_ACCEL_PCT
-                && smoothedDecelMps2 >= -0.35f;
+        // Sustained mild SCC active braking (e.g. >= 0.28 m/s^2 above passive drag for >= 550 ms)
+        boolean sccSustainedBraking = false;
+        if (sccActive && canRegenBrake && (in.accelPedal == null || in.accelPedal < 0.8f)
+                && motorDecelMps2 >= BASE_SUSTAINED_SCC_MPS2 * threshScale) {
+            if (sccSustainedDecelSinceMs < 0L) {
+                sccSustainedDecelSinceMs = effPollMs;
+            } else if ((effPollMs - sccSustainedDecelSinceMs) >= SUSTAINED_SCC_CONFIRM_MS) {
+                sccSustainedBraking = true;
+            }
+        } else {
+            sccSustainedDecelSinceMs = -1L;
+        }
 
-        boolean featheredIpedal = inferredRegenLevel == REGEN_LEVEL_IPEDAL
+        // In manual L2/L3/i-Pedal, E-GMP illuminates 22BC06 (44) immediately on full throttle lift-off
+        // above the < 20 km/h creep-taper zone (and down to standstill in i-Pedal).
+        float liftoffMinSpd = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
+                ? 2.0f : LIFTOFF_MIN_SPEED_L2_L3_KMH;
+        boolean liftoffAnticipation = !sccActive
+                && inferredRegenLevel >= REGEN_LEVEL_2
+                && in.speedKmh != null
+                && in.speedKmh >= liftoffMinSpd
+                && in.accelPedal != null
+                && in.accelPedal < COAST_MAX_ACCEL_PCT;
+
+        boolean featheredIpedal = !sccActive
+                && inferredRegenLevel == REGEN_LEVEL_IPEDAL
                 && in.speedKmh != null
                 && in.speedKmh >= STANDSTILL_SPEED_MAX_KMH
                 && in.accelPedal != null
-                && in.accelPedal < REGEN_RELEASE_ACCEL_PCT
-                && smoothedDecelMps2 >= releaseThresh;
+                && in.accelPedal < RELEASE_ACCEL_IPEDAL_PCT
+                && motorDecelMps2 >= releaseThresh;
 
         boolean throttleSuppressesMildRegen = in.accelPedal != null
-                && in.accelPedal >= REGEN_RELEASE_ACCEL_PCT
-                && smoothedDecelMps2 < config.decelThresholdMps2;
+                && in.accelPedal >= releaseAccelPct
+                && evalDecelMps2 < config.decelThresholdMps2;
 
         if (!canRegenBrake || throttleSuppressesMildRegen) {
             decelLatched = false;
             decelHoldUntilMs = 0L;
-        } else if (smoothedDecelMps2 >= onsetThresh || liftoffAnticipation || featheredIpedal) {
+        } else if (evalDecelMps2 >= onsetThresh || sccSustainedBraking || liftoffAnticipation || featheredIpedal) {
             decelLatched = true;
             decelHoldUntilMs = in.nowMs + DECEL_HOLD_MS;
         } else if (decelLatched) {
-            if (smoothedDecelMps2 >= releaseThresh
-                    && (in.accelPedal == null || in.accelPedal < REGEN_RELEASE_ACCEL_PCT)) {
+            if (evalDecelMps2 >= releaseThresh
+                    && (in.accelPedal == null || in.accelPedal < releaseAccelPct)) {
                 decelHoldUntilMs = in.nowMs + DECEL_HOLD_MS;
             } else if (in.nowMs >= decelHoldUntilMs) {
                 decelLatched = false;
             }
         }
 
-        // 5. Arm & maintain i-Pedal / Smart Cruise Control standstill hold at 0 km/h
+        // 5. Arm & maintain Auto-Hold / i-Pedal / Smart Cruise Control standstill hold at 0 km/h
         boolean activeModelBraking = decelLatched || pressureLatched;
-        if (!Boolean.TRUE.equals(in.gearPark)
-                && in.speedKmh != null
-                && in.speedKmh >= 0.5f
-                && in.speedKmh <= 14.0f
-                && activeModelBraking) {
+        if (Boolean.TRUE.equals(in.gearPark) || Boolean.TRUE.equals(in.parkingBrake)) {
+            lastBrakingNearStopMs = 0L;
+        } else if (in.speedKmh != null && in.speedKmh <= 14.0f && activeModelBraking) {
             lastBrakingNearStopMs = in.nowMs;
+        } else if ((in.speedKmh != null && in.speedKmh >= 3.0f)
+                || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
+            lastBrakingNearStopMs = 0L;
         }
 
         boolean decelModeEnabled = (config.signalMode == IndicatorConfig.SignalMode.PRESSURE_AND_DECEL);
         if (!decelModeEnabled || !config.standstillHold) {
             standstillLatched = false;
         } else if (Boolean.TRUE.equals(in.gearPark)
+                || Boolean.TRUE.equals(in.parkingBrake)
                 || in.speedKmh == null
                 || in.speedKmh >= STANDSTILL_SPEED_MAX_KMH
-                || (Boolean.TRUE.equals(in.moving) && in.speedKmh >= 2.0f)
+                || Boolean.TRUE.equals(in.moving)
                 || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
             standstillLatched = false;
-            if (Boolean.TRUE.equals(in.gearPark)
-                    || (in.speedKmh != null && in.speedKmh >= 3.0f)
-                    || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
-                lastBrakingNearStopMs = 0L;
-            }
         } else if (standstillLatched
                 || inferredRegenLevel == REGEN_LEVEL_IPEDAL
                 || (lastBrakingNearStopMs > 0L && in.nowMs - lastBrakingNearStopMs <= STANDSTILL_ARM_WINDOW_MS)) {
@@ -494,18 +611,114 @@ public final class BrakeEvaluator {
                 obdFresh,
                 manualTest,
                 inferredRegenLevel,
-                in.hevRegenRaw);
+                in.hevRegenRaw,
+                sccActive);
+    }
+
+    private static float regenReleaseAccelPct(int regenLevel, boolean sccActive) {
+        if (sccActive) {
+            return RELEASE_ACCEL_LOW_PCT;
+        }
+        if (regenLevel == REGEN_LEVEL_IPEDAL) {
+            return RELEASE_ACCEL_IPEDAL_PCT;
+        }
+        if (regenLevel == REGEN_LEVEL_3) {
+            return RELEASE_ACCEL_L3_PCT;
+        }
+        if (regenLevel == REGEN_LEVEL_2) {
+            return RELEASE_ACCEL_L2_PCT;
+        }
+        return RELEASE_ACCEL_LOW_PCT;
+    }
+
+    private void updateSccState(Input in, boolean obdFresh, long effPollMs) {
+        boolean footBrakePressed = pressureLatched
+                || (in.brakePressure != null && in.brakePressure >= COAST_MAX_PRESSURE)
+                || (obdFresh && in.obd.pedalBit);
+        if (Boolean.TRUE.equals(in.gearPark)
+                || Boolean.TRUE.equals(in.parkingBrake)
+                || footBrakePressed) {
+            sccActive = false;
+            sccZeroPedalStartMs = -1L;
+            sccAnchorMs = -1L;
+            sccManualThrottleSinceMs = -1L;
+            sccSustainedDecelSinceMs = -1L;
+            return;
+        }
+
+        if (in.accelPedal != null && in.accelPedal >= 2.0f) {
+            sccZeroPedalStartMs = -1L;
+            sccAnchorMs = -1L;
+            if (sccActive) {
+                if (sccManualThrottleSinceMs < 0L) {
+                    sccManualThrottleSinceMs = effPollMs;
+                } else if ((effPollMs - sccManualThrottleSinceMs) >= SCC_MANUAL_OVERRIDE_EXIT_MS) {
+                    sccActive = false;
+                    sccManualThrottleSinceMs = -1L;
+                }
+            }
+            return;
+        }
+        sccManualThrottleSinceMs = -1L;
+
+        if (in.speedKmh == null || in.speedKmh < 10.0f || in.accelPedal == null || in.accelPedal >= 0.5f) {
+            sccZeroPedalStartMs = -1L;
+            sccAnchorMs = -1L;
+            return;
+        }
+
+        if (sccZeroPedalStartMs < 0L) {
+            sccZeroPedalStartMs = effPollMs;
+            sccAnchorMs = -1L;
+            return;
+        }
+
+        if (sccAnchorMs < 0L) {
+            if ((effPollMs - sccZeroPedalStartMs) >= SCC_SETTLE_MS) {
+                sccAnchorMs = effPollMs;
+                sccAnchorSpeedKmh = in.speedKmh.floatValue();
+            }
+            return;
+        }
+
+        long dtMs = effPollMs - sccAnchorMs;
+        if (dtMs >= SCC_ACCEL_CHORD_MS) {
+            float dvKmh = in.speedKmh.floatValue() - sccAnchorSpeedKmh;
+            float chordDecel = -(dvKmh / 3.6f) / (dtMs / 1000.0f);
+            if (dvKmh >= 1.4f && chordDecel <= -0.18f) {
+                sccActive = true;
+                sccAnchorMs = effPollMs;
+                sccAnchorSpeedKmh = in.speedKmh.floatValue();
+            } else if (dtMs >= SCC_CRUISE_CHORD_MS && in.speedKmh >= 20.0f && chordDecel <= 0.06f) {
+                sccActive = true;
+                sccAnchorMs = effPollMs;
+                sccAnchorSpeedKmh = in.speedKmh.floatValue();
+            } else if (chordDecel > 0.16f && dtMs >= 1500L) {
+                // Re-anchor if vehicle is gently slowing down so subsequent SCC acceleration is caught
+                sccAnchorMs = effPollMs;
+                sccAnchorSpeedKmh = in.speedKmh.floatValue();
+            }
+        }
     }
 
     private void updateRegenModeEstimate(Input in, boolean obdFresh, boolean decelUpdated, long effPollMs) {
         if (Boolean.TRUE.equals(in.gearPark)) {
             coastStartMs = -1L;
-            coastAnchor0Ms = -1L;
-            coastAnchor1Ms = -1L;
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
             creepTaperSinceMs = -1L;
+            lowPedalCruiseSinceMs = -1L;
             inferredRegenLevel = REGEN_LEVEL_UNKNOWN;
+            return;
+        }
+
+        // Freeze driver paddle regen-mode inference while Smart Cruise Control owns longitudinal control
+        if (sccActive) {
+            coastStartMs = -1L;
+            ipedalLowSpdSinceMs = -1L;
+            ipedalCruiseSinceMs = -1L;
+            creepTaperSinceMs = -1L;
+            lowPedalCruiseSinceMs = -1L;
             return;
         }
 
@@ -513,7 +726,7 @@ public final class BrakeEvaluator {
                 && in.brakePressure < COAST_MAX_PRESSURE
                 && !(obdFresh && in.obd.pedalBit);
 
-        // Signature A: Settled 2-slot rolling coasting chord above 21 km/h (L0 / L1 / L2 / L3+)
+        // Signature A: History-ring settled coasting chord above 21 km/h (L0 / L1 / L2 / L3+)
         boolean zeroPedalHighSpeed = in.speedKmh != null
                 && in.speedKmh >= COAST_MIN_SPEED_KMH
                 && in.accelPedal != null
@@ -523,24 +736,36 @@ public final class BrakeEvaluator {
         if (zeroPedalHighSpeed) {
             if (coastStartMs < 0L) {
                 coastStartMs = effPollMs;
-                coastAnchor0Ms = -1L;
-                coastAnchor1Ms = -1L;
-            } else if (coastAnchor0Ms < 0L) {
-                if ((effPollMs - coastStartMs) >= COAST_SETTLE_MS) {
-                    coastAnchor0Ms = effPollMs;
-                    coastAnchor0SpeedKmh = in.speedKmh.floatValue();
+            } else if (decelUpdated && (effPollMs - coastStartMs) >= (COAST_SETTLE_MS + COAST_CHORD_MIN_MS)) {
+                long earliestValidMs = coastStartMs + COAST_SETTLE_MS;
+                int anchorIdx = -1;
+                // Prefer newest chord >= COAST_CHORD_PREF_MS (~1.05s on 20Hz Hub, ~1.30s = 2 polls on 650ms Hub)
+                for (int i = histCount - 1; i >= 0; i--) {
+                    long t = histTimeMs[i];
+                    long age = effPollMs - t;
+                    if (t >= earliestValidMs && age >= COAST_CHORD_PREF_MS && age <= COAST_CHORD_MAX_MS) {
+                        anchorIdx = i;
+                        break;
+                    }
                 }
-            } else if (decelUpdated) {
-                if (coastAnchor1Ms >= 0L && (effPollMs - coastAnchor0Ms) >= COAST_CHORD_SLIDE_MS) {
-                    coastAnchor0Ms = coastAnchor1Ms;
-                    coastAnchor0SpeedKmh = coastAnchor1SpeedKmh;
-                    coastAnchor1Ms = -1L;
+                if (anchorIdx < 0) {
+                    for (int i = 0; i < histCount; i++) {
+                        long t = histTimeMs[i];
+                        long age = effPollMs - t;
+                        if (t >= earliestValidMs && age >= COAST_CHORD_MIN_MS && age <= COAST_CHORD_MAX_MS) {
+                            anchorIdx = i;
+                            break;
+                        }
+                    }
                 }
-                long chordDtMs = effPollMs - coastAnchor0Ms;
-                if (chordDtMs >= COAST_CHORD_MIN_MS) {
-                    float dvMps = (in.speedKmh.floatValue() - coastAnchor0SpeedKmh) / 3.6f;
-                    float chordDecel = -dvMps / (chordDtMs / 1000.0f);
-                    if (chordDecel >= -0.35f && chordDecel <= 4.0f) {
+                if (anchorIdx >= 0) {
+                    long chordDtMs = effPollMs - histTimeMs[anchorIdx];
+                    float curSpd = in.speedKmh.floatValue();
+                    float anchorSpd = histSpeedKmh[anchorIdx];
+                    float midSpd = 0.5f * (curSpd + anchorSpd);
+                    float dvMps = (curSpd - anchorSpd) / 3.6f;
+                    float chordDecel = (-dvMps / (chordDtMs / 1000.0f)) - aeroDragExcessMps2(Float.valueOf(midSpd));
+                    if (chordDecel >= 0.08f && chordDecel <= 4.0f) {
                         int prevForChord = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
                                 ? REGEN_LEVEL_3 : inferredRegenLevel;
                         int classified = classifyCoastingRegenLevel(chordDecel, prevForChord);
@@ -548,16 +773,10 @@ public final class BrakeEvaluator {
                             inferredRegenLevel = classified;
                         }
                     }
-                    if (coastAnchor1Ms < 0L) {
-                        coastAnchor1Ms = effPollMs;
-                        coastAnchor1SpeedKmh = in.speedKmh.floatValue();
-                    }
                 }
             }
         } else {
             coastStartMs = -1L;
-            coastAnchor0Ms = -1L;
-            coastAnchor1Ms = -1L;
         }
 
         // Signature B: Distinguish i-Pedal (4) from Level 3 (3)
@@ -583,8 +802,10 @@ public final class BrakeEvaluator {
                 ipedalLowSpdSinceMs = -1L;
             }
 
-            // 2) High neutral cruise throttle: holding steady speed (>= 16 km/h) at 23..30% pedal
-            if (spd >= 16.0f && acc >= 23.0f && acc <= 30.0f && Math.abs(smoothedDecelMps2) <= 0.15f) {
+            // 2) High neutral cruise throttle in urban speeds (16..56 km/h) at 23..30% pedal
+            if (spd >= 16.0f && spd <= IPEDAL_CRUISE_MAX_SPD_KMH
+                    && acc >= 23.0f && acc <= 30.0f
+                    && Math.abs(smoothedDecelMps2) <= 0.15f) {
                 if (ipedalCruiseSinceMs < 0L) {
                     ipedalCruiseSinceMs = effPollMs;
                 } else if ((effPollMs - ipedalCruiseSinceMs) >= IPEDAL_CRUISE_CONFIRM_MS) {
@@ -607,10 +828,25 @@ public final class BrakeEvaluator {
             } else {
                 creepTaperSinceMs = -1L;
             }
+
+            // 4) Step down i-Pedal -> L3 if driver cruises/accelerates (>= 20 km/h) at 3..17.5% pedal
+            if (inferredRegenLevel == REGEN_LEVEL_IPEDAL
+                    && spd >= 20.0f
+                    && acc >= 3.0f && acc <= 17.5f
+                    && smoothedDecelMps2 <= 0.15f) {
+                if (lowPedalCruiseSinceMs < 0L) {
+                    lowPedalCruiseSinceMs = effPollMs;
+                } else if ((effPollMs - lowPedalCruiseSinceMs) >= IPEDAL_LOW_PEDAL_CRUISE_CONFIRM_MS) {
+                    inferredRegenLevel = REGEN_LEVEL_3;
+                }
+            } else {
+                lowPedalCruiseSinceMs = -1L;
+            }
         } else {
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
             creepTaperSinceMs = -1L;
+            lowPedalCruiseSinceMs = -1L;
         }
     }
 

@@ -22,9 +22,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * Polls HMG-API's built-in `Vehicle` readings at 20 Hz (50 ms) (or 650 ms on legacy
  * KitKat `Hub`), aligns `-dv/dt` and `L0..i-Pedal` detection to exact HMG-API poll
- * timestamps, fuses or compares them against {@link ObdBrakeClient} (`@gen5w_ble`
- * primary -> `127.0.0.1:35000` fallback), records a 30-minute synchronized CSV dataset
- * in RAM, and exports to removable USB.
+ * timestamps, fuses or compares them against {@link ObdBrakeClient} (`@hmgapi-ble`
+ * central + `127.0.0.1:35000` bridge coexistence), records a 30-minute synchronized CSV
+ * dataset in RAM, and exports to removable USB.
  */
 public final class BrakeEngine {
 

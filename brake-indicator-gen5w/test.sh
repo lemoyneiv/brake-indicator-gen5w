@@ -12,7 +12,7 @@ R=$T/root
 mkdir -p "$R/system" "$R/data/hmgapi/settings"
 printf 'ro.board.platform=tcc803x\n' > "$R/props.txt"
 
-# Verify built APK and key v0.4.0 classes inside classes.dex
+# Verify built APK and key v0.7.0 classes inside classes.dex
 check "built: BrakeIndicator.apk exists" yes "$(test -f "$B/app/BrakeIndicator.apk" && echo yes || echo no)"
 DEX_STRINGS=$(unzip -p "$B/app/BrakeIndicator.apk" classes.dex | strings)
 has "apk contains OverlayService" "Ldev/lemoyne/brakeindicator/OverlayService;" "$DEX_STRINGS"
@@ -24,8 +24,9 @@ has "apk contains ObdBrakeClient" "Ldev/lemoyne/brakeindicator/ObdBrakeClient;" 
 has "apk contains Elm327BrakeProtocol" "Ldev/lemoyne/brakeindicator/Elm327BrakeProtocol;" "$DEX_STRINGS"
 has "apk contains TelemetryRecorder" "Ldev/lemoyne/brakeindicator/TelemetryRecorder;" "$DEX_STRINGS"
 has "apk contains UsbExporter" "Ldev/lemoyne/brakeindicator/UsbExporter;" "$DEX_STRINGS"
-has "apk contains Gen5wBleClient" "Lgen5w/ble/Gen5wBleClient;" "$DEX_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$DEX_STRINGS"
+has "apk bundles HmgApi Ble client" "Lhmgapi/client/Ble;" "$DEX_STRINGS"
+check "apk drops legacy Gen5wBleClient" no "$(echo "$DEX_STRINGS" | grep -q 'Gen5wBleClient' && echo yes || echo no)"
 check "apk drops obsolete root HscanProbe" no "$(echo "$DEX_STRINGS" | grep -q 'HscanProbe' && echo yes || echo no)"
 check "apk drops obsolete root MonitorMain" no "$(echo "$DEX_STRINGS" | grep -q 'MonitorMain' && echo yes || echo no)"
 
@@ -41,6 +42,7 @@ eng plan
 check "engine plan succeeds" 0 "$rc"
 has "plan lists BrakeIndicator.apk" "dev.lemoyne.brakeindicator (app/BrakeIndicator.apk)" "$out"
 has "plan lists non-root starter service as system" "service  brake-indicator-gen5w/starter as system, at android" "$out"
+has "plan lists BLE central" "ble      BLE scanner and GATT central" "$out"
 has "plan lists USB folder" "usb      BrakeIndicator/ on a stick" "$out"
 for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
     has "plan lists $sig reading" "$sig" "$out"

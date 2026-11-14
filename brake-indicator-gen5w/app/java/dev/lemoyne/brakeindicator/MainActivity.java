@@ -24,13 +24,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Gen5W landscape dashboard for Brake Light Indicator v0.5:
+ * Gen5W landscape dashboard for Brake Light Indicator v0.7:
  *  - Left card: Live brake-lamp preview, configurable OBD vs HMG-API icon mode toggle,
  *    built-in HMG-API readings vs real OBD (`770`/`22BC06`) ground truth, automatic
  *    `L0 / L1 / L2 / L3 / i-Pedal` regen-mode detection, instant `Mark Log` bookmark
  *    button, and atomic USB export (`brake-dataset` + `brake-summary`).
- *  - Right card: `@gen5w_ble` direct BLE scanner pairing (with automatic `127.0.0.1:35000`
- *    loopback fallback) and live discrete transition log.
+ *  - Right card: `@hmgapi-ble` native BLE scanner pairing (with automatic `127.0.0.1:35000`
+ *    bridge coexistence) and live discrete transition log.
  */
 public final class MainActivity extends Activity
         implements BrakeEngine.StateListener, ObdBrakeClient.Listener {
@@ -127,7 +127,7 @@ public final class MainActivity extends Activity
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("Brake Light Indicator v0.6");
+        title.setText("Brake Light Indicator v0.7");
         title.setTextColor(TEXT_PRIMARY);
         title.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -309,7 +309,7 @@ public final class MainActivity extends Activity
         rightHeader.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView obdTitle = new TextView(this);
-        obdTitle.setText("OBD-II Ground Truth (@gen5w_ble + Loopback)");
+        obdTitle.setText("OBD-II Ground Truth (@hmgapi-ble + Bridge)");
         obdTitle.setTextColor(ACCENT_TEAL);
         obdTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, 19);
         obdTitle.setTypeface(Typeface.DEFAULT_BOLD);
@@ -339,7 +339,7 @@ public final class MainActivity extends Activity
                         engine.getObdClient().monotonicMs(), "OBD Reconnect tapped");
                 engine.getObdClient().requestReconnect();
                 refreshObdPanel();
-                actionNoticeText.setText("Retrying @gen5w_ble direct -> 127.0.0.1 fallback...");
+                actionNoticeText.setText("Retrying 127.0.0.1 bridge / @hmgapi-ble direct BLE...");
             }
         });
         LinearLayout.LayoutParams recLp = new LinearLayout.LayoutParams(
@@ -351,7 +351,7 @@ public final class MainActivity extends Activity
             @Override
             public void onClick(View v) {
                 engine.getObdClient().unpairAdapter();
-                actionNoticeText.setText("Cleared paired BLE adapter (127.0.0.1 loopback fallback still active).");
+                actionNoticeText.setText("Cleared paired BLE adapter (127.0.0.1 bridge still supported).");
             }
         });
         rightHeader.addView(unpairBtn);
@@ -361,7 +361,7 @@ public final class MainActivity extends Activity
         obdStatusLineText.setTextColor(TEXT_MUTED);
         obdStatusLineText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15);
         obdStatusLineText.setPadding(0, 6, 0, 6);
-        obdStatusLineText.setText("Priority: 1) Direct BLE via @gen5w_ble  ->  2) 127.0.0.1:35000 loopback");
+        obdStatusLineText.setText("Priority: 1) Yield to 127.0.0.1:35000 if active  ->  2) Direct BLE via @hmgapi-ble");
         rightCard.addView(obdStatusLineText);
 
         deviceListContainer = new LinearLayout(this);

@@ -1,13 +1,16 @@
 package dev.lemoyne.brakeindicator;
 
-import gen5w.ble.Gen5wBleClient;
-
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -23,13 +26,13 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.5.0:
+ * Host JVM unit tests for v0.7.0:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
- * - ObdBrakeClient (@gen5w_ble direct BLE primary session + ALREADY_CONNECTED 127.0.0.1 loopback fallback)
+ * - ObdBrakeClient (HMG-API native @hmgapi-ble central session + PROTECT_CHAR guard + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + i-Pedal auto-detection, E-GMP R13-H regen hysteresis, standstill hold)
+ *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, E-GMP R13-H regen hysteresis, standstill hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
@@ -227,43 +230,50 @@ public final class TestMain {
         final List<String> sentBleLines = Collections.synchronizedList(new ArrayList<String>());
 
         // Start a mock 127.0.0.1 loopback ELM327 bridge server (simulating obd-gen5w's TcpElmBridgeServer)
-        final ServerSocket server = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"));
+        final ServerSocket server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
         final int port = server.getLocalPort();
         Thread mockBridgeThread = new Thread(new Runnable() {
             @Override
             public void run() {
-                Socket client = null;
                 try {
-                    server.setSoTimeout(4000);
-                    client = server.accept();
-                    InputStream in = client.getInputStream();
-                    OutputStream out = client.getOutputStream();
-                    StringBuilder line = new StringBuilder();
-                    int b;
-                    while ((b = in.read()) != -1) {
-                        if (b == '\r' || b == '\n') {
-                            String cmd = line.toString().trim();
-                            line.setLength(0);
-                            if (cmd.isEmpty()) continue;
-                            String reply;
-                            if ("ATI".equalsIgnoreCase(cmd)) {
-                                reply = "ELM327 v1.5\r>";
-                            } else if ("22BC06".equalsIgnoreCase(cmd)) {
-                                reply = "778100B62BC0670400003\r778212C000000000000\r>";
-                            } else {
-                                reply = "OK\r>";
+                    server.setSoTimeout(5000);
+                    while (!server.isClosed()) {
+                        Socket client = null;
+                        try {
+                            client = server.accept();
+                            InputStream in = client.getInputStream();
+                            OutputStream out = client.getOutputStream();
+                            StringBuilder line = new StringBuilder();
+                            int b;
+                            while ((b = in.read()) != -1) {
+                                if (b == '\r' || b == '\n') {
+                                    String cmd = line.toString().trim();
+                                    line.setLength(0);
+                                    if (cmd.isEmpty()) continue;
+                                    String reply;
+                                    if ("ATI".equalsIgnoreCase(cmd)) {
+                                        reply = "ELM327 v1.5\r>";
+                                    } else if ("22BC06".equalsIgnoreCase(cmd)) {
+                                        reply = "778100B62BC0670400003\r778212C000000000000\r>";
+                                    } else {
+                                        reply = "OK\r>";
+                                    }
+                                    out.write(reply.getBytes(Elm327BrakeProtocol.ASCII));
+                                    out.flush();
+                                } else {
+                                    line.append((char) b);
+                                }
                             }
-                            out.write(reply.getBytes(Elm327BrakeProtocol.ASCII));
-                            out.flush();
-                        } else {
-                            line.append((char) b);
+                        } catch (Throwable ignored) {
+                            break;
+                        } finally {
+                            if (client != null) {
+                                try { client.close(); } catch (Throwable ignored) {}
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
                 } finally {
-                    if (client != null) {
-                        try { client.close(); } catch (Throwable ignored) {}
-                    }
                     try { server.close(); } catch (Throwable ignored) {}
                 }
             }
@@ -271,67 +281,135 @@ public final class TestMain {
         mockBridgeThread.setDaemon(true);
         mockBridgeThread.start();
 
-        InMemoryPairingStore store = new InMemoryPairingStore();
-        final ObdBrakeClient[] ref = new ObdBrakeClient[1];
-        Gen5wBleClient.LineChannel channel = new Gen5wBleClient.LineChannel() {
+        // Loopback socket pair simulating @hmgapi-ble inside com.android.bluetooth
+        final ServerSocket bleServerSock = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        final Socket bleClientSock = new Socket("127.0.0.1", bleServerSock.getLocalPort());
+        final Socket bleServerConn = bleServerSock.accept();
+        bleServerSock.close();
+        bleClientSock.setTcpNoDelay(true);
+        bleServerConn.setTcpNoDelay(true);
+        final BufferedWriter serverWriter = new BufferedWriter(
+                new OutputStreamWriter(bleServerConn.getOutputStream(), "UTF-8"));
+
+        Thread mockBleDaemon = new Thread(new Runnable() {
             @Override
-            public void sendLine(String line) {
-                sentBleLines.add(line);
-                // When WRITE_CHAR_NR 22BC06 arrives over @gen5w_ble, reply with CHAR_NOTIFY 22BC06 pedal=45 (0x2D)!
-                if (line.startsWith("@AA:BB:CC:DD:EE:01 WRITE_CHAR_NR ")
-                        && line.toLowerCase().endsWith("3232424330360d")) {
-                    final ObdBrakeClient c = ref[0];
-                    if (c != null) {
-                        new Thread(new Runnable() {
-                            @Override
-                            public void run() {
-                                String payloadHex = Elm327BrakeProtocol.bytesToHex(
-                                        "778100B62BC0670400003\r778212D00000000>\r"
-                                                .getBytes(Elm327BrakeProtocol.ASCII));
-                                c.getBleClientForTest().handleServerLine(
-                                        "@AA:BB:CC:DD:EE:01 CHAR_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb "
-                                                + payloadHex);
-                            }
-                        }).start();
+            public void run() {
+                try {
+                    BufferedReader r = new BufferedReader(
+                            new InputStreamReader(bleServerConn.getInputStream(), "UTF-8"));
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        String trimmed = line.trim();
+                        synchronized (sentBleLines) {
+                            sentBleLines.add(trimmed);
+                            sentBleLines.notifyAll();
+                        }
+                        if ("STREAM_SESSION".equals(trimmed)) {
+                            sendBleServerEvent(serverWriter, "OK STREAM_READY");
+                        } else if (trimmed.startsWith("@AA:BB:CC:DD:EE:01 WRITE_CHAR_NR ")
+                                && trimmed.toLowerCase().endsWith("3232424330360d")) {
+                            String payloadHex = Elm327BrakeProtocol.bytesToHex(
+                                    "778100B62BC0670400003\r778212D00000000>\r"
+                                            .getBytes(Elm327BrakeProtocol.ASCII));
+                            sendBleServerEvent(
+                                    serverWriter,
+                                    "@AA:BB:CC:DD:EE:01 CHAR_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb "
+                                            + payloadHex);
+                        } else if ("CLOSE".equals(trimmed)) {
+                            break;
+                        }
                     }
+                } catch (Throwable ignored) {
+                } finally {
+                    try { serverWriter.close(); } catch (Throwable ignored) {}
+                    try { bleServerConn.close(); } catch (Throwable ignored) {}
                 }
             }
+        }, "MockHmgApiBleServer");
+        mockBleDaemon.setDaemon(true);
+        mockBleDaemon.start();
 
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        Closeable closeBleSockets = new Closeable() {
             @Override
-            public void close() {}
+            public void close() throws IOException {
+                try { bleServerConn.close(); } catch (Throwable ignored) {}
+                try { bleClientSock.close(); } catch (Throwable ignored) {}
+            }
         };
 
-        ObdBrakeClient client = ObdBrakeClient.createForTest(store, channel, port);
-        ref[0] = client;
+        ObdBrakeClient client = ObdBrakeClient.createForTest(
+                store,
+                bleClientSock.getInputStream(),
+                bleClientSock.getOutputStream(),
+                closeBleSockets,
+                port);
         try {
-            // 1. Pairing refuses BVM02 battery sensor
+            eq("Ble.attach negotiated STREAM_SESSION + MULTICONN 1",
+                    Boolean.TRUE, Boolean.valueOf(waitForBleLine(sentBleLines, "MULTICONN 1", 1000L)));
+
+            // 1. Pairing refuses BVM02 battery sensor by advertised name
             eq("pairAdapter refuses BVM02",
                     Boolean.FALSE, Boolean.valueOf(client.pairAdapter("11:22:33:44:55:66", "LNEX BVM02", 0)));
 
-            // 2. Pairing accepts Veepeak BLE adapter and issues @gen5w_ble CONNECT first
+            // 2. Pairing accepts Veepeak BLE adapter and issues @<mac> CONNECT <addrType> on @hmgapi-ble
             eq("pairAdapter accepts Veepeak",
                     Boolean.TRUE, Boolean.valueOf(client.pairAdapter("AA:BB:CC:DD:EE:01", "OBDCheck BLE", 0)));
-            eq("sent CONNECT on @gen5w_ble",
-                    Boolean.TRUE, Boolean.valueOf(sentBleLines.contains("CONNECT AA:BB:CC:DD:EE:01 0 *")));
+            eq("sent @mac CONNECT 0 on @hmgapi-ble",
+                    Boolean.TRUE,
+                    Boolean.valueOf(waitForBleLine(sentBleLines, "@AA:BB:CC:DD:EE:01 CONNECT 0", 1000L)));
 
-            // 3. Simulate @gen5w_ble GATT_READY + direct BLE 22BC06 command round-trip
-            Gen5wBleClient ble = client.getBleClientForTest();
-            ble.handleServerLine("GATT_READY AA:BB:CC:DD:EE:01 0000fff1-0000-1000-8000-00805f9b34fb:10,0000fff2-0000-1000-8000-00805f9b34fb:0c");
-            ble.handleServerLine("@AA:BB:CC:DD:EE:01 OP_OK ENABLE_NOTIFY 0000fff1-0000-1000-8000-00805f9b34fb");
+            // 3. Simulate @hmgapi-ble GATT service/char discovery + GATT_READY + direct BLE 22BC06 round-trip
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 CONN_STATE CONNECTED AA:BB:CC:DD:EE:01 0x0040");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 GATT_SERVICE 0000fff0-0000-1000-8000-00805f9b34fb 0x0010 0x0015");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 GATT_CHAR 0000fff0-0000-1000-8000-00805f9b34fb 0000fff1-0000-1000-8000-00805f9b34fb 0x0012 0x10 0x0013");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 GATT_CHAR 0000fff0-0000-1000-8000-00805f9b34fb 0000fff2-0000-1000-8000-00805f9b34fb 0x0015 0x0c 0x0000");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 GATT_READY AA:BB:CC:DD:EE:01 mtu=185");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 NOTIFY_STATE 0000fff1-0000-1000-8000-00805f9b34fb ENABLED");
+
+            eq("GATT_READY enables notifications on fff1",
+                    Boolean.TRUE,
+                    Boolean.valueOf(waitForBleLinePrefix(sentBleLines, "@AA:BB:CC:DD:EE:01 ENABLE_NOTIFY ", 1000L)));
 
             String bleRaw = client.sendBleCommandBlocking("22BC06", 1000L);
             Elm327BrakeProtocol.IgmpBrakeReading bleDecoded = Elm327BrakeProtocol.decodeIgmpBrakeResponse(bleRaw);
-            eq("Direct @gen5w_ble 22BC06 round-trip decoded rawCode=45 (pedal switch)",
+            eq("Direct @hmgapi-ble 22BC06 round-trip decoded rawCode=45 (pedal switch)",
                     Boolean.TRUE, Boolean.valueOf(bleDecoded != null && bleDecoded.rawCode == 45 && bleDecoded.pedalBit));
-            eq("Direct @gen5w_ble blocks unsafe VIN 0902", null, client.sendBleCommandBlocking("0902", 300L));
+            eq("Direct @hmgapi-ble blocks unsafe VIN 0902", null, client.sendBleCommandBlocking("0902", 300L));
 
-            // 4. Simulate obd-gen5w holding BLE link (status=253 reason=ALREADY_CONNECTED) -> fallback to 127.0.0.1:<port>
-            ble.handleServerLine("CONN_STATE DISCONNECTED AA:BB:CC:DD:EE:01 status=253 reason=ALREADY_CONNECTED");
-            eq("Status reflects fallback after ALREADY_CONNECTED",
-                    Boolean.TRUE, Boolean.valueOf(client.getStatusSummary().contains("127.0.0.1:" + port)));
+            // 4. Simulate @hmgapi-ble ERR CONNECT_TIMEOUT -> clean backoff status
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:01 ERR CONNECT_TIMEOUT AA:BB:CC:DD:EE:01");
+            long errDeadline = System.currentTimeMillis() + 1000L;
+            while (!client.getStatusSummary().contains("BLE retry pending") && System.currentTimeMillis() < errDeadline) {
+                Thread.sleep(10L);
+            }
+            eq("ERR CONNECT_TIMEOUT transitions to retry backoff",
+                    Boolean.TRUE, Boolean.valueOf(client.getStatusSummary().contains("BLE retry pending")));
 
+            // 5. Defense-in-depth BVM02 GATT table on unnamed device -> PROTECT_CHAR fff1 + DISCONNECT
+            eq("pairAdapter allows unnamed device for GATT inspection",
+                    Boolean.TRUE, Boolean.valueOf(client.pairAdapter("AA:BB:CC:DD:EE:02", "Generic BLE", 0)));
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 CONN_STATE CONNECTED AA:BB:CC:DD:EE:02 0x0041");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 GATT_SERVICE 0000fff0-0000-1000-8000-00805f9b34fb 0x0010 0x0018");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 GATT_CHAR 0000fff0-0000-1000-8000-00805f9b34fb 0000fff1-0000-1000-8000-00805f9b34fb 0x0012 0x02 0x0000");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 GATT_CHAR 0000fff0-0000-1000-8000-00805f9b34fb 0000fff2-0000-1000-8000-00805f9b34fb 0x0014 0x08 0x0000");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 GATT_CHAR 0000fff0-0000-1000-8000-00805f9b34fb 0000fff4-0000-1000-8000-00805f9b34fb 0x0016 0x10 0x0017");
+            sendBleServerEvent(serverWriter, "@AA:BB:CC:DD:EE:02 GATT_READY AA:BB:CC:DD:EE:02 mtu=23");
+
+            eq("BVM02 GATT sends PROTECT_CHAR fff1",
+                    Boolean.TRUE,
+                    Boolean.valueOf(waitForBleLine(sentBleLines, "@AA:BB:CC:DD:EE:02 PROTECT_CHAR fff1", 1000L)));
+            eq("BVM02 GATT disconnects immediately",
+                    Boolean.TRUE,
+                    Boolean.valueOf(waitForBleLine(sentBleLines, "@AA:BB:CC:DD:EE:02 DISCONNECT", 1000L)));
+            eq("BVM02 GATT marks safety rejected",
+                    "Incompatible GATT (safety rejected)", client.getStatusSummary());
+
+            // 6. Verify coexistence probe + 127.0.0.1:<port> loopback bridge session (obd-gen5w multiplexer)
+            eq("probeActiveLoopbackBridge detects live obd-gen5w bridge",
+                    Boolean.TRUE, Boolean.valueOf(client.probeActiveLoopbackBridge(port)));
             boolean okBridge = client.tryRunLoopbackBridgeSession(port);
-            eq("127.0.0.1 loopback fallback session succeeds", Boolean.TRUE, Boolean.valueOf(okBridge));
+            eq("127.0.0.1 loopback bridge session succeeds", Boolean.TRUE, Boolean.valueOf(okBridge));
             BrakeEvaluator.ObdSample bridgeSample = client.currentSample();
             eq("Loopback sample transport=BRIDGE", "BRIDGE", bridgeSample.transport);
             eq("Loopback sample rawCode=44 (Pure Regen ON)", Integer.valueOf(44), Integer.valueOf(bridgeSample.rawCode));
@@ -340,6 +418,42 @@ public final class TestMain {
         } finally {
             client.close();
             try { server.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void sendBleServerEvent(BufferedWriter serverWriter, String line) throws IOException {
+        synchronized (serverWriter) {
+            serverWriter.write(line);
+            serverWriter.write('\n');
+            serverWriter.flush();
+        }
+    }
+
+    private static boolean waitForBleLine(List<String> lines, String expected, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (lines) {
+            while (!lines.contains(expected)) {
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0L) return false;
+                lines.wait(rem);
+            }
+            return true;
+        }
+    }
+
+    private static boolean waitForBleLinePrefix(List<String> lines, String prefix, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (lines) {
+            while (true) {
+                for (int i = 0; i < lines.size(); i++) {
+                    if (lines.get(i).startsWith(prefix)) return true;
+                }
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0L) return false;
+                lines.wait(rem);
+            }
         }
     }
 
@@ -872,9 +986,9 @@ public final class TestMain {
                 Boolean.TRUE, Boolean.valueOf(lines[4].contains(",1,BRAKE_PRESSURE,1,1,BLE,") && lines[4].endsWith(",45,1,1,4,")));
 
         String summary = rec.buildSummaryReport(
-                IndicatorConfig.defaults(), "BLE @gen5w_ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.6.0",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.6.0 Calibration Summary")));
+                IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
+        eq("Summary banner is v0.7.0",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.0 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")

@@ -19,7 +19,7 @@
           "title": "OBD disabled (HMG-API built-in readings only)"
         }
       ],
-      "description": "Connects via @gen5w_ble directly first, falling back automatically to 127.0.0.1:35000 if obd-gen5w holds the BLE link. Both OBD modes log synchronized HMG-API + OBD ground-truth rows in RAM for USB CSV export."
+      "description": "Connects via HMG-API's built-in @hmgapi-ble BLE central (hmgapi.client.Ble), automatically yielding to 127.0.0.1:35000 when obd-gen5w's ELM327 bridge is active so AT headers never collide. Both OBD modes log synchronized HMG-API + OBD ground-truth rows in RAM for USB CSV export."
     },
     {
       "key": "signal_mode",
@@ -114,16 +114,16 @@
     {
       "key": "standstill_hold",
       "type": "toggle",
-      "title": "Hold at standstill after regen / cruise stop",
+      "title": "Hold at standstill after regen / cruise / Auto-Hold stop",
       "default": true,
-      "description": "Keeps the HMG-API model illuminated at 0 km/h after decelerating to a stop in i-Pedal or Smart Cruise Control until throttle is applied, the car moves, or Park is selected."
+      "description": "Keeps the HMG-API model illuminated at 0 km/h after decelerating to a stop under Auto-Hold, i-Pedal, or Smart Cruise Control until throttle is applied, the car moves, EPB engages, or Park is selected."
     },
     {
       "key": "bridge_port",
       "type": "number",
-      "title": "Loopback ELM327 fallback port",
+      "title": "Loopback ELM327 bridge port",
       "default": 35000,
-      "description": "Localhost TCP port (127.0.0.1) tried automatically when @gen5w_ble direct BLE is busy (e.g. obd-gen5w loopback bridge)."
+      "description": "Localhost TCP port (127.0.0.1) used automatically when obd-gen5w's ELM327 bridge is active so both apps share OBD-II without AT header collisions."
     }
   ]
 }

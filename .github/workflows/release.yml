@@ -11,7 +11,7 @@ permissions:
 
 env:
   MOD: brake-indicator-gen5w
-  HMGAPI_REPO: Open-HMG/HMG-API
+  HMGAPI_REPO: lemoyneiv/HMG-API
 
 jobs:
   check-secrets:
@@ -80,7 +80,7 @@ jobs:
         if: steps.pin.outputs.form == 'ref'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Open-HMG/HMG-API
+          repository: ${{ env.HMGAPI_REPO }}
           ref: ${{ steps.pin.outputs.ref }}
           path: .hmgapi-src
           persist-credentials: false

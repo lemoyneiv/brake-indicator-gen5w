@@ -4,15 +4,16 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 MOD=$(cd "$HERE/../.." && pwd)
 SRC="$MOD/app/java/dev/lemoyne/brakeindicator"
-BLE="$MOD/app/java/gen5w/ble"
 STUBS="$HERE/stubs"
+if [ -z "${HMGAPI_SDK:-}" ]; then
+    HMGAPI_SDK=$(cd "$MOD/../../HMG-API/out/sdk" && pwd)
+fi
+CLIENT_JAR="$HMGAPI_SDK/lib/hmgapi-client.jar"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 
-javac --release 8 -Xlint:-options -d "$W" \
+javac --release 8 -Xlint:-options -cp "$CLIENT_JAR" -d "$W" \
     "$STUBS/android/net/LocalSocketAddress.java" \
     "$STUBS/android/net/LocalSocket.java" \
-    "$BLE/Gen5wBleAdvRecord.java" \
-    "$BLE/Gen5wBleClient.java" \
     "$SRC/IndicatorConfig.java" \
     "$SRC/BrakeEvaluator.java" \
     "$SRC/HmgVehiclePoller.java" \
@@ -23,4 +24,4 @@ javac --release 8 -Xlint:-options -d "$W" \
     "$SRC/ObdBrakeClient.java" \
     "$HERE/TestMain.java"
 
-java -cp "$W" dev.lemoyne.brakeindicator.TestMain
+java -cp "$W:$CLIENT_JAR" dev.lemoyne.brakeindicator.TestMain

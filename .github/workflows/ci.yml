@@ -20,9 +20,11 @@ jobs:
           persist-credentials: false
       - name: The workflow and hmgapi-sdk.json pin the same HMG-API
         run: |
-          w=$(sed -n 's#^ *uses: Open-HMG/HMG-API/.github/workflows/mod.yml@\([0-9A-Za-z.]*\)$#\1#p' .github/workflows/ci.yml)
+          w=$(sed -n 's#^ *uses: [A-Za-z0-9_.-]*/HMG-API/.github/workflows/mod.yml@\([0-9A-Za-z.]*\)$#\1#p' .github/workflows/ci.yml)
           s=$(python3 -c 'import json; p=json.load(open("hmgapi-sdk.json")); print(p.get("ref") or "v"+p["version"])')
           test "$w" = "$s" || { echo "ci.yml calls mod.yml@$w, hmgapi-sdk.json pins $s"; exit 1; }
 
   mod:
-    uses: Open-HMG/HMG-API/.github/workflows/mod.yml@287f36609964f1ce86bae18889af05e5cc3540a4
+    uses: lemoyneiv/HMG-API/.github/workflows/mod.yml@248fe55e328567e270bb5dca37fd99cb7f2eacbb
+    with:
+      hmgapi-repo: lemoyneiv/HMG-API

@@ -12,10 +12,13 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -55,6 +58,7 @@ public final class ObdBrakeClient {
         public final String name;
         public final boolean likelyObd;
         public final boolean likelyBvm02;
+        public final List<String> serviceUuids;
 
         public DiscoveredDevice(
                 String mac,
@@ -63,12 +67,26 @@ public final class ObdBrakeClient {
                 String name,
                 boolean likelyObd,
                 boolean likelyBvm02) {
+            this(mac, addrType, rssi, name, likelyObd, likelyBvm02, Collections.<String>emptyList());
+        }
+
+        public DiscoveredDevice(
+                String mac,
+                int addrType,
+                int rssi,
+                String name,
+                boolean likelyObd,
+                boolean likelyBvm02,
+                List<String> serviceUuids) {
             this.mac = mac;
             this.addrType = addrType;
             this.rssi = rssi;
             this.name = name;
             this.likelyObd = likelyObd;
             this.likelyBvm02 = likelyBvm02;
+            this.serviceUuids = serviceUuids == null
+                    ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(serviceUuids));
         }
     }
 
@@ -77,6 +95,7 @@ public final class ObdBrakeClient {
     private final long monoOriginNano = System.nanoTime();
     private final List<Listener> listeners = new CopyOnWriteArrayList<Listener>();
     private final Map<String, DiscoveredDevice> discovered = new LinkedHashMap<String, DiscoveredDevice>();
+    private final Set<String> knownBvm02Macs = Collections.synchronizedSet(new HashSet<String>());
     private final List<String> triedServiceOverrides = new ArrayList<String>();
     private final Map<String, List<String>> discoveredServicesByMac = new LinkedHashMap<String, List<String>>();
     private final Map<String, Map<String, Integer>> discoveredCharsByMac = new LinkedHashMap<String, Map<String, Integer>>();
@@ -246,9 +265,35 @@ public final class ObdBrakeClient {
     }
 
     public List<DiscoveredDevice> getDiscoveredDevices() {
+        List<DiscoveredDevice> list;
         synchronized (discovered) {
-            return new ArrayList<DiscoveredDevice>(discovered.values());
+            list = new ArrayList<DiscoveredDevice>(discovered.values());
         }
+        final String currentPaired = pairedMac;
+        Collections.sort(list, new Comparator<DiscoveredDevice>() {
+            @Override
+            public int compare(DiscoveredDevice a, DiscoveredDevice b) {
+                int rankDiff = discoveryPriorityRank(a) - discoveryPriorityRank(b);
+                if (rankDiff != 0) return rankDiff;
+                boolean aPaired = !currentPaired.isEmpty() && currentPaired.equalsIgnoreCase(a.mac);
+                boolean bPaired = !currentPaired.isEmpty() && currentPaired.equalsIgnoreCase(b.mac);
+                if (aPaired != bPaired) return aPaired ? -1 : 1;
+                if (a.rssi != b.rssi) return (b.rssi > a.rssi) ? 1 : -1;
+                return a.mac.compareTo(b.mac);
+            }
+        });
+        return list;
+    }
+
+    private static int discoveryPriorityRank(DiscoveredDevice d) {
+        if (d == null || d.likelyBvm02) return 3;
+        if (Elm327BrakeProtocol.isKnownObdAdapterName(d.name)) return 0;
+        if (d.likelyObd) return 1;
+        return 2;
+    }
+
+    boolean isBleGattRejectedForTest() {
+        return bleGattRejected;
     }
 
     public Ble getBleSessionForTest() {
@@ -309,12 +354,13 @@ public final class ObdBrakeClient {
 
     public boolean pairAdapter(String mac, String name, final int addrType) {
         if (mac == null || mac.trim().isEmpty()) return false;
-        if (Elm327BrakeProtocol.isLikelyBvm02Device(name)) {
+        final String cleanMac = safeUpper(mac);
+        if (Elm327BrakeProtocol.isLikelyBvm02Device(name) || knownBvm02Macs.contains(cleanMac)) {
+            knownBvm02Macs.add(cleanMac);
             statusSummary = "Refused BVM02 battery sensor (safety guard)";
             notifyListeners();
             return false;
         }
-        final String cleanMac = safeUpper(mac);
         final String cleanName = (name == null || name.trim().isEmpty()) ? "BLE OBD-II" : name.trim();
         final String prevMac = this.pairedMac;
 
@@ -1045,12 +1091,27 @@ public final class ObdBrakeClient {
         public void onAdvertisement(Ble.AdvRecord record) {
             if (record == null || record.mac == null) return;
             String upper = safeUpper(record.mac);
+            String rawNewName = record.localName == null ? "" : record.localName.trim();
+            boolean hasRealNewName = !rawNewName.isEmpty() && !"BLE Device".equalsIgnoreCase(rawNewName);
+
             if (upper.equals(pairedMac)) {
+                boolean changedMeta = false;
                 if (record.addrType == 0 || record.addrType == 1) {
-                    pairedAddrType = record.addrType;
-                    if (store != null) {
-                        store.save(pairedMac, pairedName, record.addrType);
+                    if (pairedAddrType != record.addrType) {
+                        pairedAddrType = record.addrType;
+                        changedMeta = true;
                     }
+                }
+                if (hasRealNewName
+                        && !Elm327BrakeProtocol.isLikelyBvm02Device(rawNewName)
+                        && (pairedName.isEmpty()
+                                || "BLE OBD-II".equalsIgnoreCase(pairedName)
+                                || "BLE Device".equalsIgnoreCase(pairedName))) {
+                    pairedName = rawNewName;
+                    changedMeta = true;
+                }
+                if (changedMeta && store != null) {
+                    store.save(pairedMac, pairedName, pairedAddrType);
                 }
                 nextBleReconnectMs = 0L;
                 synchronized (pairedAdvLock) {
@@ -1058,17 +1119,51 @@ public final class ObdBrakeClient {
                     pairedAdvLock.notifyAll();
                 }
             }
-            String localName = (record.localName != null && !record.localName.isEmpty())
-                    ? record.localName
-                    : "BLE Device";
-            List<String> uuids = record.serviceUuids != null
-                    ? record.serviceUuids
-                    : Collections.<String>emptyList();
-            boolean isBvm = Elm327BrakeProtocol.isLikelyBvm02Device(localName);
-            boolean isObd = Elm327BrakeProtocol.isLikelyObdAdapter(localName, uuids);
-            DiscoveredDevice dev = new DiscoveredDevice(upper, record.addrType, record.rssi, localName, isObd, isBvm);
+
             synchronized (discovered) {
-                discovered.put(upper, dev);
+                DiscoveredDevice prev = discovered.get(upper);
+                boolean hasRealPrevName = prev != null
+                        && prev.name != null
+                        && !prev.name.trim().isEmpty()
+                        && !"BLE Device".equalsIgnoreCase(prev.name.trim());
+                String mergedName = hasRealNewName
+                        ? rawNewName
+                        : (hasRealPrevName ? prev.name : "BLE Device");
+
+                List<String> mergedUuids = new ArrayList<String>();
+                if (prev != null && prev.serviceUuids != null) {
+                    for (int i = 0; i < prev.serviceUuids.size(); i++) {
+                        String u = prev.serviceUuids.get(i);
+                        if (u != null && !mergedUuids.contains(u)) {
+                            mergedUuids.add(u);
+                        }
+                    }
+                }
+                if (record.serviceUuids != null) {
+                    for (int i = 0; i < record.serviceUuids.size(); i++) {
+                        String u = record.serviceUuids.get(i);
+                        if (u != null && !u.trim().isEmpty()) {
+                            String norm = Elm327BrakeProtocol.normUuid(u);
+                            if (!mergedUuids.contains(norm)) {
+                                mergedUuids.add(norm);
+                            }
+                        }
+                    }
+                }
+
+                boolean isBvm = (prev != null && prev.likelyBvm02)
+                        || knownBvm02Macs.contains(upper)
+                        || Elm327BrakeProtocol.isLikelyBvm02Device(mergedName);
+                if (isBvm) {
+                    knownBvm02Macs.add(upper);
+                }
+                boolean isObd = !isBvm && Elm327BrakeProtocol.isLikelyObdAdapter(mergedName, mergedUuids);
+                int mergedAddrType = (record.addrType == 0 || record.addrType == 1)
+                        ? record.addrType
+                        : (prev != null ? prev.addrType : record.addrType);
+
+                discovered.put(upper, new DiscoveredDevice(
+                        upper, mergedAddrType, record.rssi, mergedName, isObd, isBvm, mergedUuids));
             }
             notifyListeners();
         }
@@ -1112,7 +1207,7 @@ public final class ObdBrakeClient {
             bleTimeoutStreak++;
             long backoff = Math.min(15000L, 2500L * bleTimeoutStreak);
             nextBleReconnectMs = System.currentTimeMillis() + backoff;
-            if (!bridgeConnected && !bleGattRejected) {
+            if (!bridgeConnected && !bleGattRejected && !statusSummary.startsWith("BLE GATT incomplete")) {
                 statusSummary = String.format(Locale.US, "BLE disconnected (0x%02x)",
                         Integer.valueOf(handleOrReason & 0xFF));
             }
@@ -1173,13 +1268,27 @@ public final class ObdBrakeClient {
 
             Ble s = bleSession;
             // Defense-in-depth LNEX BVM02 read-only fff1 protection before resolving bindings
-            Integer p4 = charProps.get("fff4");
-            Integer p1 = charProps.get("fff1");
-            if (p4 != null && (p4.intValue() & (Elm327BrakeProtocol.PROP_NOTIFY | Elm327BrakeProtocol.PROP_INDICATE)) != 0) {
-                boolean f1Active = p1 != null && (p1.intValue() & 0x3C) != 0;
-                if (!f1Active && s != null && s.isOpen()) {
+            boolean bvmGatt = Elm327BrakeProtocol.isBvm02GattSignature(charProps);
+            if (bvmGatt) {
+                knownBvm02Macs.add(effective);
+                synchronized (discovered) {
+                    DiscoveredDevice prev = discovered.get(effective);
+                    if (prev != null && !prev.likelyBvm02) {
+                        discovered.put(effective, new DiscoveredDevice(
+                                prev.mac, prev.addrType, prev.rssi, prev.name, false, true, prev.serviceUuids));
+                    }
+                }
+                if (s != null && s.isOpen()) {
                     s.protectCharacteristic(pairedMac, "fff1");
                 }
+                bleGattRejected = true;
+                bleConnected = false;
+                statusSummary = "Incompatible GATT (safety rejected)";
+                if (s != null && s.isOpen()) {
+                    s.disconnectDevice(pairedMac);
+                }
+                notifyListeners();
+                return;
             }
 
             List<Elm327BrakeProtocol.GattBinding> cands = Elm327BrakeProtocol.resolveAdapterBindings(charProps);
@@ -1196,9 +1305,22 @@ public final class ObdBrakeClient {
                     s.disconnectDevice(pairedMac);
                     return;
                 }
+                if (charProps.isEmpty() || Elm327BrakeProtocol.isKnownObdAdapterName(pairedName)) {
+                    // Transient incomplete/aborted GATT discovery: retry automatically rather than permanently latching bleGattRejected
+                    bleServiceFilter = null;
+                    bleConnected = false;
+                    bleTimeoutStreak++;
+                    nextBleReconnectMs = System.currentTimeMillis() + Math.min(10000L, 2000L * bleTimeoutStreak);
+                    statusSummary = "BLE GATT incomplete; retrying...";
+                    if (s != null && s.isOpen()) {
+                        s.disconnectDevice(pairedMac);
+                    }
+                    notifyListeners();
+                    return;
+                }
                 bleGattRejected = true;
                 bleConnected = false;
-                statusSummary = "Incompatible GATT (safety rejected)";
+                statusSummary = "Incompatible GATT (no OBD UART)";
                 if (s != null && s.isOpen()) {
                     s.disconnectDevice(pairedMac);
                 }

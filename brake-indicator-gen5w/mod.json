@@ -1,7 +1,7 @@
 {
   "id": "brake-indicator-gen5w",
   "name": "Brake Light Indicator",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "hmgapi": ">=1.0.0",
   "authors": ["Kyle"],
   "license": "AGPL-3.0",

@@ -26,13 +26,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.1:
+ * Host JVM unit tests for v0.7.2:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
- * - ObdBrakeClient (HMG-API native @hmgapi-ble central session + PROTECT_CHAR guard + 127.0.0.1 bridge coexistence)
+ * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
+ *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, E-GMP R13-H regen hysteresis, standstill hold)
+ *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, post-brake decel settle, EPB auto-release hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
@@ -46,6 +47,7 @@ public final class TestMain {
         testElm327IgmpBrakeDecoding();
         testElm327SafetyAndBvm02Exclusion();
         testObdBrakeClientBleAndLoopbackFallback();
+        testV072BleDiscoveryMergePriorityAndEvaluatorCalibration();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1019,8 +1021,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.1",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.1 Calibration Summary")));
+        eq("Summary banner is v0.7.2",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.2 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1029,6 +1031,164 @@ public final class TestMain {
                 Boolean.TRUE, Boolean.valueOf(summary.contains("MARK #1")
                         && summary.contains("RegenModeEst: L3 -> i-Pedal")
                         && summary.contains("reg=i-Pedal")));
+    }
+
+    private static void testV072BleDiscoveryMergePriorityAndEvaluatorCalibration() throws Exception {
+        // 1. BLE scan sticky ADV_IND + SCAN_RSP merge, persistent BVM02 MAC memory, & OBD priority sorting
+        final ServerSocket mockBle = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        final Socket cliSock = new Socket("127.0.0.1", mockBle.getLocalPort());
+        final Socket srvSock = mockBle.accept();
+        mockBle.close();
+        cliSock.setTcpNoDelay(true);
+        srvSock.setTcpNoDelay(true);
+        final BufferedWriter w = new BufferedWriter(new OutputStreamWriter(srvSock.getOutputStream(), "UTF-8"));
+        final List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+        Thread acceptThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    BufferedReader rdr = new BufferedReader(new InputStreamReader(srvSock.getInputStream(), "UTF-8"));
+                    String l;
+                    while ((l = rdr.readLine()) != null) {
+                        String trimmed = l.trim();
+                        synchronized (lines) {
+                            lines.add(trimmed);
+                            lines.notifyAll();
+                        }
+                        if ("STREAM_SESSION".equals(trimmed)) {
+                            sendBleServerEvent(w, "OK STREAM_READY");
+                        } else if ("CLOSE".equals(trimmed)) {
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }, "MockBleV072");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+
+        Closeable closeBoth = new Closeable() {
+            @Override
+            public void close() {
+                try { srvSock.close(); } catch (Throwable ignored) {}
+                try { cliSock.close(); } catch (Throwable ignored) {}
+            }
+        };
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        ObdBrakeClient client = ObdBrakeClient.createForTest(
+                store, cliSock.getInputStream(), cliSock.getOutputStream(), closeBoth, 35999);
+        try {
+            waitForBleLine(lines, "MULTICONN 1", 1000L);
+
+            // Emit 4 generic beacons + 1 BVM02 BEFORE Veepeak so Veepeak arrives at insertion index 5 (> old 4-row cap)
+            sendBleServerEvent(w, "ADV CC:00:00:00:00:01 1 -52 020106");
+            sendBleServerEvent(w, "ADV CC:00:00:00:00:02 1 -55 020106");
+            sendBleServerEvent(w, "ADV CC:00:00:00:00:03 1 -58 020106");
+            sendBleServerEvent(w, "ADV CC:00:00:00:00:04 1 -60 020106");
+            // BVM02 advertises local name "BVM02" in SCAN_RSP, then later sends an unmerged ADV_IND with 0xFFF0 UUID (0303f0ff) and NO name:
+            sendBleServerEvent(w, "ADV BB:BB:BB:BB:BB:02 0 -48 020106060942564d3032");
+            sendBleServerEvent(w, "ADV BB:BB:BB:BB:BB:02 0 -47 0201060303f0ff");
+            // Veepeak advertises "VEEPEAK" in SCAN_RSP, then later sends an unmerged ADV_IND with 0xFFF0 UUID and NO name:
+            sendBleServerEvent(w, "ADV AA:BB:CC:DD:EE:77 0 -65 02010608095645455045414b");
+            sendBleServerEvent(w, "ADV AA:BB:CC:DD:EE:77 0 -64 0201060303f0ff");
+
+            long deadline = System.currentTimeMillis() + 1000L;
+            while (client.getDiscoveredDevices().size() < 6 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10L);
+            }
+            List<ObdBrakeClient.DiscoveredDevice> sorted = client.getDiscoveredDevices();
+            eq("v0.7.2 priority sort puts VEEPEAK at index 0 ahead of 5 earlier devices",
+                    "AA:BB:CC:DD:EE:77", sorted.get(0).mac);
+            eq("v0.7.2 sticky ADV merge preserves VEEPEAK name across nameless ADV_IND",
+                    "VEEPEAK", sorted.get(0).name);
+            eq("v0.7.2 sticky ADV merge keeps VEEPEAK likelyObd=true",
+                    Boolean.TRUE, Boolean.valueOf(sorted.get(0).likelyObd && !sorted.get(0).likelyBvm02));
+
+            ObdBrakeClient.DiscoveredDevice lastDev = sorted.get(sorted.size() - 1);
+            eq("v0.7.2 priority sort sinks BVM02 to bottom of list",
+                    "BB:BB:BB:BB:BB:02", lastDev.mac);
+            eq("v0.7.2 BVM02 never masquerades as likelyObd on nameless 0xFFF0 ADV_IND",
+                    Boolean.TRUE, Boolean.valueOf(lastDev.likelyBvm02 && !lastDev.likelyObd));
+            eq("v0.7.2 pairAdapter refuses knownBvm02Mac even if passed generic name",
+                    Boolean.FALSE, Boolean.valueOf(client.pairAdapter("BB:BB:BB:BB:BB:02", "BLE Device", 0)));
+
+            // 2. Transient empty GATT_READY on VEEPEAK retries instead of permanently latching bleGattRejected
+            eq("v0.7.2 pairAdapter accepts VEEPEAK",
+                    Boolean.TRUE, Boolean.valueOf(client.pairAdapter("AA:BB:CC:DD:EE:77", "VEEPEAK", 0)));
+            waitForBleLine(lines, "@AA:BB:CC:DD:EE:77 CONNECT 0", 1000L);
+            lines.clear();
+            sendBleServerEvent(w, "@AA:BB:CC:DD:EE:77 CONN_STATE CONNECTED AA:BB:CC:DD:EE:77 0x0042");
+            sendBleServerEvent(w, "@AA:BB:CC:DD:EE:77 GATT_READY AA:BB:CC:DD:EE:77 mtu=23");
+            eq("v0.7.2 empty GATT_READY disconnects for clean retry",
+                    Boolean.TRUE, Boolean.valueOf(waitForBleLine(lines, "@AA:BB:CC:DD:EE:77 DISCONNECT", 1000L)));
+            eq("v0.7.2 empty GATT_READY does NOT latch bleGattRejected on VEEPEAK",
+                    Boolean.FALSE, Boolean.valueOf(client.isBleGattRejectedForTest()));
+            eq("v0.7.2 empty GATT_READY surfaces retrying status",
+                    "BLE GATT incomplete; retrying...", client.getStatusSummary());
+        } finally {
+            client.close();
+        }
+
+        // 3. BrakeEvaluator: L1 foot-brake stop -> pedal release at 10 km/h does NOT corrupt L1->i-Pedal or drag REGEN_DECEL
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 10000L;
+        float spd = 64.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        for (int i = 0; i <= 26; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.21f; // ~0.58 m/s^2 L1 coast
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.2 learned L1 before foot brake", Integer.valueOf(1), Integer.valueOf(snap.inferredRegenLevel));
+
+        // Foot-brake down from 22 -> 10 km/h at ~2.5 m/s^2 (prsr = 8.0 bar)
+        spd = 22.0f;
+        for (int i = 0; i < 24; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.90f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 8.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        // Release foot brake (prsr -> 0.0) while rolling at ~11.2 km/h: must turn OFF immediately and stay L1!
+        for (int i = 0; i < 6; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.2 foot-brake release in L1 does NOT corrupt RegenModeEst to i-Pedal",
+                Integer.valueOf(1), Integer.valueOf(snap.inferredRegenLevel));
+        eq("v0.7.2 foot-brake release in L1 clears hydraulic -dv/dt tail immediately",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 4. Park-carryover EPB auto-release hold stays STANDSTILL_HOLD until throttle >= 1.5%
+        BrakeEvaluator evEpb = new BrakeEvaluator();
+        t = 50000L;
+        evEpb.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 18.0f, 0.0f, 0.0f, 0.0f, Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, 80.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 100L;
+        // Shift Park -> Drive with foot on brake while EPB=true is still engaged from Park
+        evEpb.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 18.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.TRUE, Boolean.FALSE, 80.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 100L;
+        // Release foot brake (prsr -> 0.0) while Park-carryover EPB auto-releases (obd=44 in real vehicle logs)
+        BrakeEvaluator.Snapshot epbHold = evEpb.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.TRUE, Boolean.FALSE, 80.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("v0.7.2 Park-carryover EPB auto-release holds STANDSTILL_HOLD",
+                Boolean.TRUE, Boolean.valueOf(epbHold.modelIlluminated && "STANDSTILL_HOLD".equals(epbHold.modelSource)));
+        t += 100L;
+        BrakeEvaluator.Snapshot epbGo = evEpb.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 2.7f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 80.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("v0.7.2 throttle >= 1.5% releases Park-carryover EPB hold",
+                Boolean.FALSE, Boolean.valueOf(epbGo.modelIlluminated));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

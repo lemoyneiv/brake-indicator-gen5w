@@ -488,7 +488,7 @@ public final class MainActivity extends Activity
         deviceListContainer.removeAllViews();
         List<ObdBrakeClient.DiscoveredDevice> devs = obd.getDiscoveredDevices();
         int shown = 0;
-        for (int i = 0; i < devs.size() && shown < 4; i++) {
+        for (int i = 0; i < devs.size() && shown < 6; i++) {
             final ObdBrakeClient.DiscoveredDevice d = devs.get(i);
             shown++;
             String prefix = d.likelyBvm02 ? "[BVM02 - Ignored] " : (d.likelyObd ? "[OBD] " : "");

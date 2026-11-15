@@ -224,17 +224,25 @@ public final class Elm327BrakeProtocol {
         return false;
     }
 
+    public static boolean isKnownObdAdapterName(String localName) {
+        if (localName == null || isLikelyBvm02Device(localName)) {
+            return false;
+        }
+        String lower = localName.trim().toLowerCase(Locale.US);
+        for (int i = 0; i < KNOWN_OBD_NAME_TOKENS.length; i++) {
+            if (lower.contains(KNOWN_OBD_NAME_TOKENS[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean isLikelyObdAdapter(String localName, List<String> serviceUuids) {
         if (isLikelyBvm02Device(localName)) {
             return false;
         }
-        if (localName != null) {
-            String lower = localName.trim().toLowerCase(Locale.US);
-            for (int i = 0; i < KNOWN_OBD_NAME_TOKENS.length; i++) {
-                if (lower.contains(KNOWN_OBD_NAME_TOKENS[i])) {
-                    return true;
-                }
-            }
+        if (isKnownObdAdapterName(localName)) {
+            return true;
         }
         if (serviceUuids != null) {
             for (int i = 0; i < serviceUuids.size(); i++) {
@@ -257,6 +265,31 @@ public final class Elm327BrakeProtocol {
     }
 
     /**
+     * Returns true when a discovered GATT characteristic table matches the LNEX BVM02 12V battery
+     * sensor signature (`fff4` NOTIFY/INDICATE paired with read-only `fff1`).
+     */
+    public static boolean isBvm02GattSignature(Map<String, Integer> charPropsByUuid) {
+        if (charPropsByUuid == null || charPropsByUuid.isEmpty()) {
+            return false;
+        }
+        Integer pFff1 = null;
+        Integer pFff4 = null;
+        for (Map.Entry<String, Integer> e : charPropsByUuid.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) continue;
+            String norm = normUuid(e.getKey());
+            if ("fff1".equals(norm)) pFff1 = e.getValue();
+            else if ("fff4".equals(norm)) pFff4 = e.getValue();
+        }
+        boolean hasBvmCmdNotify = pFff4 != null && (pFff4.intValue() & (PROP_NOTIFY | PROP_INDICATE)) != 0;
+        if (!hasBvmCmdNotify) {
+            return false;
+        }
+        boolean fff1Active = pFff1 != null
+                && (pFff1.intValue() & (PROP_NOTIFY | PROP_INDICATE | PROP_WRITE | PROP_WRITE_NO_RESP)) != 0;
+        return !fff1Active;
+    }
+
+    /**
      * Resolves candidate ELM327 GATT notify/write characteristic pairs from `GATT_READY`,
      * strictly rejecting LNEX BVM02 battery sensors (`fff4` NOTIFY with read-only `fff1`).
      */
@@ -271,16 +304,11 @@ public final class Elm327BrakeProtocol {
             }
         }
 
-        Integer pFff1 = normProps.get("fff1");
+        if (isBvm02GattSignature(normProps)) {
+            return Collections.emptyList();
+        }
         Integer pFff4 = normProps.get("fff4");
         boolean hasBvmCmdNotify = pFff4 != null && (pFff4.intValue() & (PROP_NOTIFY | PROP_INDICATE)) != 0;
-        if (hasBvmCmdNotify) {
-            boolean fff1Active = pFff1 != null
-                    && (pFff1.intValue() & (PROP_NOTIFY | PROP_INDICATE | PROP_WRITE | PROP_WRITE_NO_RESP)) != 0;
-            if (!fff1Active) {
-                return Collections.emptyList();
-            }
-        }
 
         List<GattBinding> out = new ArrayList<GattBinding>();
         Set<String> seenPairs = new HashSet<String>();

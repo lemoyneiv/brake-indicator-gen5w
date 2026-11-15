@@ -26,14 +26,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.2:
+ * Host JVM unit tests for v0.7.3:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
  *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, post-brake decel settle, EPB auto-release hold)
+ *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, L2/L3 post-accel VCU torque-ramp delay,
+ *   <14.2 km/h creep-taper release, strong-decel paddle throttle cancel, post-brake decel settle, EPB hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
@@ -48,6 +49,7 @@ public final class TestMain {
         testElm327SafetyAndBvm02Exclusion();
         testObdBrakeClientBleAndLoopbackFallback();
         testV072BleDiscoveryMergePriorityAndEvaluatorCalibration();
+        testV073MultiRegenTorqueRampCreepTaperAndThrottleCancel();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1021,8 +1023,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.2",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.2 Calibration Summary")));
+        eq("Summary banner is v0.7.3",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.3 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1189,6 +1191,139 @@ public final class TestMain {
                 BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
         eq("v0.7.2 throttle >= 1.5% releases Park-carryover EPB hold",
                 Boolean.FALSE, Boolean.valueOf(epbGo.modelIlluminated));
+    }
+
+    private static void testV073MultiRegenTorqueRampCreepTaperAndThrottleCancel() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Unlearned post-acceleration L2 coasting waits for forward acceleration (< -0.55 m/s^2)
+        //    to subside before starting coastStartMs -> classifies directly ? -> L2 without false L1 step!
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 10000L;
+        float spd = 48.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        // Brisk forward acceleration (~ -1.35 m/s^2 decel) from 48 -> 52 km/h at 25% throttle
+        for (int i = 0; i < 8; i++) {
+            spd += 0.50f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 25.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        // Lift off at t: VCU takes ~400ms to ramp +drive -> 0 before settled ~1.05 m/s^2 L2 coast begins
+        for (int i = 0; i < 4; i++) {
+            spd += 0.20f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        boolean sawFalseL1 = false;
+        for (int i = 0; i < 16; i++) {
+            spd -= 0.39f; // ~1.08 m/s^2 settled L2 coast
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.inferredRegenLevel == 1) {
+                sawFalseL1 = true;
+            }
+            t += 100L;
+        }
+        eq("v0.7.3 post-accel coast avoids false intermediate L1 classification",
+                Boolean.FALSE, Boolean.valueOf(sawFalseL1));
+        eq("v0.7.3 post-accel coast classifies directly as L2",
+                Integer.valueOf(2), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 2. Step up to L3 (~1.65 m/s^2), accelerate briskly (-1.5 m/s^2), then lift off:
+        //    - During initial <550ms VCU +drive->0 torque ramp: brake lamps stay OFF (matching 22BC06=0)
+        //    - At >=550ms into lift-off: lights ON and stays ON continuously without mid-ramp notch!
+        for (int i = 0; i < 16; i++) {
+            spd -= 0.60f; // ~1.67 m/s^2 settled L3 coast
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        eq("v0.7.3 learned L3 mode", Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // Brisk acceleration from 36 -> 42 km/h at 32% throttle (~ -1.67 m/s^2 decel)
+        spd = 36.0f;
+        for (int i = 0; i < 10; i++) {
+            spd += 0.60f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 32.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        // Full lift-off from brisk acceleration: at +200ms and +500ms (<550ms ramp), must still be OFF!
+        BrakeEvaluator.Snapshot snap200 = null;
+        BrakeEvaluator.Snapshot snap500 = null;
+        for (int i = 0; i < 6; i++) {
+            if (i < 2) spd += 0.20f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (i == 2) snap200 = snap;
+            if (i == 5) snap500 = snap;
+            t += 100L;
+        }
+        eq("v0.7.3 L3 lift-off from brisk accel stays OFF at +200ms during VCU torque ramp",
+                Boolean.FALSE, Boolean.valueOf(snap200.modelIlluminated));
+        eq("v0.7.3 L3 lift-off from brisk accel stays OFF at +500ms during VCU torque ramp",
+                Boolean.FALSE, Boolean.valueOf(snap500.modelIlluminated));
+
+        // From +600ms through +1600ms as regen builds 0.45 -> 1.75 m/s^2: lights ON with ZERO dropout notch!
+        boolean allOnAfterRamp = true;
+        for (int i = 0; i < 11; i++) {
+            spd -= (i < 3) ? 0.22f : 0.64f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (!snap.modelIlluminated) {
+                allOnAfterRamp = false;
+            }
+            t += 100L;
+        }
+        eq("v0.7.3 L3 lift-off lights after 550ms ramp and holds with zero mid-ramp notch",
+                Boolean.TRUE, Boolean.valueOf(allOnAfterRamp));
+
+        // 3. Light feathering (7.0% < 7.5%) during strong L3 decel keeps REGEN_DECEL ON,
+        //    whereas deliberate >=13.0% throttle (13.7%) cancels REGEN_DECEL immediately!
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd - 0.60f, 7.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("v0.7.3 L3 light 7.0% feathering keeps REGEN_DECEL ON",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        t += 100L;
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd - 1.10f, 13.7f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("v0.7.3 L3 >=13.0% throttle cancels strong-decel REGEN_DECEL immediately",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 4. Low-speed (<14.2 km/h) L3 creep taper (~0.70 m/s^2 at 13.5 km/h) releases REGEN_DECEL cleanly
+        //    without corrupting L3 -> i-Pedal:
+        t += 200L;
+        spd = 24.0f;
+        for (int i = 0; i < 16; i++) {
+            spd -= 0.60f; // coast down from 24 -> 14.4 km/h in L3
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        eq("v0.7.3 L3 regen stays ON above 14.2 km/h", Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        for (int i = 0; i < 8; i++) {
+            spd -= 0.25f; // ~0.69 m/s^2 E-GMP creep taper across 14.1 -> 12.1 km/h
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        eq("v0.7.3 L3 low-speed (<14.2 km/h) creep taper releases REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+        eq("v0.7.3 L3 creep taper preserves L3 mode (does NOT false-promote to i-Pedal)",
+                Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

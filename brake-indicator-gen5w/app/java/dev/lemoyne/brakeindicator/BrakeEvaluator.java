@@ -60,10 +60,15 @@ public final class BrakeEvaluator {
     private static final float RELEASE_ACCEL_L2_PCT = 4.8f;
     private static final float RELEASE_ACCEL_L3_PCT = 7.5f;
     private static final float RELEASE_ACCEL_IPEDAL_PCT = 11.5f;
+    private static final float STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT = 13.0f;
+    private static final float ZERO_PEDAL_HIGH_REGEN_RELEASE_MPS2 = 0.42f;
+    private static final float CREEP_TAPER_RELEASE_SPEED_KMH = 14.2f;
 
     private static final float DECEL_EMA_ALPHA = 0.72f;
     private static final long DECEL_HOLD_MS = 140L;
-    private static final long LIFTOFF_ANTICIPATION_MAX_MS = 650L;
+    private static final long LIFTOFF_CRUISE_ANTICIPATION_MAX_MS = 900L;
+    private static final long LIFTOFF_ACCEL_RAMP_DELAY_MS = 550L;
+    private static final long LIFTOFF_ACCEL_ANTICIPATION_MAX_MS = 1350L;
     private static final long POST_BRAKE_REGEN_SETTLE_MS = 650L;
 
     /**
@@ -416,6 +421,7 @@ public final class BrakeEvaluator {
     private final float[] histSpeedKmh = new float[SPEED_HISTORY_CAP];
     private int histCount;
     private long lastProcessedHmgPollMs = -1L;
+    private float smoothedPollIntervalMs = 100.0f;
     private float lastRawDecelMps2;
     private float smoothedDecelMps2;
     private boolean hasDecelSample;
@@ -423,6 +429,7 @@ public final class BrakeEvaluator {
     private long coastStartMs = -1L;
     private long lastFootBrakeMs = -1L;
     private long zeroPedalLiftStartMs = -1L;
+    private float zeroPedalLiftInitDecelMps2;
     private long ipedalLowSpdSinceMs = -1L;
     private long ipedalCruiseSinceMs = -1L;
     private long creepTaperSinceMs = -1L;
@@ -481,6 +488,14 @@ public final class BrakeEvaluator {
         float aeroExcess = aeroDragExcessMps2(in.speedKmh);
         float motorDecelMps2 = smoothedDecelMps2 - aeroExcess;
 
+        float liftoffMinSpd = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
+                ? 2.0f : LIFTOFF_MIN_SPEED_L2_L3_KMH;
+        boolean zeroPedalAboveLiftMin = !sccActive
+                && in.speedKmh != null
+                && in.speedKmh >= liftoffMinSpd
+                && in.accelPedal != null
+                && in.accelPedal < COAST_MAX_ACCEL_PCT;
+
         float onsetThresh;
         float releaseThresh;
         if (sccActive) {
@@ -488,7 +503,17 @@ public final class BrakeEvaluator {
             releaseThresh = BASE_RELEASE_SCC_MPS2 * threshScale;
         } else if (inferredRegenLevel >= REGEN_LEVEL_2) {
             onsetThresh = BASE_ONSET_HIGH_REGEN_MPS2 * threshScale;
-            releaseThresh = BASE_RELEASE_HYST_MPS2 * threshScale;
+            if (inferredRegenLevel != REGEN_LEVEL_IPEDAL
+                    && smoothedPollIntervalMs < 350.0f
+                    && in.speedKmh != null
+                    && in.speedKmh < CREEP_TAPER_RELEASE_SPEED_KMH) {
+                // E-GMP tapers L2/L3 paddle regen down to idle creep below ~14.2 km/h (22BC06 44 -> 0)
+                releaseThresh = BASE_RELEASE_LOW_REGEN_MPS2 * threshScale;
+            } else if (zeroPedalAboveLiftMin) {
+                releaseThresh = ZERO_PEDAL_HIGH_REGEN_RELEASE_MPS2 * threshScale;
+            } else {
+                releaseThresh = BASE_RELEASE_HYST_MPS2 * threshScale;
+            }
         } else {
             onsetThresh = BASE_ONSET_STANDARD_MPS2 * threshScale;
             releaseThresh = BASE_RELEASE_LOW_REGEN_MPS2 * threshScale;
@@ -516,24 +541,29 @@ public final class BrakeEvaluator {
             sccSustainedDecelSinceMs = -1L;
         }
 
-        // In manual L2/L3/i-Pedal, E-GMP illuminates 22BC06 (44) immediately on full throttle lift-off
-        // above the < 20 km/h creep-taper zone (and down to standstill in i-Pedal). Bridge the initial
-        // <= 650 ms speed-window lag on lift-off, after which measured motorDecelMps2 governs hold/release.
-        float liftoffMinSpd = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
-                ? 2.0f : LIFTOFF_MIN_SPEED_L2_L3_KMH;
-        boolean zeroPedalAboveLiftMin = !sccActive
-                && in.speedKmh != null
-                && in.speedKmh >= liftoffMinSpd
-                && in.accelPedal != null
-                && in.accelPedal < COAST_MAX_ACCEL_PCT;
+        // In manual L2/L3/i-Pedal, E-GMP illuminates 22BC06 (44) on full throttle lift-off above
+        // the < 20 km/h creep-taper zone (and down to standstill in i-Pedal). When lifting off from
+        // active forward acceleration (smoothedDecelMps2 < -0.25 m/s^2), VCU motor-torque slew-rate
+        // limiting takes ~550 ms to ramp +drive -> 0 -> -regen before 22BC06 lights.
         if (!zeroPedalAboveLiftMin) {
             zeroPedalLiftStartMs = -1L;
+            zeroPedalLiftInitDecelMps2 = 0.0f;
         } else if (zeroPedalLiftStartMs < 0L) {
             zeroPedalLiftStartMs = effPollMs;
+            zeroPedalLiftInitDecelMps2 = hasDecelSample ? smoothedDecelMps2 : 0.0f;
         }
-        boolean liftoffAnticipation = zeroPedalAboveLiftMin
-                && inferredRegenLevel >= REGEN_LEVEL_2
-                && (effPollMs - zeroPedalLiftStartMs) < LIFTOFF_ANTICIPATION_MAX_MS;
+        boolean liftoffAnticipation = false;
+        if (zeroPedalAboveLiftMin && inferredRegenLevel >= REGEN_LEVEL_2) {
+            long liftElapsedMs = effPollMs - zeroPedalLiftStartMs;
+            boolean coarsePollHub = smoothedPollIntervalMs >= 350.0f;
+            if (!coarsePollHub && zeroPedalLiftInitDecelMps2 < -0.25f) {
+                liftoffAnticipation = liftElapsedMs >= LIFTOFF_ACCEL_RAMP_DELAY_MS
+                        && liftElapsedMs < LIFTOFF_ACCEL_ANTICIPATION_MAX_MS
+                        && (!hasDecelSample || smoothedDecelMps2 >= -1.20f);
+            } else {
+                liftoffAnticipation = liftElapsedMs < LIFTOFF_CRUISE_ANTICIPATION_MAX_MS;
+            }
+        }
 
         boolean featheredIpedal = !sccActive
                 && inferredRegenLevel == REGEN_LEVEL_IPEDAL
@@ -543,6 +573,10 @@ public final class BrakeEvaluator {
                 && in.accelPedal < RELEASE_ACCEL_IPEDAL_PCT
                 && motorDecelMps2 >= releaseThresh;
 
+        boolean throttleCancelsPaddleRegen = !sccActive
+                && inferredRegenLevel != REGEN_LEVEL_IPEDAL
+                && in.accelPedal != null
+                && in.accelPedal >= STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT;
         boolean throttleSuppressesMildRegen = in.accelPedal != null
                 && in.accelPedal >= releaseAccelPct
                 && evalDecelMps2 < config.decelThresholdMps2;
@@ -558,7 +592,7 @@ public final class BrakeEvaluator {
                 && lastFootBrakeMs > 0L
                 && (effPollMs - lastFootBrakeMs) < POST_BRAKE_REGEN_SETTLE_MS;
 
-        if (!canRegenBrake || throttleSuppressesMildRegen || postFootBrakeDecelBleed) {
+        if (!canRegenBrake || throttleCancelsPaddleRegen || throttleSuppressesMildRegen || postFootBrakeDecelBleed) {
             decelLatched = false;
             decelHoldUntilMs = 0L;
         } else if (evalDecelMps2 >= onsetThresh || sccSustainedBraking || liftoffAnticipation || featheredIpedal) {
@@ -788,7 +822,9 @@ public final class BrakeEvaluator {
 
         if (zeroPedalHighSpeed) {
             if (coastStartMs < 0L) {
-                coastStartMs = effPollMs;
+                if (!hasDecelSample || smoothedDecelMps2 >= -0.55f) {
+                    coastStartMs = effPollMs;
+                }
             } else if (decelUpdated && (effPollMs - coastStartMs) >= (COAST_SETTLE_MS + COAST_CHORD_MIN_MS)) {
                 long earliestValidMs = coastStartMs + COAST_SETTLE_MS;
                 int anchorIdx = -1;
@@ -974,6 +1010,12 @@ public final class BrakeEvaluator {
                 }
                 return false;
             }
+            if (lastProcessedHmgPollMs > 0L) {
+                long pollDt = hmgSampleElapsedMs - lastProcessedHmgPollMs;
+                if (pollDt >= 20L && pollDt <= 850L) {
+                    smoothedPollIntervalMs = 0.35f * pollDt + 0.65f * smoothedPollIntervalMs;
+                }
+            }
             lastProcessedHmgPollMs = hmgSampleElapsedMs;
         }
 
@@ -1034,6 +1076,14 @@ public final class BrakeEvaluator {
             long dtMs = effTimeMs - histTimeMs[anchorIdx];
             float dvMps = (speedKmh - histSpeedKmh[anchorIdx]) / 3.6f;
             float rawDecel = -dvMps / (dtMs / 1000.0f);
+            if (rawDecel < -10.0f || rawDecel > 14.0f) {
+                histCount = 0;
+                lastRawDecelMps2 = 0.0f;
+                smoothedDecelMps2 = 0.0f;
+                hasDecelSample = false;
+                pushHistorySample(effTimeMs, speedKmh);
+                return true;
+            }
             rawDecel = Math.max(-8.0f, Math.min(12.0f, rawDecel));
             lastRawDecelMps2 = rawDecel;
             if (!hasDecelSample) {

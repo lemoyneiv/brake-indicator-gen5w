@@ -26,16 +26,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.4:
+ * Host JVM unit tests for v0.7.5:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
  *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + i-Pedal & SCC auto-detection, L2/L3/i-Pedal VCU torque-ramp delay,
- *   speed-dependent i-Pedal one-pedal feathered braking & post-Park urban launch detection,
- *   <14.2 km/h creep-taper release, strong-decel throttle cancel, post-brake decel settle, EPB hold)
+ *   settled L0..L3 coasting chord + post-WOT crest reset + i-Pedal & SCC auto-detection,
+ *   L2/L3/i-Pedal VCU torque-ramp delay, piecewise speed-dependent i-Pedal feathered braking & low-speed crawl,
+ *   Reverse 0%-pedal creep plateau guard, <14.2 km/h creep-taper release, strong-decel throttle cancel, EPB hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
@@ -52,6 +52,7 @@ public final class TestMain {
         testV072BleDiscoveryMergePriorityAndEvaluatorCalibration();
         testV073MultiRegenTorqueRampCreepTaperAndThrottleCancel();
         testV074IpedalFeatheredBrakingLaunchAndRamp();
+        testV075LowSpeedIpedalCrawlReverseAndPostWotCoast();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1025,8 +1026,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.4",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.4 Calibration Summary")));
+        eq("Summary banner is v0.7.5",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.5 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1331,13 +1332,19 @@ public final class TestMain {
     private static void testV074IpedalFeatheredBrakingLaunchAndRamp() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
 
-        // 1. Verify speed-dependent i-Pedal onset & release pedal curves:
-        eq("v0.7.4 ipedalOnsetPedalPct at 10 km/h is 12.2%",
-                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(10.0f) - 12.2f) < 0.01f));
+        // 1. Verify piecewise speed-dependent i-Pedal onset & release pedal curves:
+        eq("v0.7.5 ipedalOnsetPedalPct at 5 km/h is 5.5%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(5.0f) - 5.5f) < 0.01f));
+        eq("v0.7.5 ipedalOnsetPedalPct at 17 km/h is 11.0%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(17.0f) - 11.0f) < 0.01f));
+        eq("v0.7.5 ipedalOnsetPedalPct at 24 km/h is 13.4%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(24.0f) - 13.4f) < 0.01f));
         eq("v0.7.4 ipedalOnsetPedalPct at 55 km/h is 16.0%",
                 Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(55.0f) - 16.0f) < 0.01f));
-        eq("v0.7.4 ipedalReleasePedalPct at 20 km/h is 16.8%",
-                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(20.0f) - 16.8f) < 0.01f));
+        eq("v0.7.5 ipedalReleasePedalPct at 8 km/h is 11.2%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(8.0f) - 11.2f) < 0.01f));
+        eq("v0.7.5 ipedalReleasePedalPct at 21 km/h is 16.8%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(21.0f) - 16.8f) < 0.01f));
         eq("v0.7.4 ipedalReleasePedalPct at 55 km/h is 18.6%",
                 Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(55.0f) - 18.6f) < 0.01f));
 
@@ -1413,7 +1420,7 @@ public final class TestMain {
         t += 2500L;
         spd = 12.8f;
         for (int i = 0; i < 4; i++) {
-            spd -= 0.16f; // ~0.44 m/s^2 for 400 ms (< 700 ms CREEP_TAPER_CONFIRM_MS)
+            spd -= 0.16f; // ~0.44 m/s^2 for 400 ms (< 780 ms CREEP_TAPER_CONFIRM_MS)
             snap = evIp.evaluate(cfg, new BrakeEvaluator.Input(
                     t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
                     BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
@@ -1455,6 +1462,144 @@ public final class TestMain {
         }
         eq("v0.7.4 Reverse 0%-pedal creep acceleration never false-triggers REGEN_DECEL",
                 Boolean.FALSE, Boolean.valueOf(reverseCreepLit));
+    }
+
+    private static void testV075LowSpeedIpedalCrawlReverseAndPostWotCoast() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Gentle urban creep-up cruise (25.5% pedal across 34 -> 35.4 km/h, ~ -0.28 m/s^2 for 1.3 s)
+        //    auto-learns i-Pedal (4) early (matching 131433.csv t=43.7s):
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 800000L;
+        float spd = 34.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        for (int i = 0; i < 16; i++) {
+            spd += 0.10f; // -0.28 m/s^2 gentle creep-up
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 25.5f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        eq("v0.7.5 gentle 25.5% urban creep-up cruise auto-learns i-Pedal (4)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 2. Low-speed UN ECE R13-H parking-lot / neighborhood crawl in i-Pedal:
+        //    Holding 10.5% pedal at 12 -> 10 km/h (~0.55 m/s^2) stays OFF (22BC06 = 0),
+        //    whereas 0% pedal full-stop regen (~1.65 m/s^2) lights ON, and pressing back to 11.8%
+        //    at 8.0 km/h cancels REGEN_DECEL immediately even with lagged >1.8 m/s^2 decel!
+        t += 2500L;
+        spd = 12.5f;
+        boolean lowSpdCrawlLit = false;
+        for (int i = 0; i < 10; i++) {
+            spd -= 0.20f; // ~0.55 m/s^2 gentle crawl at 10.5% pedal (> 5.5..8.9% onset curve)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 10.5f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) {
+                lowSpdCrawlLit = true;
+            }
+            t += 100L;
+        }
+        eq("v0.7.5 low-speed i-Pedal crawl (10.5% pedal, ~0.55 m/s^2 at 10-12 km/h) stays OFF",
+                Boolean.FALSE, Boolean.valueOf(lowSpdCrawlLit));
+
+        // Lift to 0% pedal for strong low-speed regen (~1.67 m/s^2 down to 8.1 km/h) -> lights ON:
+        for (int i = 0; i < 4; i++) {
+            spd -= 0.60f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        eq("v0.7.5 0%-pedal low-speed i-Pedal stop (~1.67 m/s^2 at 8 km/h) lights REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+
+        // Press crawl throttle back to 11.8% (>= 11.4% strong-cancel at 8.0 km/h) while speed step
+        // still shows lagged strong decel -> cancels immediately (matching 131433.csv t=393.0s):
+        spd -= 0.65f;
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd, 11.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 100L;
+        eq("v0.7.5 pressing 11.8% crawl throttle at <8 km/h cancels lagged strong decel immediately",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 3. Post-WOT acceleration crest (131433.csv t=385.8..388.5s):
+        //    99.6% WOT pulse -> 0% lift-off at 21.7 km/h while delayed cluster speed surges to 30.6 km/h
+        //    (-3.3 m/s^2) after coastStartMs began, followed by i-Pedal regen down to 24 km/h ->
+        //    resets coastStartMs across the crest and NEVER false-demotes i-Pedal to L0 or L1!
+        t += 2500L;
+        spd = 20.5f;
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd, 99.6f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 100L;
+        boolean sawFalseLowRegen = false;
+        // 0% lift-off while cluster speed surges 21.7 -> 30.5 km/h over 800 ms (~ -3.05 m/s^2)
+        spd = 21.7f;
+        for (int i = 0; i < 8; i++) {
+            if (i > 0) spd += 1.25f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.inferredRegenLevel != BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+                sawFalseLowRegen = true;
+            }
+            t += 100L;
+        }
+        // Now decelerate in i-Pedal from 30.5 -> 22.1 km/h (~1.75 m/s^2) over 1.4 s:
+        for (int i = 0; i < 14; i++) {
+            spd -= 0.60f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.inferredRegenLevel != BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+                sawFalseLowRegen = true;
+            }
+            t += 100L;
+        }
+        eq("v0.7.5 post-WOT speed surge resets coastStartMs and preserves i-Pedal (zero L0/L1 glitch)",
+                Boolean.FALSE, Boolean.valueOf(sawFalseLowRegen));
+
+        // 4. Reverse 0%-pedal steady 7.2 km/h creep plateau (0.00 m/s^2 for 1.5 s after reverse creep accel)
+        //    and <4.5 km/h mild post-foot-brake release bleed stay OFF (matching 131433.csv t=480.8s & 485.4s):
+        t += 2500L;
+        spd = 4.0f;
+        boolean reversePlateauOrBleedLit = false;
+        for (int i = 0; i < 8; i++) {
+            spd += 0.40f; // Reverse creep up to 7.2 km/h
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) reversePlateauOrBleedLit = true;
+            t += 100L;
+        }
+        // Hold steady 7.2 km/h plateau at 0.0% pedal for 1.5 s (smoothedDecelMps2 == 0.0f):
+        for (int i = 0; i < 15; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, 7.2f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) reversePlateauOrBleedLit = true;
+            t += 100L;
+        }
+        // Foot-brake down to 3.8 km/h, then release foot brake with mild 0.55 m/s^2 bleed:
+        for (int i = 0; i < 8; i++) {
+            spd -= 0.42f;
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 6.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 100L;
+        }
+        for (int i = 0; i < 8; i++) {
+            spd -= 0.18f; // mild ~0.50 m/s^2 rolling tail below 4.5 km/h after releasing foot brake
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) reversePlateauOrBleedLit = true;
+            t += 100L;
+        }
+        eq("v0.7.5 Reverse 7.2 km/h steady creep plateau and <4.5 km/h post-brake bleed stay OFF",
+                Boolean.FALSE, Boolean.valueOf(reversePlateauOrBleedLit));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

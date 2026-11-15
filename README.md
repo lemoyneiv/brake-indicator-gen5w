@@ -6,7 +6,7 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
 
 ---
 
-## Architecture (`v0.7.3`)
+## Architecture (`v0.7.4`)
 
 `brake-indicator-gen5w` is completely standalone (`"live": true`, `"ble": {"central": true}`, zero `/system` file patches, zero `root` mod daemons) and runs inside a single lightweight Android app (`app/BrakeIndicator.apk`, `OverlayService` + `BrakeEngine`):
 
@@ -14,12 +14,12 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
    - Runs a dedicated `50 ms` (`20 Hz`) evaluation and RAM telemetry recorder thread while polling HMG-API's built-in readings (`brake.pressure`, `speed`, `pedal.accel`, `gear.park`, `parking_brake`, `moving`, `steering.angle`, `hv.soc`) over `@hmgapid` (`LFD1`) at `20 Hz` (`< 2 ms` with `100 ms` `speed`/`moving` freshness on updated HMG-API, or `650 ms` with automatic `90 ms` `'O'`-frame recovery on legacy KitKat `Hub`s).
    - Aligns longitudinal `-dv/dt` updates to exact HMG-API poll timestamps (`hmgSampleElapsedMs`), suppresses `< 560 ms` `0.8 km/h` (`0.5 mph`) cluster speed-quantization repeats, isolates post-foot-brake hydraulic `-dv/dt` tails (`650 ms` settle), and subtracts passive highway aerodynamic drag excess above `36 km/h` (`10 m/s`) so wind drag does not masquerade as motor regen torque:
      1. **Hydraulic / IEB Cylinder Pressure** (`brake.pressure` with a responsive `0.4` onset threshold, `0.70×` release hysteresis, and `409.5` CAN-invalid filtering for instant foot-pedal & IEB hydraulic braking).
-     2. **Calibrated Regenerative & Smart Cruise Deceleration** (`signal_mode = pressure_and_decel`, enabled by default: models E-GMP's UN ECE R13-H regen brake-lamp law with cruise vs post-acceleration VCU torque-ramp lift-off timing in `L2 / L3`, `< 14.2 km/h` paddle creep-taper release vs full-stop `i-Pedal`, mode-specific neutral-pedal release thresholds [`4.8%` `L2`, `7.5%` `L3`, `11.5%` `i-Pedal`, `13.0%` strong-decel paddle cancel], and dedicated Smart Cruise Control braking thresholds).
+     2. **Calibrated Regenerative, One-Pedal `i-Pedal`, & Smart Cruise Deceleration** (`signal_mode = pressure_and_decel`, enabled by default: models E-GMP's UN ECE R13-H regen brake-lamp law with cruise vs post-acceleration VCU torque-ramp lift-off timing in `L2 / L3 / i-Pedal`, speed-dependent `i-Pedal` feathered one-pedal braking onset [`12.2%–16.0%` pedal] and neutral-pedal release hysteresis [`16.8%–18.6%` pedal], `< 14.2 km/h` paddle creep-taper release vs seamless `< 1.2 km/h` full-stop `i-Pedal` continuity, mode-specific paddle release thresholds [`4.8%` `L2`, `7.5%` `L3`, `13.0%` strong-decel paddle cancel], and dedicated Smart Cruise Control braking thresholds).
      3. **Auto-Hold, `i-Pedal`, & Smart Cruise Standstill Hold** (`standstill_hold = true`: keeps the indicator illuminated at `0 km/h` after decelerating to a stop — including extended foot-brake holds released into Auto-Hold — until throttle `>= 1.5%`, `0.7 km/h` creep, `moving`, EPB, or Park).
 
 2. **Automatic `L0 / L1 / L2 / L3 / i-Pedal` + Smart Cruise Control (`SCC`) Detection**:
    - **History-Ring Coasting Chord (`L0`–`L3+`)**: Automatically classifies `L0`, `L1`, `L2`, and `L3+` whenever the driver coasts off both pedals (`pedal.accel < 1%`, `brake.pressure < 0.25`) above `21 km/h`, using a `520 ms` settle + `1.05–1.95 s` aero-compensated history chord (`0.44 / 0.82 / 1.22 m/s²` boundaries with `±0.08 m/s²` hysteresis).
-   - **`i-Pedal` (`4`) vs `L3` (`3`) Discrimination**: Distinguishes `i-Pedal` from `L3` via low-speed zero-pedal full-stop regen (`2–14 km/h` at `>= 1.35 m/s²`) and urban neutral cruise pedal (`23–30%` across `16–56 km/h`), stepping back down to `L3` on low-speed creep taper or low-pedal steady cruising (`3–17.5%`).
+   - **`i-Pedal` (`4`) vs `L3` (`3`) Discrimination**: Distinguishes `i-Pedal` from `L3` via post-Park urban pull-away throttle (`29–38.5%` pedal at `8–36 km/h` yielding moderate `0.55–1.65 m/s²` acceleration above `i-Pedal`'s `~22%` neutral zone), low-speed zero-pedal full-stop regen (`2–14 km/h` at `>= 1.35 m/s²`), and urban neutral cruise pedal (`23–30%` across `16–56 km/h`), stepping back down to `L3` on settled low-speed creep taper (`>= 700 ms`) or low-pedal steady cruising (`3–12%`).
    - **Smart Cruise Control (`SCC / HDA`) Detection**: Detects active SCC from settled zero-pedal acceleration or sustained zero-pedal constant-speed cruise, freezing the driver's learned paddle regen mode during SCC stop-and-go and exiting immediately on foot brake, Park/EPB, or sustained manual throttle.
 
 3. **Optional OBD-II Ground-Truth Brake Lamp Reader (`IGMP 770 → 778`, UDS `22 BC06`)**:
@@ -63,9 +63,9 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 
 Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
 
-- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.3-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.3.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
-- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.3-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
-- **Direct Packages:** `brake-indicator-gen5w-v0.7.3.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.3-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.4-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.4.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.4-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
+- **Direct Packages:** `brake-indicator-gen5w-v0.7.4.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.4-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
 
 > **Note on USB Export & USB Host Mode:** When exporting calibration CSV datasets via **Export USB**, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
 

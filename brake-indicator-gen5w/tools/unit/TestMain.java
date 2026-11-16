@@ -26,16 +26,17 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.5:
+ * Host JVM unit tests for v0.7.6:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
  *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + post-WOT crest reset + i-Pedal & SCC auto-detection,
+ *   settled L0..L3 coasting chord + post-WOT crest reset + Auto-Regen feather step-down + i-Pedal & SCC auto-detection,
  *   L2/L3/i-Pedal VCU torque-ramp delay, piecewise speed-dependent i-Pedal feathered braking & low-speed crawl,
- *   Reverse 0%-pedal creep plateau guard, <14.2 km/h creep-taper release, strong-decel throttle cancel, EPB hold)
+ *   full-lock steering scrub compensation, Auto-Hold ON vs OFF standstill inference, <14.2 km/h creep-taper release,
+ *   strong-decel throttle cancel, EPB actuator release & carryover hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
  */
@@ -53,6 +54,7 @@ public final class TestMain {
         testV073MultiRegenTorqueRampCreepTaperAndThrottleCancel();
         testV074IpedalFeatheredBrakingLaunchAndRamp();
         testV075LowSpeedIpedalCrawlReverseAndPostWotCoast();
+        testV076AutoRegenSteeringScrubAndAutoHoldOffStandstill();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1026,8 +1028,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.5",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.5 Calibration Summary")));
+        eq("Summary banner is v0.7.6",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.6 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1600,6 +1602,159 @@ public final class TestMain {
         }
         eq("v0.7.5 Reverse 7.2 km/h steady creep plateau and <4.5 km/h post-brake bleed stay OFF",
                 Boolean.FALSE, Boolean.valueOf(reversePlateauOrBleedLit));
+    }
+
+    private static void testV076AutoRegenSteeringScrubAndAutoHoldOffStandstill() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. EPB caliper actuator mid-release (parking_brake: true -> null at 277.25s in 205022.csv)
+        //    and 0%-throttle idle creep (0.0 -> 0.8 -> 1.6 -> 2.4 km/h) confirming console AUTO HOLD is OFF:
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 900000L;
+        BrakeEvaluator.Snapshot snap = null;
+        // Start in Park with foot on brake + EPB=true, shift to Drive, release foot brake:
+        ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 32.0f, 0.0f, 0.0f, -12.0f, Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, -12.0f, Boolean.FALSE, Boolean.TRUE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        // EPB actuator begins winding back (parking_brake transitions TRUE -> null): releases STANDSTILL_HOLD!
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, -12.0f, Boolean.FALSE, null, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.6 parking_brake TRUE->null actuator release clears STANDSTILL_HOLD",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // Vehicle creeps forward 0.0 -> 0.8 -> 1.6 -> 2.4 km/h at 0% throttle & 0 brake pressure:
+        float[] creepSpds = { 0.8f, 0.8f, 1.6f, 1.6f, 2.4f };
+        for (int i = 0; i < creepSpds.length; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, creepSpds[i], 0.0f, -12.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+
+        // Subsequent drive-through stop: brake 12 -> 0 km/h with foot brake, then release foot brake (prsr -> 0.0):
+        // Because AUTO HOLD was confirmed OFF by idle creep, STANDSTILL_HOLD releases immediately!
+        float spd = 12.0f;
+        for (int i = 0; i < 16; i++) {
+            spd = Math.max(0.0f, spd - 0.8f);
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 8.5f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(spd > 0.5f), 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 drive-through stop with foot on brake lights BRAKE_PRESSURE",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "BRAKE_PRESSURE".equals(snap.modelSource)));
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.6 releasing foot brake at 0 km/h with Auto-Hold confirmed OFF releases immediately",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 2. Learn L0 coasting, verify 5.5-second constant-speed slight-downgrade coast in L0 does NOT false-trigger SCC:
+        t += 2500L;
+        spd = 68.4f;
+        for (int i = 0; i < 40; i++) {
+            if (i > 0 && i % 16 == 0) spd -= 0.8f; // ~0.28 m/s^2 total (~0.22 m/s^2 motor/rolling) flat-road L0 coast
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 learned L0 coasting mode", Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
+        for (int i = 0; i < 110; i++) { // 5.5 s steady 66.8 km/h slight-downgrade coast in L0 (< 9.0 s L0 guard)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 5.5s constant-speed slight-downgrade coast in L0 does NOT false-activate SCC",
+                Boolean.FALSE, Boolean.valueOf(snap.sccActive));
+
+        // 3. Full-lock parking-lot steering scrub (|steering.angle| = 479 deg at 13.7 -> 8.8 km/h in L0, ~1.76 m/s^2):
+        //    subtracts passive Ackermann tire scrub so REGEN_DECEL stays OFF and L0 does NOT jump to i-Pedal!
+        t += 2500L;
+        spd = 13.7f;
+        boolean scrubLit = false;
+        for (int i = 0; i < 18; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.62f; // ~1.72 m/s^2 passive full-lock scrub drag
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 479.4f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) scrubLit = true;
+            t += 50L;
+        }
+        eq("v0.7.6 full-lock 479 deg parking turn scrub in L0 stays OFF",
+                Boolean.FALSE, Boolean.valueOf(scrubLit));
+        eq("v0.7.6 full-lock 479 deg parking turn scrub preserves L0 (does NOT false-promote to i-Pedal)",
+                Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 4. Post-foot-brake >= 20 km/h strong Auto-Regen/blended continuation (28 -> 24 km/h at ~3.0 m/s^2, 22BC06=36/40)
+        //    stays ON without a 650 ms dropout, and pressing >= 2.0% throttle cancels immediately:
+        t += 2500L;
+        spd = 34.0f;
+        for (int i = 0; i < 12; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 1.10f; // ~3.05 m/s^2
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 4.5f, spd, 0.0f, 20.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        // Release foot brake (prsr -> 0.0) while Auto Regen keeps pulling ~3.0 m/s^2 at ~28 km/h:
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd - 0.55f, 0.0f, 20.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.6 >=20 km/h strong Auto-Regen continuation after foot-brake lift stays lit (zero dropout notch)",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+        // Press gentle 2.5% throttle right after brake release in L0 -> cancels immediately!
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, spd - 0.55f, 2.5f, 20.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.6 pressing 2.5% throttle in L0 cancels post-brake regen immediately",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 5. Auto-Regen radar L2 taper release (< 0.82 m/s^2 after >= 1.5 s) and stale L2 -> L0 step-down on < 2% feather coast:
+        t += 2500L;
+        spd = 46.0f;
+        for (int i = 0; i < 36; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.38f; // ~1.05 m/s^2 Auto-Regen radar L2 braking
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 Auto-Regen radar braking learns L2 and lights REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 2 && snap.modelIlluminated));
+        // Radar tapers regen down to ~0.65 m/s^2 (< 0.82 m/s^2) after 1.8 s of 0%-pedal coast:
+        for (int i = 0; i < 12; i++) {
+            if (i % 4 == 0) spd -= 0.45f; // ~0.62 m/s^2
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 settled L2 Auto-Regen taper (<0.82 m/s^2) releases REGEN_DECEL promptly",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+        // Driver holds 1.4% feather pedal at 65 km/h with ~0.18 m/s^2 passive coast for 1.8 s -> steps L2 down to L0!
+        t += 2500L;
+        spd = 65.2f;
+        for (int i = 0; i < 36; i++) {
+            if (i == 8 || i == 20 || i == 32) spd -= 0.4f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 1.4f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.6 near-zero decel at 1.4% feather pedal above 25 km/h steps stale L2 back to L0",
+                Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

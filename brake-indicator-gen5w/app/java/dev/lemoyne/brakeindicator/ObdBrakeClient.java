@@ -51,6 +51,10 @@ public final class ObdBrakeClient {
         void onObdStateChanged();
     }
 
+    public interface DiagnosticLogger {
+        void onDiagnostic(long monoMs, String message);
+    }
+
     public static final class DiscoveredDevice {
         public final String mac;
         public final int addrType;
@@ -102,7 +106,12 @@ public final class ObdBrakeClient {
 
     private final HmgBleListener bleListener = new HmgBleListener();
     private final Object sessionOpenLock = new Object();
+    private final Object coordinatorWaitLock = new Object();
+    private final Object diagnosticLock = new Object();
     private volatile Ble bleSession;
+    private volatile DiagnosticLogger diagnosticLogger;
+    private String lastDiagnosticMsg = "";
+    private long lastDiagnosticMonoMs = -60000L;
 
     private final ExecutorService cmdExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
         @Override
@@ -132,6 +141,7 @@ public final class ObdBrakeClient {
     // HMG-API @hmgapi-ble session state
     private volatile boolean bleBridgeReady = false;
     private volatile boolean bleScanning = false;
+    private volatile boolean manualScanActive = false;
     private volatile int scanGeneration = 0;
     private volatile boolean bleConnecting = false;
     private volatile long bleConnectStartedMs = 0L;
@@ -139,6 +149,9 @@ public final class ObdBrakeClient {
     private volatile boolean bleGattRejected = false;
     private volatile String bleServiceFilter = null;
     private volatile boolean pendingTargetedSvcRetry = false;
+    private volatile boolean forceWakeScanOnNextConnect = false;
+    private volatile boolean suppressNextDisconnectBackoff = false;
+    private volatile boolean loggedWakeMissInOutage = false;
     private volatile long nextBleReconnectMs = 0L;
     private volatile int bleTimeoutStreak = 0;
     private volatile int lastWakeScanStreak = 0;
@@ -197,6 +210,43 @@ public final class ObdBrakeClient {
 
     public long monotonicMs() {
         return Math.max(1L, (System.nanoTime() - monoOriginNano) / 1_000_000L);
+    }
+
+    public void setDiagnosticLogger(DiagnosticLogger logger) {
+        this.diagnosticLogger = logger;
+    }
+
+    private void emitDiagnostic(String message) {
+        DiagnosticLogger logger = this.diagnosticLogger;
+        if (logger == null || message == null || message.isEmpty()) return;
+        long nowMono = monotonicMs();
+        synchronized (diagnosticLock) {
+            if (message.equals(lastDiagnosticMsg) && (nowMono - lastDiagnosticMonoMs) < 30000L) {
+                return;
+            }
+            lastDiagnosticMsg = message;
+            lastDiagnosticMonoMs = nowMono;
+        }
+        try {
+            logger.onDiagnostic(nowMono, message);
+        } catch (Throwable ignored) {}
+    }
+
+    private void wakeCoordinator() {
+        synchronized (coordinatorWaitLock) {
+            coordinatorWaitLock.notifyAll();
+        }
+    }
+
+    private void waitCoordinator(long maxWaitMs) {
+        if (maxWaitMs <= 0L || stopped.get()) return;
+        synchronized (coordinatorWaitLock) {
+            try {
+                coordinatorWaitLock.wait(maxWaitMs);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     public void addListener(Listener l) {
@@ -296,6 +346,17 @@ public final class ObdBrakeClient {
         return bleGattRejected;
     }
 
+    boolean canAttemptDirectBleNowForTest() {
+        Ble s = bleSession;
+        return s != null
+                && s.isOpen()
+                && !pairedMac.isEmpty()
+                && !bleGattRejected
+                && !bleScanning
+                && !manualScanActive
+                && System.currentTimeMillis() >= nextBleReconnectMs;
+    }
+
     public Ble getBleSessionForTest() {
         return bleSession;
     }
@@ -305,6 +366,8 @@ public final class ObdBrakeClient {
         synchronized (discovered) {
             discovered.clear();
         }
+        manualScanActive = true;
+        bleScanning = true;
         final int gen = ++scanGeneration;
         statusSummary = "Scanning BLE via @hmgapi-ble...";
         notifyListeners();
@@ -316,7 +379,10 @@ public final class ObdBrakeClient {
                 if (s != null) {
                     s.startScan();
                 } else {
+                    manualScanActive = false;
+                    bleScanning = false;
                     statusSummary = "@hmgapi-ble unavailable (check Bluetooth & HMG-API)";
+                    emitDiagnostic(statusSummary);
                     notifyListeners();
                 }
             }
@@ -327,7 +393,7 @@ public final class ObdBrakeClient {
                 @Override
                 public void run() {
                     sleepQuiet(15000L);
-                    if (!stopped.get() && bleScanning && scanGeneration == gen) {
+                    if (!stopped.get() && (bleScanning || manualScanActive) && scanGeneration == gen) {
                         stopBleScan();
                     }
                 }
@@ -338,6 +404,8 @@ public final class ObdBrakeClient {
     }
 
     public void stopBleScan() {
+        final boolean wasManual = manualScanActive;
+        manualScanActive = false;
         scanGeneration++;
         runAsyncOrInline(new Runnable() {
             @Override
@@ -347,6 +415,29 @@ public final class ObdBrakeClient {
                     s.stopScan();
                 }
                 bleScanning = false;
+                if (!bleConnected && !bleConnecting && !bridgeConnected && enabled) {
+                    int totalFound;
+                    boolean pairedSeen = false;
+                    synchronized (discovered) {
+                        totalFound = discovered.size();
+                        if (!pairedMac.isEmpty() && discovered.containsKey(pairedMac)) {
+                            pairedSeen = true;
+                        }
+                    }
+                    if (pairedMac.isEmpty()) {
+                        statusSummary = "BLE scan complete (" + totalFound + " found; tap Pair)";
+                    } else if (pairedSeen) {
+                        nextBleReconnectMs = 0L;
+                        statusSummary = "BLE scan found " + shortName(pairedName, pairedMac) + "; connecting...";
+                    } else {
+                        statusSummary = "BLE scan: " + shortName(pairedName, pairedMac)
+                                + " not advertising (" + totalFound + " other BLE seen)";
+                    }
+                    if (wasManual) {
+                        emitDiagnostic(statusSummary);
+                    }
+                }
+                wakeCoordinator();
                 notifyListeners();
             }
         });
@@ -372,6 +463,7 @@ public final class ObdBrakeClient {
             store.save(cleanMac, cleanName, addrType);
         }
         resetBleRetryState();
+        manualScanActive = false;
         scanGeneration++;
         bleScanning = false;
 
@@ -386,10 +478,12 @@ public final class ObdBrakeClient {
                     s.stopScan();
                     if (enabled && (testMode || !probeActiveLoopbackBridge(bridgePort))) {
                         bleConnecting = true;
+                        bleConnectStartedMs = System.currentTimeMillis();
                         statusSummary = "Connecting @hmgapi-ble (" + shortName(cleanName, cleanMac) + ")...";
                         s.connectDevice(cleanMac, addrType, null);
                     }
                 }
+                wakeCoordinator();
                 notifyListeners();
             }
         });
@@ -405,6 +499,7 @@ public final class ObdBrakeClient {
         if (store != null) {
             store.clear();
         }
+        manualScanActive = false;
         resetBleRetryState();
         bleConnected = false;
         bleConnecting = false;
@@ -418,8 +513,10 @@ public final class ObdBrakeClient {
             public void run() {
                 Ble s = bleSession;
                 if (!oldMac.isEmpty() && s != null && s.isOpen()) {
+                    suppressNextDisconnectBackoff = true;
                     s.disconnectDevice(oldMac);
                 }
+                wakeCoordinator();
                 notifyListeners();
             }
         });
@@ -427,7 +524,10 @@ public final class ObdBrakeClient {
     }
 
     public void requestReconnect() {
+        manualScanActive = false;
+        scanGeneration++;
         resetBleRetryState();
+        forceWakeScanOnNextConnect = true;
         bridgeRetryAfterMs = 0L;
         closeBridgeSocketQuiet();
         final String targetMac = pairedMac;
@@ -435,16 +535,28 @@ public final class ObdBrakeClient {
         runAsyncOrInline(new Runnable() {
             @Override
             public void run() {
-                Ble s = bleSession;
-                if (!targetMac.isEmpty() && s != null && s.isOpen()) {
-                    bleConnected = false;
-                    bleConnecting = false;
-                    s.disconnectDevice(targetMac);
-                    if (testMode && enabled) {
-                        bleConnecting = true;
-                        statusSummary = "Reconnecting @hmgapi-ble...";
-                        s.connectDevice(targetMac, targetAddrType, null);
+                if (testMode) {
+                    Ble s = bleSession;
+                    if (!targetMac.isEmpty() && s != null && s.isOpen()) {
+                        bleConnected = false;
+                        bleConnecting = false;
+                        suppressNextDisconnectBackoff = true;
+                        s.disconnectDevice(targetMac);
+                        if (enabled) {
+                            bleConnecting = true;
+                            bleConnectStartedMs = System.currentTimeMillis();
+                            statusSummary = "Reconnecting @hmgapi-ble...";
+                            s.connectDevice(targetMac, targetAddrType, null);
+                        }
                     }
+                } else {
+                    recycleBleSession();
+                    if (enabled) {
+                        statusSummary = targetMac.isEmpty()
+                                ? ("Reconnecting (127.0.0.1:" + bridgePort + ")...")
+                                : ("Reconnecting @hmgapi-ble (" + shortName(pairedName, targetMac) + ")...");
+                    }
+                    wakeCoordinator();
                 }
                 notifyListeners();
             }
@@ -454,6 +566,7 @@ public final class ObdBrakeClient {
 
     public void close() {
         if (!stopped.compareAndSet(false, true)) return;
+        wakeCoordinator();
         disconnectActiveTransports("Stopped", true);
         cmdExecutor.shutdownNow();
     }
@@ -481,6 +594,7 @@ public final class ObdBrakeClient {
                 s.close();
             }
         }
+        manualScanActive = false;
         bleConnected = false;
         bleConnecting = false;
         bleScanning = false;
@@ -504,6 +618,7 @@ public final class ObdBrakeClient {
         bleTimeoutStreak = 0;
         lastWakeScanStreak = 0;
         lastRecycledStreak = 0;
+        loggedWakeMissInOutage = false;
         nextBleReconnectMs = 0L;
         synchronized (triedServiceOverrides) {
             triedServiceOverrides.clear();
@@ -610,7 +725,7 @@ public final class ObdBrakeClient {
     private void coordinatorLoop() {
         while (!stopped.get()) {
             if (!enabled) {
-                sleepQuiet(1000L);
+                waitCoordinator(1000L);
                 continue;
             }
 
@@ -628,13 +743,15 @@ public final class ObdBrakeClient {
                 bleTimeoutStreak++;
                 Ble cur = bleSession;
                 if (cur != null && cur.isOpen() && !pairedMac.isEmpty()) {
+                    suppressNextDisconnectBackoff = true;
                     cur.disconnectDevice(pairedMac);
                 }
                 nextBleReconnectMs = now + 1500L;
+                emitDiagnostic("OBD BLE connect watchdog reset (streak=" + bleTimeoutStreak + ")");
             }
 
             // Priority 2: Coexistence check — yield to obd-gen5w's 127.0.0.1:<bridgePort> if active
-            if (!bleScanning && !bleConnecting && now >= bridgeRetryAfterMs) {
+            if (!bleScanning && !manualScanActive && !bleConnecting && now >= bridgeRetryAfterMs) {
                 boolean ranBridge = tryRunLoopbackBridgeSession(bridgePort);
                 if (ranBridge) {
                     nextBleReconnectMs = 0L;
@@ -648,6 +765,7 @@ public final class ObdBrakeClient {
                     && (bleTimeoutStreak % 3 == 0)
                     && lastRecycledStreak != bleTimeoutStreak
                     && !bleScanning
+                    && !manualScanActive
                     && !bleConnecting
                     && now >= nextBleReconnectMs) {
                 lastRecycledStreak = bleTimeoutStreak;
@@ -655,22 +773,37 @@ public final class ObdBrakeClient {
             }
 
             // Priority 3: Direct BLE via HMG-API's @hmgapi-ble central
-            Ble s = (!pairedMac.isEmpty() || bleScanning) ? ensureBleSessionOpen() : bleSession;
+            Ble s = (!pairedMac.isEmpty() || bleScanning || manualScanActive) ? ensureBleSessionOpen() : bleSession;
+            if (s == null && !pairedMac.isEmpty() && !testMode) {
+                statusSummary = "@hmgapi-ble unavailable (waiting for Bluetooth/HMG-API)";
+                emitDiagnostic("@hmgapi-ble socket unavailable");
+                notifyListeners();
+                waitCoordinator(2500L);
+                continue;
+            }
+
             boolean canTryDirectBle = s != null
                     && s.isOpen()
                     && !pairedMac.isEmpty()
                     && !bleGattRejected
+                    && !bleScanning
+                    && !manualScanActive
                     && now >= nextBleReconnectMs;
 
             if (canTryDirectBle) {
                 if (!bleConnecting) {
                     if (!testMode
-                            && bleTimeoutStreak >= 2
-                            && (bleTimeoutStreak % 2 == 0)
-                            && lastWakeScanStreak != bleTimeoutStreak) {
+                            && (forceWakeScanOnNextConnect
+                                    || (bleTimeoutStreak >= 1 && lastWakeScanStreak != bleTimeoutStreak))) {
+                        forceWakeScanOnNextConnect = false;
                         lastWakeScanStreak = bleTimeoutStreak;
-                        performWakeScanBeforeConnect(s, 2200L);
-                        if (!s.isOpen() || !enabled || stopped.get()) {
+                        boolean seen = performWakeScanBeforeConnect(s, 2000L);
+                        if (!seen && bleTimeoutStreak >= 2 && !loggedWakeMissInOutage) {
+                            loggedWakeMissInOutage = true;
+                            emitDiagnostic("OBD BLE wake-scan: "
+                                    + shortName(pairedName, pairedMac) + " not advertising");
+                        }
+                        if (!s.isOpen() || !enabled || stopped.get() || manualScanActive) {
                             continue;
                         }
                     }
@@ -680,11 +813,11 @@ public final class ObdBrakeClient {
                     s.connectDevice(pairedMac, effectiveConnectAddrType(), bleServiceFilter);
                     notifyListeners();
                 }
-                sleepQuiet(400L);
+                waitCoordinator(400L);
                 continue;
             }
 
-            if (!bleConnected && !bleConnecting && !bridgeConnected) {
+            if (!bleConnected && !bleConnecting && !bridgeConnected && !bleScanning && !manualScanActive) {
                 if (pairedMac.isEmpty()) {
                     statusSummary = bleBridgeReady
                             ? "Unpaired (Scan BLE or run 127.0.0.1:" + bridgePort + ")"
@@ -692,7 +825,7 @@ public final class ObdBrakeClient {
                 }
                 notifyListeners();
             }
-            sleepQuiet(2500L);
+            waitCoordinator(2500L);
         }
     }
 
@@ -962,6 +1095,7 @@ public final class ObdBrakeClient {
             bridgeConnected = true;
             bridgeRetryAfterMs = 0L;
             statusSummary = "Loopback Bridge (127.0.0.1:" + port + ")";
+            emitDiagnostic("OBD connected via 127.0.0.1:" + port + " bridge");
             notifyListeners();
 
             for (int i = 0; i < Elm327BrakeProtocol.IGMP_INIT_COMMANDS.length && enabled && !stopped.get(); i++) {
@@ -1084,6 +1218,9 @@ public final class ObdBrakeClient {
         @Override
         public void onScanStateChanged(boolean scanning) {
             bleScanning = scanning;
+            if (!scanning) {
+                wakeCoordinator();
+            }
             notifyListeners();
         }
 
@@ -1113,6 +1250,7 @@ public final class ObdBrakeClient {
                 if (changedMeta && store != null) {
                     store.save(pairedMac, pairedName, pairedAddrType);
                 }
+                loggedWakeMissInOutage = false;
                 nextBleReconnectMs = 0L;
                 synchronized (pairedAdvLock) {
                     lastPairedAdvMs = System.currentTimeMillis();
@@ -1165,6 +1303,21 @@ public final class ObdBrakeClient {
                 discovered.put(upper, new DiscoveredDevice(
                         upper, mergedAddrType, record.rssi, mergedName, isObd, isBvm, mergedUuids));
             }
+
+            if (upper.equals(pairedMac)) {
+                if (!testMode && manualScanActive && enabled && !bleConnected && !bleConnecting && !bleGattRejected) {
+                    manualScanActive = false;
+                    scanGeneration++;
+                    bleScanning = false;
+                    Ble s = bleSession;
+                    if (s != null && s.isOpen()) {
+                        s.stopScan();
+                    }
+                    statusSummary = "BLE scan found " + shortName(pairedName, pairedMac) + "; connecting...";
+                    emitDiagnostic(statusSummary);
+                }
+                wakeCoordinator();
+            }
             notifyListeners();
         }
 
@@ -1185,6 +1338,7 @@ public final class ObdBrakeClient {
                 return;
             }
 
+            boolean wasConnected = bleConnected;
             bleConnecting = false;
             bleConnected = false;
             bleBinding = null;
@@ -1193,6 +1347,12 @@ public final class ObdBrakeClient {
             }
             synchronized (notifyReadyLock) {
                 notifyReadyLock.notifyAll();
+            }
+            if (suppressNextDisconnectBackoff) {
+                suppressNextDisconnectBackoff = false;
+                wakeCoordinator();
+                notifyListeners();
+                return;
             }
             if (pendingTargetedSvcRetry) {
                 pendingTargetedSvcRetry = false;
@@ -1207,10 +1367,15 @@ public final class ObdBrakeClient {
             bleTimeoutStreak++;
             long backoff = Math.min(15000L, 2500L * bleTimeoutStreak);
             nextBleReconnectMs = System.currentTimeMillis() + backoff;
+            String discMsg = String.format(Locale.US, "BLE disconnected (0x%02x)",
+                    Integer.valueOf(handleOrReason & 0xFF));
             if (!bridgeConnected && !bleGattRejected && !statusSummary.startsWith("BLE GATT incomplete")) {
-                statusSummary = String.format(Locale.US, "BLE disconnected (0x%02x)",
-                        Integer.valueOf(handleOrReason & 0xFF));
+                statusSummary = discMsg;
             }
+            if (wasConnected) {
+                emitDiagnostic("OBD " + discMsg);
+            }
+            wakeCoordinator();
             notifyListeners();
         }
 
@@ -1284,7 +1449,9 @@ public final class ObdBrakeClient {
                 bleGattRejected = true;
                 bleConnected = false;
                 statusSummary = "Incompatible GATT (safety rejected)";
+                emitDiagnostic("OBD BLE rejected BVM02 GATT (" + pairedMac + ")");
                 if (s != null && s.isOpen()) {
+                    suppressNextDisconnectBackoff = true;
                     s.disconnectDevice(pairedMac);
                 }
                 notifyListeners();
@@ -1312,16 +1479,21 @@ public final class ObdBrakeClient {
                     bleTimeoutStreak++;
                     nextBleReconnectMs = System.currentTimeMillis() + Math.min(10000L, 2000L * bleTimeoutStreak);
                     statusSummary = "BLE GATT incomplete; retrying...";
+                    emitDiagnostic("OBD BLE GATT incomplete; retrying (" + shortName(pairedName, pairedMac) + ")");
                     if (s != null && s.isOpen()) {
+                        suppressNextDisconnectBackoff = true;
                         s.disconnectDevice(pairedMac);
                     }
+                    wakeCoordinator();
                     notifyListeners();
                     return;
                 }
                 bleGattRejected = true;
                 bleConnected = false;
                 statusSummary = "Incompatible GATT (no OBD UART)";
+                emitDiagnostic("OBD BLE incompatible GATT (" + shortName(pairedName, pairedMac) + ")");
                 if (s != null && s.isOpen()) {
+                    suppressNextDisconnectBackoff = true;
                     s.disconnectDevice(pairedMac);
                 }
                 notifyListeners();
@@ -1337,11 +1509,14 @@ public final class ObdBrakeClient {
             bleTimeoutStreak = 0;
             lastWakeScanStreak = 0;
             lastRecycledStreak = 0;
+            loggedWakeMissInOutage = false;
             statusSummary = "BLE GATT Ready (" + primary.profileName + ")";
+            emitDiagnostic("OBD BLE connected (" + shortName(pairedName, pairedMac) + ", " + primary.profileName + ")");
             synchronized (notifyReadyLock) {
                 lastNotifyReadyUuid = "";
             }
             enableCharacteristicStream(s, pairedMac, primary.notifyUuid, charProps);
+            wakeCoordinator();
             notifyListeners();
         }
 
@@ -1401,9 +1576,13 @@ public final class ObdBrakeClient {
                             ? "BLE link busy; resetting (" + err + ")"
                             : "BLE retry pending (" + err + ")";
                 }
+                if (bleTimeoutStreak == 1 || bleTimeoutStreak == 3 || err.startsWith("CONNECT_ALREADY_EXISTS")) {
+                    emitDiagnostic("OBD BLE error: " + err + " (streak=" + bleTimeoutStreak + ")");
+                }
                 if (err.startsWith("CONNECT_ALREADY_EXISTS")) {
                     Ble s = bleSession;
                     if (s != null && s.isOpen() && !pairedMac.isEmpty()) {
+                        suppressNextDisconnectBackoff = true;
                         s.disconnectDevice(pairedMac);
                     }
                 }
@@ -1413,6 +1592,7 @@ public final class ObdBrakeClient {
                 synchronized (notifyReadyLock) {
                     notifyReadyLock.notifyAll();
                 }
+                wakeCoordinator();
                 notifyListeners();
             }
         }
@@ -1434,6 +1614,7 @@ public final class ObdBrakeClient {
             synchronized (notifyReadyLock) {
                 notifyReadyLock.notifyAll();
             }
+            wakeCoordinator();
             notifyListeners();
         }
     }

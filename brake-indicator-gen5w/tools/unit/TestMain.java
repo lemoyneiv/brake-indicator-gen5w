@@ -26,14 +26,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.7:
+ * Host JVM unit tests for v0.7.8:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
- * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
- *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
+ * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, uninterrupted manual BLE scan guard,
+ *   reconnect 0x16 backoff suppression, diagnostic transition logging, sticky ADV_IND+SCAN_RSP merge,
+ *   priority sorting, transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + first-class Auto Regen detection & speed-dependent radar hysteresis,
+ *   settled L0..L3 coasting chord + first-class Auto Regen detection, light throttle feathering, speed-band hysteresis,
+ *   strict i-Pedal vs Auto mutual exclusion, early >=1.5 km/h brake-release standstill clear,
  *   20 Hz flat-speed quantization ceiling, pressureLatched-gated post-brake bleed & gentle standstill feather hold,
  *   L2/L3/i-Pedal VCU torque-ramp delay, piecewise speed-dependent i-Pedal feathered braking & low-speed crawl,
  *   full-lock steering scrub compensation, Auto-Hold ON vs OFF standstill inference, <14.2 km/h creep-taper release,
@@ -57,6 +59,7 @@ public final class TestMain {
         testV075LowSpeedIpedalCrawlReverseAndPostWotCoast();
         testV076AutoRegenSteeringScrubAndAutoHoldOffStandstill();
         testV077AutoRegenDetectionHysteresisAndQuantizationDecay();
+        testV078BleScanReconnectAndAutoRegenFeatherCalibration();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1030,8 +1033,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.7",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.7 Calibration Summary")));
+        eq("Summary banner is v0.7.8",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.8 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1852,7 +1855,7 @@ public final class TestMain {
         eq("v0.7.7 sub-latch 0.20 bar pedal brush does NOT drop active REGEN_DECEL",
                 Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
 
-        // Above 48 km/h in Auto Regen, tapering motor decel to ~0.62 m/s^2 (< 0.75 m/s^2) releases REGEN_DECEL promptly:
+        // Above 39.5 km/h in Auto Regen, tapering motor decel below 0.60 m/s^2 (~0.51 m/s^2) releases REGEN_DECEL promptly:
         t += 3000L;
         spd = 58.0f;
         for (int i = 0; i < 6; i++) {
@@ -1868,14 +1871,14 @@ public final class TestMain {
                     BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
             t += 50L;
         }
-        for (int i = 1; i <= 21; i++) {
-            if (i % 3 == 0) spd -= 0.37f; // ~0.68 m/s^2 total (~0.60 m/s^2 motor < 0.75 m/s^2)
+        for (int i = 1; i <= 24; i++) {
+            if (i % 3 == 0) spd -= 0.32f; // ~0.59 m/s^2 total (~0.51 m/s^2 motor < 0.60 m/s^2)
             snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
                     t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
                     BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
             t += 50L;
         }
-        eq("v0.7.7 Auto-Regen releases REGEN_DECEL below 0.75 m/s^2 motor decel at >= 48 km/h",
+        eq("v0.7.8 Auto-Regen releases REGEN_DECEL below 0.60 m/s^2 motor decel at >= 39.5 km/h",
                 Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
 
         // 4. 20 Hz flat-speed quantization ceiling & gentle standstill feather hold:
@@ -1933,6 +1936,244 @@ public final class TestMain {
         }
         eq("v0.7.7 3 consecutive fixed high-decel manual coasts exit autoRegenActive cleanly",
                 Boolean.FALSE, Boolean.valueOf(snap.autoRegenActive));
+    }
+
+    private static void testV078BleScanReconnectAndAutoRegenFeatherCalibration() throws Exception {
+        // 1. ObdBrakeClient v0.7.8: uninterrupted manual BLE scan guard, reconnect 0x16 backoff suppression,
+        //    non-advertising scan summary, and deduplicated DiagnosticLogger events:
+        final List<String> lines = new ArrayList<String>();
+        final List<String> diagnostics = Collections.synchronizedList(new ArrayList<String>());
+        final ServerSocket ss = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        final Socket cliSock = new Socket("127.0.0.1", ss.getLocalPort());
+        final Socket srvSock = ss.accept();
+        ss.close();
+        cliSock.setTcpNoDelay(true);
+        srvSock.setTcpNoDelay(true);
+        final BufferedWriter w = new BufferedWriter(new OutputStreamWriter(srvSock.getOutputStream(), "UTF-8"));
+
+        Thread srvReader = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    BufferedReader r = new BufferedReader(new InputStreamReader(srvSock.getInputStream(), "UTF-8"));
+                    String ln;
+                    while ((ln = r.readLine()) != null) {
+                        String trimmed = ln.trim();
+                        synchronized (lines) {
+                            lines.add(trimmed);
+                            lines.notifyAll();
+                        }
+                        if ("STREAM_SESSION".equals(trimmed)) {
+                            sendBleServerEvent(w, "OK STREAM_READY");
+                        } else if ("CLOSE".equals(trimmed)) {
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    try { w.close(); } catch (Throwable ignored) {}
+                    try { srvSock.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "MockV078BleServer");
+        srvReader.setDaemon(true);
+        srvReader.start();
+
+        Closeable closeBoth = new Closeable() {
+            @Override
+            public void close() {
+                try { srvSock.close(); } catch (Throwable ignored) {}
+                try { cliSock.close(); } catch (Throwable ignored) {}
+            }
+        };
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        ObdBrakeClient client = ObdBrakeClient.createForTest(
+                store, cliSock.getInputStream(), cliSock.getOutputStream(), closeBoth, 35998);
+        client.setDiagnosticLogger(new ObdBrakeClient.DiagnosticLogger() {
+            @Override
+            public void onDiagnostic(long monoMs, String message) {
+                diagnostics.add(message);
+            }
+        });
+        try {
+            waitForBleLine(lines, "MULTICONN 1", 1000L);
+            eq("v0.7.8 pairAdapter accepts VEEPEAK",
+                    Boolean.TRUE, Boolean.valueOf(client.pairAdapter("AA:BB:CC:DD:EE:88", "VEEPEAK", 0)));
+            waitForBleLine(lines, "@AA:BB:CC:DD:EE:88 CONNECT 0", 1000L);
+
+            // Tapping Reconnect sends DISCONNECT, and BleCentral echoes CONN_STATE DISCONNECTED 0x0016:
+            // v0.7.8 must NOT penalize self-initiated disconnect with bleTimeoutStreak=1 or overwrite statusSummary!
+            lines.clear();
+            client.requestReconnect();
+            eq("v0.7.8 requestReconnect sends DISCONNECT",
+                    Boolean.TRUE, Boolean.valueOf(waitForBleLine(lines, "@AA:BB:CC:DD:EE:88 DISCONNECT", 1000L)));
+            sendBleServerEvent(w, "@AA:BB:CC:DD:EE:88 CONN_STATE DISCONNECTED AA:BB:CC:DD:EE:88 0x0016");
+            Thread.sleep(50L);
+            eq("v0.7.8 self-disconnect 0x16 does NOT penalize effectiveConnectAddrType to -1",
+                    Integer.valueOf(0), Integer.valueOf(client.effectiveConnectAddrType()));
+            eq("v0.7.8 self-disconnect 0x16 does NOT overwrite Reconnecting status with 0x16 error",
+                    Boolean.FALSE, Boolean.valueOf(client.getStatusSummary().contains("0x16")));
+
+            // Simulate real CONNECT_TIMEOUT -> logs diagnostic milestone
+            sendBleServerEvent(w, "@AA:BB:CC:DD:EE:88 ERR CONNECT_TIMEOUT AA:BB:CC:DD:EE:88");
+            long errWait = System.currentTimeMillis() + 1000L;
+            while (diagnostics.isEmpty() && System.currentTimeMillis() < errWait) {
+                Thread.sleep(10L);
+            }
+            eq("v0.7.8 ERR CONNECT_TIMEOUT emits diagnostic log entry",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!diagnostics.isEmpty() && diagnostics.get(0).contains("CONNECT_TIMEOUT")));
+
+            // Start manual BLE scan: direct BLE connect attempts MUST be suppressed during scan!
+            lines.clear();
+            client.startBleScan();
+            eq("v0.7.8 startBleScan sends SCAN_START",
+                    Boolean.TRUE, Boolean.valueOf(waitForBleLine(lines, "SCAN_START", 1000L)));
+            eq("v0.7.8 canAttemptDirectBleNowForTest is FALSE while BLE scan is active",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleNowForTest()));
+
+            // Feed 2 nearby BLE devices (neither is paired VEEPEAK), then stop scan:
+            sendBleServerEvent(w, "ADV CC:11:22:33:44:01 1 -58 020106");
+            sendBleServerEvent(w, "ADV CC:11:22:33:44:02 1 -63 020106");
+            long advWait = System.currentTimeMillis() + 1000L;
+            while (client.getDiscoveredDevices().size() < 2 && System.currentTimeMillis() < advWait) {
+                Thread.sleep(10L);
+            }
+            client.stopBleScan();
+            eq("v0.7.8 stopBleScan clears stuck Scanning status and reports paired adapter not advertising",
+                    "BLE scan: VEEPEAK not advertising (2 other BLE seen)", client.getStatusSummary());
+            boolean loggedNotAdv = false;
+            synchronized (diagnostics) {
+                for (int i = 0; i < diagnostics.size(); i++) {
+                    if (diagnostics.get(i).contains("VEEPEAK not advertising (2 other BLE seen)")) {
+                        loggedNotAdv = true;
+                    }
+                }
+            }
+            eq("v0.7.8 stopBleScan logs non-advertising scan result to DiagnosticLogger",
+                    Boolean.TRUE, Boolean.valueOf(loggedNotAdv));
+        } finally {
+            client.close();
+        }
+
+        // 2. BrakeEvaluator v0.7.8: Auto-Regen light throttle feathering, mid-speed settled coast release,
+        //    i-Pedal vs Auto mutual exclusion, and fast-Hub early foot-brake release standstill clear:
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator evAuto = new BrakeEvaluator();
+        long t = 120000L;
+        float spd = 62.0f;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // Confirmed L0 coast (~0.22 m/s^2) followed by radar L2 modulation (~1.08 m/s^2) on 20 Hz Hub:
+        for (int i = 0; i <= 36; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.08f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.8 baseline L0 coast learned", Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
+
+        for (int i = 1; i <= 30; i++) {
+            if (i % 2 == 0) spd -= 0.42f; // ~1.17 m/s^2 total (~1.07 m/s^2 motor) radar regen above 52 km/h
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.8 confirmed L0 -> L2 modulation on 20 Hz Hub latches autoRegenActive immediately",
+                Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive && snap.modelIlluminated));
+
+        // Highway Auto-Regen light feathering (6.4% throttle at ~53 km/h while radar regen holds ~1.06 m/s^2 motor):
+        for (int i = 0; i < 6; i++) {
+            if (i % 2 == 1) spd -= 0.42f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 6.4f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.8 Auto-Regen >=48 km/h light 6.4% throttle feathering keeps REGEN_DECEL ON",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // Urban Auto-Regen light feathering (2.8% throttle at ~33 km/h while radar regen holds ~1.02 m/s^2):
+        t += 1500L;
+        spd = 35.0f;
+        for (int i = 0; i < 16; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.38f;
+            float featherAccel = (i >= 10) ? 2.8f : 0.0f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, featherAccel, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.8 Auto-Regen urban 2.8% throttle feathering at ~32 km/h keeps REGEN_DECEL ON",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // Settled (>2.05 s + 220 ms hold) 14.2-39.5 km/h Auto-Regen coast easing to ~0.69 m/s^2 (< 0.88 m/s^2) releases cleanly:
+        for (int i = 0; i < 52; i++) {
+            if (i % 2 == 1) spd -= 0.25f; // ~0.69 m/s^2 across ~32 -> 25.5 km/h over 2.6 s
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.8 settled (>2.05 s) mid-speed Auto-Regen coast at ~0.69 m/s^2 releases REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 3. Strict i-Pedal vs Auto-Regen mutual exclusion across brief (<1.45 s) accel -> coast transitions:
+        BrakeEvaluator evIp = new BrakeEvaluator();
+        long ti = 300000L;
+        float ipSpd = 9.0f;
+        for (int i = 0; i < 34; i++) {
+            ipSpd += 0.20f; // +1.11 m/s^2 over 1.70 s (>= 1.35 s confirm)
+            snap = evIp.evaluate(cfg, new BrakeEvaluator.Input(
+                    ti, 0.0f, ipSpd, 33.5f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ti));
+            ti += 50L;
+        }
+        eq("v0.7.8 post-Park urban launch learns i-Pedal (4)",
+                Integer.valueOf(4), Integer.valueOf(snap.inferredRegenLevel));
+        ipSpd = 38.0f;
+        for (int i = 0; i < 12; i++) {
+            ipSpd += 0.25f;
+            evIp.evaluate(cfg, new BrakeEvaluator.Input(
+                    ti, 0.0f, ipSpd, 32.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ti));
+            ti += 50L;
+        }
+        // Brief 1.25 s coast during VCU +drive -> regen transition (~0.33 m/s^2 transient):
+        for (int i = 0; i < 25; i++) {
+            if (i % 2 == 1) ipSpd -= 0.12f;
+            snap = evIp.evaluate(cfg, new BrakeEvaluator.Input(
+                    ti, 0.0f, ipSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ti));
+            ti += 50L;
+        }
+        eq("v0.7.8 i-Pedal brief <1.45 s transient coast preserves i-Pedal (4) and keeps autoRegenActive=false",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 4 && !snap.autoRegenActive));
+
+        // 4. Fast-Hub (20 Hz) early foot-brake release (>=1.5 km/h) rolling unbraked to 0.0 km/h clears standstill latch:
+        BrakeEvaluator evEarlyRel = new BrakeEvaluator();
+        long te = 400000L;
+        float eSpd = 8.0f;
+        for (int i = 0; i < 14; i++) {
+            if (i > 0 && i % 2 == 0) eSpd -= 0.80f; // brake down from 8.0 -> 2.4 km/h
+            evEarlyRel.evaluate(cfg, new BrakeEvaluator.Input(
+                    te, 6.0f, eSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, te));
+            te += 50L;
+        }
+        // Release foot brake completely at 2.4 km/h and roll unbraked to 0.0 km/h:
+        float[] rollSpds = {2.4f, 2.4f, 1.6f, 1.6f, 0.8f, 0.8f, 0.0f, 0.0f};
+        for (int i = 0; i < rollSpds.length; i++) {
+            float rs = rollSpds[i];
+            snap = evEarlyRel.evaluate(cfg, new BrakeEvaluator.Input(
+                    te, 0.0f, rs, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(rs > 0.1f), 72.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, te));
+            te += 50L;
+        }
+        eq("v0.7.8 early foot-brake release at 2.4 km/h rolling unbraked to 0.0 km/h does NOT false-latch STANDSTILL_HOLD",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

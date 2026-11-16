@@ -515,6 +515,7 @@ public final class BrakeEvaluator {
 
     private boolean sccActive;
     private boolean autoRegenActive;
+    private boolean confirmedZeroRegenCoast;
     private int autoRegenBaseLevel = REGEN_LEVEL_0;
     private float coastMinChordDecel = Float.MAX_VALUE;
     private float coastMaxChordDecel = -Float.MAX_VALUE;
@@ -618,16 +619,33 @@ public final class BrakeEvaluator {
         if (sccActive) {
             onsetThresh = BASE_ONSET_SCC_MPS2 * threshScale;
             releaseThresh = BASE_RELEASE_SCC_MPS2 * threshScale;
-        } else if (autoRegenActive) {
-            boolean cleanZeroPedal = in.speedKmh != null && in.speedKmh >= 15.0f
-                    && in.accelPedal != null && in.accelPedal < 0.8f;
-            onsetThresh = (cleanZeroPedal ? 0.72f : BASE_ONSET_STANDARD_MPS2) * threshScale;
-            if (in.speedKmh != null && in.speedKmh < CREEP_TAPER_RELEASE_SPEED_KMH) {
-                releaseThresh = 0.72f * threshScale;
-            } else if (in.speedKmh != null && in.speedKmh >= 48.0f) {
-                releaseThresh = 0.75f * threshScale;
+        } else if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
+            float spdVal = in.speedKmh != null ? in.speedKmh.floatValue() : 0.0f;
+            float accVal = in.accelPedal != null ? in.accelPedal.floatValue() : 0.0f;
+            boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
+            if (spdVal < CREEP_TAPER_RELEASE_SPEED_KMH) {
+                onsetThresh = BASE_ONSET_STANDARD_MPS2 * threshScale;
+                releaseThresh = 1.08f * threshScale;
+            } else if (accVal < 0.8f) {
+                if (spdVal >= 39.5f) {
+                    onsetThresh = 0.68f * threshScale;
+                    releaseThresh = 0.68f * threshScale;
+                } else {
+                    boolean settledAutoMidTaper = smoothedPollIntervalMs < 350.0f
+                            && zeroPedalLiftStartMs > 0L
+                            && (effPollMs - zeroPedalLiftStartMs) >= 2050L;
+                    onsetThresh = 0.88f * threshScale;
+                    releaseThresh = (settledAutoMidTaper ? 0.88f : 0.64f) * threshScale;
+                }
+            } else if (noRecentFootBrake && accVal < 4.4f) {
+                onsetThresh = (spdVal >= 48.0f ? 0.86f : 0.84f) * threshScale;
+                releaseThresh = 0.78f * threshScale;
+            } else if (noRecentFootBrake && spdVal >= 48.0f && accVal < 9.6f) {
+                onsetThresh = 1.02f * threshScale;
+                releaseThresh = 0.88f * threshScale;
             } else {
-                releaseThresh = 0.60f * threshScale;
+                onsetThresh = BASE_ONSET_STANDARD_MPS2 * threshScale;
+                releaseThresh = 0.75f * threshScale;
             }
         } else if (inferredRegenLevel >= REGEN_LEVEL_2) {
             boolean lowSpdAboveIpedalOnset = inferredRegenLevel == REGEN_LEVEL_IPEDAL
@@ -669,9 +687,19 @@ public final class BrakeEvaluator {
         }
 
         float evalDecelMps2 = sccActive ? smoothedDecelMps2 : motorDecelMps2;
-        float releaseAccelPct = autoRegenActive
-                ? 1.2f
-                : regenReleaseAccelPct(inferredRegenLevel, sccActive, in.speedKmh);
+        float releaseAccelPct;
+        if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
+            boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
+            if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 48.0f && evalDecelMps2 >= 0.88f * threshScale) {
+                releaseAccelPct = 9.6f;
+            } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 15.0f && evalDecelMps2 >= 0.78f * threshScale) {
+                releaseAccelPct = 4.4f;
+            } else {
+                releaseAccelPct = 1.2f;
+            }
+        } else {
+            releaseAccelPct = regenReleaseAccelPct(inferredRegenLevel, sccActive, in.speedKmh);
+        }
         float minRegenSpdKmh = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
                 ? STANDSTILL_SPEED_MAX_KMH : 1.2f;
 
@@ -694,15 +722,15 @@ public final class BrakeEvaluator {
             sccSustainedDecelSinceMs = -1L;
         }
 
-        // Sustained moderate Auto-Regen radar braking (>= 0.62 m/s^2 off-pedal for >= 150 ms)
+        // Sustained arterial/highway Auto-Regen radar braking (>= 0.60 m/s^2 off-pedal above 39.5 km/h for >= 200 ms)
         boolean autoRegenSustainedBraking = false;
-        if (!sccActive && autoRegenActive && canRegenBrake
-                && in.speedKmh >= 15.0f && in.speedKmh < 48.0f
+        if (!sccActive && autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL && canRegenBrake
+                && in.speedKmh >= 39.5f
                 && (in.accelPedal == null || in.accelPedal < 0.8f)
-                && motorDecelMps2 >= 0.62f * threshScale) {
+                && motorDecelMps2 >= 0.60f * threshScale) {
             if (autoRegenSustainedSinceMs < 0L) {
                 autoRegenSustainedSinceMs = effPollMs;
-            } else if ((effPollMs - autoRegenSustainedSinceMs) >= 150L) {
+            } else if ((effPollMs - autoRegenSustainedSinceMs) >= 200L) {
                 autoRegenSustainedBraking = true;
             }
         } else {
@@ -735,7 +763,12 @@ public final class BrakeEvaluator {
                         && liftElapsedMs < LIFTOFF_CRUISE_ANTICIPATION_MAX_MS
                         && decelAllowsAnticipation;
             } else {
-                liftoffAnticipation = liftElapsedMs < LIFTOFF_CRUISE_ANTICIPATION_MAX_MS
+                boolean flatFastHubCoast = !coarsePollHub
+                        && liftElapsedMs >= 350L
+                        && hasDecelSample
+                        && smoothedDecelMps2 < 0.30f;
+                liftoffAnticipation = !flatFastHubCoast
+                        && liftElapsedMs < LIFTOFF_CRUISE_ANTICIPATION_MAX_MS
                         && (lowSpeedLift
                                 ? (hasDecelSample && smoothedDecelMps2 >= 0.28f)
                                 : (!hasDecelSample || smoothedDecelMps2 >= -0.50f));
@@ -781,9 +814,17 @@ public final class BrakeEvaluator {
         }
 
         float paddleStrongCancelPct;
-        if (autoRegenActive) {
-            paddleStrongCancelPct = (evalDecelMps2 >= 2.2f * threshScale)
-                    ? 12.0f : ((evalDecelMps2 >= 1.30f * threshScale) ? 5.8f : 2.0f);
+        if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
+            boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
+            if (evalDecelMps2 >= 2.2f * threshScale) {
+                paddleStrongCancelPct = 12.0f;
+            } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 48.0f && evalDecelMps2 >= 0.88f * threshScale) {
+                paddleStrongCancelPct = 9.6f;
+            } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 15.0f && evalDecelMps2 >= 0.78f * threshScale) {
+                paddleStrongCancelPct = 4.4f;
+            } else {
+                paddleStrongCancelPct = 2.0f;
+            }
         } else if (inferredRegenLevel == REGEN_LEVEL_0 || inferredRegenLevel == REGEN_LEVEL_1) {
             paddleStrongCancelPct = (lastFootBrakeMs > 0L && (effPollMs - lastFootBrakeMs) < 1200L) ? 2.0f : RELEASE_ACCEL_LOW_PCT;
         } else {
@@ -797,9 +838,16 @@ public final class BrakeEvaluator {
                 && inferredRegenLevel == REGEN_LEVEL_IPEDAL
                 && in.accelPedal != null
                 && in.accelPedal >= ipedalStrongCancelPedalPct(in.speedKmh);
-        float mildRegenCeiling = (!sccActive && inferredRegenLevel == REGEN_LEVEL_IPEDAL
-                && in.speedKmh != null && in.speedKmh >= 20.5f && in.speedKmh < 27.0f)
-                ? (0.95f * threshScale) : config.decelThresholdMps2;
+        float mildRegenCeiling;
+        if (!sccActive && inferredRegenLevel == REGEN_LEVEL_IPEDAL
+                && in.speedKmh != null && in.speedKmh >= 20.5f && in.speedKmh < 27.0f) {
+            mildRegenCeiling = 0.95f * threshScale;
+        } else if (!sccActive && autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL
+                && in.speedKmh != null && in.speedKmh >= 15.0f) {
+            mildRegenCeiling = 0.78f * threshScale;
+        } else {
+            mildRegenCeiling = config.decelThresholdMps2;
+        }
         boolean throttleSuppressesMildRegen = in.accelPedal != null
                 && in.accelPedal >= releaseAccelPct
                 && evalDecelMps2 < mildRegenCeiling;
@@ -907,7 +955,7 @@ public final class BrakeEvaluator {
             lastBrakingNearStopMs = 0L;
         } else if (in.speedKmh != null && in.speedKmh <= 14.0f && activeModelBraking) {
             lastBrakingNearStopMs = in.nowMs;
-        } else if ((in.speedKmh != null && in.speedKmh >= 3.0f)
+        } else if ((in.speedKmh != null && in.speedKmh >= (fastPollHub ? 1.5f : 3.0f))
                 || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
             lastBrakingNearStopMs = 0L;
         }
@@ -1114,6 +1162,7 @@ public final class BrakeEvaluator {
             coastRecordedHigh = false;
             consecutiveFixedHighCoasts = 0;
             autoRegenActive = false;
+            confirmedZeroRegenCoast = false;
             autoRegenBaseLevel = REGEN_LEVEL_0;
             autoRegenSustainedSinceMs = -1L;
             featheredIpedalSinceMs = -1L;
@@ -1210,36 +1259,48 @@ public final class BrakeEvaluator {
                         int prevForChord = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
                                 ? REGEN_LEVEL_3 : inferredRegenLevel;
                         int classified = classifyCoastingRegenLevel(chordDecel, prevForChord);
-                        if (!(classified == REGEN_LEVEL_3 && inferredRegenLevel == REGEN_LEVEL_IPEDAL)) {
+                        boolean ipedalUnsettledRamp = prevLevel == REGEN_LEVEL_IPEDAL
+                                && ((effPollMs - coastStartMs) < 1450L || chordDtMs < COAST_CHORD_PREF_MS);
+                        if (!ipedalUnsettledRamp && !(classified == REGEN_LEVEL_3 && prevLevel == REGEN_LEVEL_IPEDAL)) {
                             inferredRegenLevel = classified;
                         }
 
                         // Detect Auto Regen (Smart Recuperation) from intra-coast radar modulation
-                        // or cross-coast return from L2/L3 back to L0 open-road coasting:
-                        if (classified == REGEN_LEVEL_0) {
-                            autoRegenBaseLevel = REGEN_LEVEL_0;
-                            if (prevLevel >= REGEN_LEVEL_2 && prevLevel != REGEN_LEVEL_IPEDAL) {
-                                autoRegenActive = true;
-                                consecutiveFixedHighCoasts = 0;
-                            }
-                        }
-                        if (curSpd >= 24.5f && chordDtMs >= 950L) {
-                            if (chordDecel < coastMinChordDecel) coastMinChordDecel = chordDecel;
-                            if (chordDecel > coastMaxChordDecel) coastMaxChordDecel = chordDecel;
-                            if ((coastMinChordDecel < 0.52f && chordDecel >= 0.90f && (chordDecel - coastMinChordDecel) >= 0.45f)
-                                    || (coastMaxChordDecel >= 1.08f && chordDecel <= (coastMaxChordDecel - 0.45f))) {
-                                autoRegenActive = true;
-                                consecutiveFixedHighCoasts = 0;
-                            }
-                            if (!coastRecordedHigh && (effPollMs - coastStartMs) >= 1600L && chordDecel >= 0.85f) {
-                                coastRecordedHigh = true;
-                                if (coastMinChordDecel >= 0.78f) {
-                                    consecutiveFixedHighCoasts++;
-                                    if (consecutiveFixedHighCoasts >= 3) {
-                                        autoRegenActive = false;
-                                    }
-                                } else {
+                        // or cross-coast transitions between L0 open-road coasting and L2/L3 radar braking:
+                        if (inferredRegenLevel != REGEN_LEVEL_IPEDAL && prevLevel != REGEN_LEVEL_IPEDAL) {
+                            if (classified == REGEN_LEVEL_0) {
+                                autoRegenBaseLevel = REGEN_LEVEL_0;
+                                if (curSpd >= 24.5f && chordDtMs >= 950L && chordDecel < 0.36f) {
+                                    confirmedZeroRegenCoast = true;
+                                }
+                                if (prevLevel >= REGEN_LEVEL_2) {
+                                    autoRegenActive = true;
                                     consecutiveFixedHighCoasts = 0;
+                                }
+                            } else if (confirmedZeroRegenCoast && classified >= REGEN_LEVEL_2
+                                    && smoothedPollIntervalMs < 350.0f && curSpd >= 24.5f
+                                    && chordDtMs >= 950L && consecutiveFixedHighCoasts == 0) {
+                                autoRegenActive = true;
+                            }
+                            if (curSpd >= 24.5f && chordDtMs >= 950L) {
+                                if (chordDecel < coastMinChordDecel) coastMinChordDecel = chordDecel;
+                                if (chordDecel > coastMaxChordDecel) coastMaxChordDecel = chordDecel;
+                                if ((coastMinChordDecel < 0.52f && chordDecel >= 0.90f && (chordDecel - coastMinChordDecel) >= 0.45f)
+                                        || (coastMaxChordDecel >= 1.08f && chordDecel <= (coastMaxChordDecel - 0.45f))) {
+                                    autoRegenActive = true;
+                                    consecutiveFixedHighCoasts = 0;
+                                }
+                                if (!coastRecordedHigh && (effPollMs - coastStartMs) >= 1600L && chordDecel >= 0.85f) {
+                                    coastRecordedHigh = true;
+                                    if (coastMinChordDecel >= 0.78f) {
+                                        consecutiveFixedHighCoasts++;
+                                        if (consecutiveFixedHighCoasts >= 3) {
+                                            autoRegenActive = false;
+                                            confirmedZeroRegenCoast = false;
+                                        }
+                                    } else {
+                                        consecutiveFixedHighCoasts = 0;
+                                    }
                                 }
                             }
                         }
@@ -1280,9 +1341,13 @@ public final class BrakeEvaluator {
                             && (histTimeMs[histCount - 1] - histTimeMs[histCount - 2]) >= 500L;
                     if (legacyCoarsePoll && decelUpdated && lastRawDecelMps2 >= 1.50f) {
                         inferredRegenLevel = REGEN_LEVEL_IPEDAL;
+                        autoRegenActive = false;
+                        confirmedZeroRegenCoast = false;
                     }
                 } else if ((effPollMs - ipedalLowSpdSinceMs) >= IPEDAL_LOW_SPD_CONFIRM_MS) {
                     inferredRegenLevel = REGEN_LEVEL_IPEDAL;
+                    autoRegenActive = false;
+                    confirmedZeroRegenCoast = false;
                 }
             } else {
                 ipedalLowSpdSinceMs = -1L;
@@ -1301,6 +1366,7 @@ public final class BrakeEvaluator {
                 } else if ((effPollMs - ipedalCruiseSinceMs) >= IPEDAL_CRUISE_CONFIRM_MS) {
                     inferredRegenLevel = REGEN_LEVEL_IPEDAL;
                     autoRegenActive = false;
+                    confirmedZeroRegenCoast = false;
                 }
             } else {
                 ipedalCruiseSinceMs = -1L;
@@ -1315,6 +1381,7 @@ public final class BrakeEvaluator {
                 } else if ((effPollMs - ipedalLaunchSinceMs) >= IPEDAL_LAUNCH_CONFIRM_MS) {
                     inferredRegenLevel = REGEN_LEVEL_IPEDAL;
                     autoRegenActive = false;
+                    confirmedZeroRegenCoast = false;
                 }
             } else {
                 ipedalLaunchSinceMs = -1L;

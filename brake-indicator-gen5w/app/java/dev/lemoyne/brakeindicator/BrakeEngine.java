@@ -131,6 +131,12 @@ public final class BrakeEngine {
             }
         };
         this.obdClient = new ObdBrakeClient(store);
+        this.obdClient.setDiagnosticLogger(new ObdBrakeClient.DiagnosticLogger() {
+            @Override
+            public void onDiagnostic(long monoMs, String message) {
+                recorder.recordExternalEvent(monoMs, message);
+            }
+        });
     }
 
     public void ensureStarted() {

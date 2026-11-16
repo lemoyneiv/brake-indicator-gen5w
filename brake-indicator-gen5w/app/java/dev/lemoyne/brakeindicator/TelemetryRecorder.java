@@ -182,6 +182,7 @@ public final class TelemetryRecorder {
     private int prevObdRaw = -1;
     private int prevInferredRegen = -1;
     private boolean prevSccActive;
+    private boolean prevAutoRegenActive;
 
     private long lastModelRiseMs = -1L;
     private long lastModelFallMs = -1L;
@@ -221,6 +222,7 @@ public final class TelemetryRecorder {
         prevObdRaw = -1;
         prevInferredRegen = -1;
         prevSccActive = false;
+        prevAutoRegenActive = false;
         lastModelRiseMs = -1L;
         lastModelFallMs = -1L;
         pendingObdRiseMs = -1L;
@@ -378,6 +380,7 @@ public final class TelemetryRecorder {
             prevObdRaw = obdRaw;
             prevInferredRegen = snap.inferredRegenLevel;
             prevSccActive = snap.sccActive;
+            prevAutoRegenActive = snap.autoRegenActive;
             return;
         }
 
@@ -385,6 +388,7 @@ public final class TelemetryRecorder {
         boolean obdChanged = (snap.obdFresh != prevObdFresh) || (snap.obdFresh && obdRaw != prevObdRaw);
         boolean regenChanged = (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel != prevInferredRegen);
         boolean sccChanged = (snap.sccActive != prevSccActive);
+        boolean autoRegenChanged = (snap.autoRegenActive != prevAutoRegenActive);
 
         // Edge lag Pairing (signed: positive = HMG-API model lagged behind real OBD)
         if (modelLit && !prevModelLit) {
@@ -432,9 +436,18 @@ public final class TelemetryRecorder {
                     BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)));
         }
 
+        if (autoRegenChanged) {
+            pushTransitionLine(String.format(Locale.US,
+                    "[%7.2fs] AutoRegenEst: %s (spd=%s km/h, reg=%s)",
+                    Float.valueOf(relMs / 1000.0f),
+                    snap.autoRegenActive ? "ACTIVE" : "OFF",
+                    fmtFloat(unboxFloat(snap.speedKmh), "%.1f"),
+                    BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel)));
+        }
+
         if (regenChanged) {
-            String fromLbl = BrakeEvaluator.regenLevelLabel(prevInferredRegen);
-            String toLbl = BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel);
+            String fromLbl = BrakeEvaluator.regenLevelLabel(prevInferredRegen, prevSccActive, prevAutoRegenActive);
+            String toLbl = BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive);
             pushTransitionLine(String.format(Locale.US,
                     "[%7.2fs] RegenModeEst: %s -> %s (decel=%.2f m/s^2 @ %s km/h)",
                     Float.valueOf(relMs / 1000.0f),
@@ -460,8 +473,9 @@ public final class TelemetryRecorder {
                     .append(" decel=").append(String.format(Locale.US, "%.2f", Float.valueOf(snap.decelMps2)))
                     .append(" prsr=").append(fmtFloat(unboxFloat(snap.brakePressure), "%.1f"))
                     .append(" acc=").append(fmtFloat(unboxFloat(snap.accelPedal), "%.1f"));
-            if (snap.inferredRegenLevel >= 0 || snap.sccActive) {
-                line.append(" reg=").append(BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive));
+            if (snap.inferredRegenLevel >= 0 || snap.sccActive || snap.autoRegenActive) {
+                line.append(" reg=").append(BrakeEvaluator.regenLevelLabel(
+                        snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive));
             }
             pushTransitionLine(line.toString());
         }
@@ -473,6 +487,7 @@ public final class TelemetryRecorder {
         prevObdRaw = obdRaw;
         prevInferredRegen = snap.inferredRegenLevel;
         prevSccActive = snap.sccActive;
+        prevAutoRegenActive = snap.autoRegenActive;
     }
 
     private void pushTransitionLine(String s) {
@@ -579,7 +594,7 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.7.6 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.7.7 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');

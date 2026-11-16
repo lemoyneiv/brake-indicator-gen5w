@@ -26,19 +26,20 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.6:
+ * Host JVM unit tests for v0.7.7:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
  * - ObdBrakeClient (HMG-API native @hmgapi-ble central session, sticky ADV_IND+SCAN_RSP merge, priority sorting,
  *   transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + post-WOT crest reset + Auto-Regen feather step-down + i-Pedal & SCC auto-detection,
+ *   settled L0..L3 coasting chord + first-class Auto Regen detection & speed-dependent radar hysteresis,
+ *   20 Hz flat-speed quantization ceiling, pressureLatched-gated post-brake bleed & gentle standstill feather hold,
  *   L2/L3/i-Pedal VCU torque-ramp delay, piecewise speed-dependent i-Pedal feathered braking & low-speed crawl,
  *   full-lock steering scrub compensation, Auto-Hold ON vs OFF standstill inference, <14.2 km/h creep-taper release,
  *   strong-decel throttle cancel, EPB actuator release & carryover hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
- * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, i-Pedal labels, atomic USB export)
+ * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, Auto/i-Pedal labels, atomic USB export)
  */
 public final class TestMain {
 
@@ -55,6 +56,7 @@ public final class TestMain {
         testV074IpedalFeatheredBrakingLaunchAndRamp();
         testV075LowSpeedIpedalCrawlReverseAndPostWotCoast();
         testV076AutoRegenSteeringScrubAndAutoHoldOffStandstill();
+        testV077AutoRegenDetectionHysteresisAndQuantizationDecay();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1028,8 +1030,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.6",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.6 Calibration Summary")));
+        eq("Summary banner is v0.7.7",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.7 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -1755,6 +1757,182 @@ public final class TestMain {
         }
         eq("v0.7.6 near-zero decel at 1.4% feather pedal above 25 km/h steps stale L2 back to L0",
                 Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
+    }
+
+    private static void testV077AutoRegenDetectionHysteresisAndQuantizationDecay() {
+        eq("v0.7.7 regenLevelLabel L0 Auto", "L0 (Auto)", BrakeEvaluator.regenLevelLabel(0, false, true));
+        eq("v0.7.7 regenLevelLabel L2 Auto", "L2 (Auto)", BrakeEvaluator.regenLevelLabel(2, false, true));
+        eq("v0.7.7 regenLevelLabel SCC overrides Auto", "L0 (SCC)", BrakeEvaluator.regenLevelLabel(0, true, true));
+        eq("v0.7.7 regenLevelLabel i-Pedal ignores Auto", "i-Pedal", BrakeEvaluator.regenLevelLabel(4, false, true));
+
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 1000L;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // 1. Intra-coast Auto-Regen modulation: open-road L0 coast (~0.18 m/s^2) ramping into radar L2 (~1.10 m/s^2)
+        float spd = 68.0f;
+        for (int i = 0; i < 36; i++) {
+            if (i > 0 && i % 8 == 0) spd -= 0.25f; // ~0.17 m/s^2 L0 open-road coast
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        // Lead car encountered in same coast -> radar ramps regen to ~1.12 m/s^2
+        for (int i = 0; i < 34; i++) {
+            if (i > 0 && i % 4 == 0) spd -= 0.80f; // 0.8 km/h every 200 ms = 1.11 m/s^2
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 intra-coast L0->L2 radar modulation latches autoRegenActive and REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive && snap.inferredRegenLevel >= 2 && snap.modelIlluminated));
+
+        // 2. Pressing >= 3.5% throttle in Auto Regen resets temporary radar L2/L3 back to base L0,
+        //    and subsequent open-road lift-off at 72 km/h (0.0 m/s^2) does NOT false-fire liftoffAnticipation!
+        spd = 72.4f;
+        for (int i = 0; i < 16; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 resuming throttle in Auto Regen resets temporary radar level back to L0",
+                Integer.valueOf(0), Integer.valueOf(snap.inferredRegenLevel));
+        boolean anyOpenRoadLiftoffFp = false;
+        for (int i = 0; i < 18; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) anyOpenRoadLiftoffFp = true;
+            t += 50L;
+        }
+        eq("v0.7.7 open-road 0%-pedal lift-off in Auto Regen produces zero liftoffAnticipation FPs",
+                Boolean.FALSE, Boolean.valueOf(anyOpenRoadLiftoffFp));
+
+        // 3. Auto-Regen moderate radar braking (15..48 km/h): ~0.89 m/s^2 lights REGEN_DECEL and holds down to ~0.67 m/s^2,
+        //    whereas above 48 km/h, tapering below 0.75 m/s^2 releases promptly.
+        t += 3000L;
+        spd = 34.0f;
+        for (int i = 0; i < 6; i++) {
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 0; i < 19; i++) {
+            if (i % 3 == 0) spd -= 0.48f; // 0.48 km/h every 150 ms = 0.89 m/s^2
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 Auto-Regen ~0.89 m/s^2 radar braking at 32 km/h lights REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+        for (int i = 1; i <= 18; i++) {
+            if (i % 3 == 0) spd -= 0.36f; // 0.36 km/h every 150 ms = exact 0.67 m/s^2 (>= 0.60 m/s^2 mid-speed hold)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 Auto-Regen holds REGEN_DECEL at ~0.67 m/s^2 between 15 and 48 km/h",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+
+        // Sub-latch 0.20 bar brake brush during active 1.35 m/s^2 regen must NOT trigger postFootBrakeDecelBleed:
+        for (int i = 1; i <= 12; i++) {
+            if (i % 3 == 0) spd -= 0.80f; // ~1.48 m/s^2
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.20f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 sub-latch 0.20 bar pedal brush does NOT drop active REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // Above 48 km/h in Auto Regen, tapering motor decel to ~0.62 m/s^2 (< 0.75 m/s^2) releases REGEN_DECEL promptly:
+        t += 3000L;
+        spd = 58.0f;
+        for (int i = 0; i < 6; i++) {
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 14.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 18; i++) {
+            if (i % 3 == 0) spd -= 0.62f; // ~1.15 m/s^2 total (~1.06 m/s^2 motor) -> lights REGEN_DECEL
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 21; i++) {
+            if (i % 3 == 0) spd -= 0.37f; // ~0.68 m/s^2 total (~0.60 m/s^2 motor < 0.75 m/s^2)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.7 Auto-Regen releases REGEN_DECEL below 0.75 m/s^2 motor decel at >= 48 km/h",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 4. 20 Hz flat-speed quantization ceiling & gentle standstill feather hold:
+        //    Braking at ~1.9 m/s^2 to 12.1 km/h then releasing to flat 12.1 km/h must bound decelMps2 and never false-promote i-Pedal.
+        BrakeEvaluator evQuant = new BrakeEvaluator();
+        long tq = 1000L;
+        float qSpd = 18.5f;
+        for (int i = 0; i < 20; i++) {
+            if (i > 0 && i % 3 == 0) qSpd -= 0.80f;
+            snap = evQuant.evaluate(cfg, new BrakeEvaluator.Input(
+                    tq, 2.4f, qSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tq));
+            tq += 50L;
+        }
+        // Release foot brake cleanly while speed sits flat at qSpd (~13.7 km/h -> 12.1 km/h) for 500 ms:
+        for (int i = 0; i < 10; i++) {
+            snap = evQuant.evaluate(cfg, new BrakeEvaluator.Input(
+                    tq, 0.0f, qSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tq));
+            tq += 50L;
+        }
+        eq("v0.7.7 20 Hz flat-speed ceiling decays stale decel (< 0.70 m/s^2) and prevents false i-Pedal promotion",
+                Boolean.TRUE, Boolean.valueOf(snap.decelMps2 < 0.70f && snap.inferredRegenLevel != 4));
+
+        // Gentle < 0.85 bar feather stop (0.50 -> 0.30 -> 0.22 bar at 0.0 km/h) holds BRAKE_PRESSURE down to 0.18 bar:
+        qSpd = 2.4f;
+        for (int i = 0; i < 8; i++) {
+            if (i % 2 == 1 && qSpd > 0.0f) qSpd = Math.max(0.0f, qSpd - 0.80f);
+            float prsr = (i < 3) ? 0.50f : 0.22f;
+            snap = evQuant.evaluate(cfg, new BrakeEvaluator.Input(
+                    tq, prsr, qSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(qSpd > 0.1f), 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tq));
+            tq += 50L;
+        }
+        eq("v0.7.7 gentle <=0.85 bar feather stop holds BRAKE_PRESSURE at 0.22 bar at 0.0 km/h",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "BRAKE_PRESSURE".equals(snap.modelSource)));
+
+        // 5. Exiting Auto Regen cleanly after 3 consecutive fixed manual L2/L3 coasts:
+        for (int c = 0; c < 3; c++) {
+            t += 3000L;
+            spd = 58.0f;
+            for (int i = 0; i < 10; i++) {
+                ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, 0.0f, spd, 18.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                t += 50L;
+            }
+            for (int i = 1; i <= 42; i++) {
+                if (i % 3 == 0) spd -= 0.75f; // steady ~1.39 m/s^2 fixed manual L3 coast throughout
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                t += 50L;
+            }
+        }
+        eq("v0.7.7 3 consecutive fixed high-decel manual coasts exit autoRegenActive cleanly",
+                Boolean.FALSE, Boolean.valueOf(snap.autoRegenActive));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

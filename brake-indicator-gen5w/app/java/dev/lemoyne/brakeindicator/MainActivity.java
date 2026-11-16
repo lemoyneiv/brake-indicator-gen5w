@@ -442,8 +442,8 @@ public final class MainActivity extends Activity
           .append(fmtObjFloat(snap.accelPedal, "%.1f")).append("%\n");
 
         sb.append("Detected Regen Mode   : ")
-          .append((snap.inferredRegenLevel >= 0 || snap.sccActive)
-                  ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive)
+          .append((snap.inferredRegenLevel >= 0 || snap.sccActive || snap.autoRegenActive)
+                  ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive)
                   : "learning (coast >= 21 km/h)")
           .append('\n');
 

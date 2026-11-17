@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.8:
+ * Host JVM unit tests for v0.7.9:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -34,9 +34,11 @@ import java.util.Map;
  *   reconnect 0x16 backoff suppression, diagnostic transition logging, sticky ADV_IND+SCAN_RSP merge,
  *   priority sorting, transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
- *   settled L0..L3 coasting chord + first-class Auto Regen detection, light throttle feathering, speed-band hysteresis,
- *   strict i-Pedal vs Auto mutual exclusion, early >=1.5 km/h brake-release standstill clear,
- *   20 Hz flat-speed quantization ceiling, pressureLatched-gated post-brake bleed & gentle standstill feather hold,
+ *   settled L0..L3 coasting chord + first-class Auto Regen detection & traffic-stop stability,
+ *   light-throttle cold-onset guard & sustained feather release, highway <1.7% deadzone & active R13-H strong-decel hold,
+ *   intersection trail-braking turn scrub suppression, strict i-Pedal vs Auto mutual exclusion,
+ *   early >=1.5 km/h brake-release standstill clear, 20 Hz flat-speed quantization ceiling,
+ *   pressureLatched-gated post-brake bleed & gentle standstill feather hold,
  *   L2/L3/i-Pedal VCU torque-ramp delay, piecewise speed-dependent i-Pedal feathered braking & low-speed crawl,
  *   full-lock steering scrub compensation, Auto-Hold ON vs OFF standstill inference, <14.2 km/h creep-taper release,
  *   strong-decel throttle cancel, EPB actuator release & carryover hold)
@@ -60,6 +62,7 @@ public final class TestMain {
         testV076AutoRegenSteeringScrubAndAutoHoldOffStandstill();
         testV077AutoRegenDetectionHysteresisAndQuantizationDecay();
         testV078BleScanReconnectAndAutoRegenFeatherCalibration();
+        testV079AutoRegenTrafficStabilityThrottleOnsetAndTurnBleed();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1033,8 +1036,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.8",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.8 Calibration Summary")));
+        eq("Summary banner is v0.7.9",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.9 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -2174,6 +2177,191 @@ public final class TestMain {
         }
         eq("v0.7.8 early foot-brake release at 2.4 km/h rolling unbraked to 0.0 km/h does NOT false-latch STANDSTILL_HOLD",
                 Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+    }
+
+    private static void testV079AutoRegenTrafficStabilityThrottleOnsetAndTurnBleed() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 500000L;
+        float spd = 62.0f;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // 1. Learn Auto Regen via settled L0 coast (~0.22 m/s^2) -> radar L2 coast (~1.08 m/s^2):
+        for (int i = 0; i <= 36; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.08f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 30; i++) {
+            if (i % 2 == 0) spd -= 0.42f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 baseline Auto Regen latched", Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive));
+
+        // 4 traffic radar high-decel coasts separated by >=3.5% throttle (which resets inferredRegenLevel to 0)
+        // and open-road L0/L1 coasts MUST NOT accumulate consecutiveFixedHighCoasts >= 3 or drop autoRegenActive:
+        boolean anyAutoDropout = false;
+        for (int stop = 0; stop < 4; stop++) {
+            // Accelerate back up with 14% throttle (resets inferredRegenLevel -> 0)
+            spd = 58.0f;
+            for (int i = 0; i < 12; i++) {
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, 0.0f, spd, 14.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                if (!snap.autoRegenActive) anyAutoDropout = true;
+                t += 50L;
+            }
+            // Open-road settled L0 (even stops) or L1 (odd stops) coast while prevLevel is already 0:
+            for (int i = 1; i <= 38; i++) {
+                if (i % 2 == 0) spd -= (stop % 2 == 0 ? 0.08f : 0.24f); // ~0.16 m/s^2 L0 or ~0.60 m/s^2 L1 motor
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                if (!snap.autoRegenActive) anyAutoDropout = true;
+                t += 50L;
+            }
+            // Re-accelerate briefly, then perform two back-to-back radar L3 traffic coasts (~1.38 m/s^2):
+            for (int hc = 0; hc < 2; hc++) {
+                spd = 56.0f;
+                for (int i = 0; i < 10; i++) {
+                    snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                            t, 0.0f, spd, 14.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                            BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                    if (!snap.autoRegenActive) anyAutoDropout = true;
+                    t += 50L;
+                }
+                for (int i = 1; i <= 40; i++) {
+                    if (i % 3 == 0) spd -= 0.75f; // ~1.39 m/s^2 high-decel radar stop
+                    snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                            t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 54.0f,
+                            BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+                    if (!snap.autoRegenActive) anyAutoDropout = true;
+                    t += 50L;
+                }
+            }
+        }
+        eq("v0.7.9 AutoRegenEst stays ACTIVE across 8 radar traffic coasts interleaved with settled L0/L1 coasts",
+                Boolean.FALSE, Boolean.valueOf(anyAutoDropout));
+
+        // 2. Light-throttle cold-onset guard (!decelLatched && accVal >= 1.8%) & sustained >=350ms light-throttle release:
+        t += 2000L;
+        spd = 54.0f;
+        for (int i = 0; i < 12; i++) {
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 52.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        // Cold uphill coast with 3.6% throttle (~1.05 m/s^2 motor decel < 1.25 m/s^2 cold-onset guard) stays OFF:
+        boolean coldThrottleFp = false;
+        for (int i = 1; i <= 18; i++) {
+            if (i % 2 == 0) spd -= 0.41f; // ~1.14 m/s^2 total (~1.06 m/s^2 motor)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 3.6f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 52.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) coldThrottleFp = true;
+            t += 50L;
+        }
+        eq("v0.7.9 cold 3.6% uphill throttle at ~1.06 m/s^2 does NOT false-fire REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(coldThrottleFp));
+
+        // Latch off-pedal radar regen (~1.12 m/s^2 motor), feather 2.8% briefly (<350 ms) at ~0.86 m/s^2 -> stays ON (>=0.78),
+        // then hold 2.8% throttle past >=350 ms + 220 ms hold at ~0.86 m/s^2 (< 1.02 m/s^2 sustained release) -> releases cleanly:
+        spd = 52.0f;
+        for (int i = 1; i <= 16; i++) {
+            if (i % 2 == 0) spd -= 0.43f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 52.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 off-pedal radar regen latches REGEN_DECEL", Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        for (int i = 1; i <= 4; i++) { // 200 ms (< 350 ms) at 2.8% pedal, ~0.86 m/s^2 motor (>= 0.78 m/s^2 brief hold)
+            if (i % 2 == 0) spd -= 0.33f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 2.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 52.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 brief <350 ms 2.8% feather keeps REGEN_DECEL ON", Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        for (int i = 1; i <= 16; i++) { // +800 ms (1000 ms total) at ~0.86 m/s^2 motor (< 1.02 m/s^2 sustained release)
+            if (i % 2 == 0) spd -= 0.33f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 2.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 52.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 sustained >=350 ms 2.8% throttle below 1.02 m/s^2 releases REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 3. Highway (>=56 km/h) <1.7% pedal deadzone onset & active R13-H >=1.18 m/s^2 strong-decel hold up to 12.8% pedal:
+        t += 2000L;
+        spd = 68.0f;
+        for (int i = 0; i < 8; i++) {
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 50.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 14; i++) {
+            if (i % 2 == 0) spd -= 0.36f; // ~1.00 m/s^2 total (~0.84 m/s^2 motor >= 0.68 m/s^2) at 1.2% deadzone pedal
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 1.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 50.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 highway >=56 km/h 1.2% pedal deadzone catches ~0.84 m/s^2 radar regen onset",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // Foot-brake at 44 km/h (~2.2 m/s^2), release foot brake and at 750..950 ms post-release (<1200 ms noRecentFootBrake)
+        // apply 10.5% throttle while radar holds ~1.55 m/s^2 straight ahead (< 12.8% active R13-H strong-decel hold):
+        t += 2000L;
+        spd = 44.0f;
+        for (int i = 1; i <= 12; i++) {
+            if (i % 2 == 0) spd -= 0.80f; // ~2.22 m/s^2
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 3.8f, spd, 0.0f, 10.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 50.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 18; i++) { // 900 ms total (< 1200 ms post-foot-brake)
+            if (i % 2 == 0) spd -= 0.58f; // ~1.61 m/s^2 (>= 1.18 m/s^2)
+            float ped = (i >= 15) ? 10.5f : 0.0f; // 0% pedal re-latches at 700 ms, then 10.5% pedal at 750..900 ms
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, ped, 10.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 50.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.9 active >=1.18 m/s^2 R13-H strong-decel holds REGEN_DECEL at 10.5% pedal right after foot-brake lift",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // 4. Intersection trail-braking turn scrub (speed >= 18 km/h, |steering| >= 80 deg) suppresses post-brake carryover:
+        t += 2500L;
+        spd = 31.0f;
+        for (int i = 1; i <= 12; i++) {
+            if (i % 2 == 0) spd -= 0.80f; // ~2.22 m/s^2 foot braking into intersection
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 4.2f, spd, 0.0f, 35.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 49.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        // Release foot brake while turning sharply (115 deg >= 80 deg) at ~25->21 km/h with ~2.05 m/s^2 lateral tire scrub:
+        boolean turnScrubFp = false;
+        for (int i = 1; i <= 16; i++) { // 800 ms (< 950 ms turn settle window)
+            if (i % 2 == 0) spd -= 0.74f; // ~2.05 m/s^2 scrub drag
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 115.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 49.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) turnScrubFp = true;
+            t += 50L;
+        }
+        eq("v0.7.9 >=80 deg intersection trail-braking turn scrub suppresses post-foot-brake REGEN_DECEL FP",
+                Boolean.FALSE, Boolean.valueOf(turnScrubFp));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

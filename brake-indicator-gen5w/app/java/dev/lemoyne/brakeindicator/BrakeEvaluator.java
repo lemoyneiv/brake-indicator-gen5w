@@ -522,6 +522,7 @@ public final class BrakeEvaluator {
     private boolean coastRecordedHigh;
     private int consecutiveFixedHighCoasts;
     private long autoRegenSustainedSinceMs = -1L;
+    private long autoLightThrottleSinceMs = -1L;
     private boolean postBrakeStepConfirmed;
     private float pressureLatchPeakBar;
     private boolean prevParkingBrake;
@@ -616,35 +617,50 @@ public final class BrakeEvaluator {
         float ipedalOnsetPct = ipedalOnsetPedalPct(in.speedKmh);
         float onsetThresh;
         float releaseThresh;
+        if (sccActive || !autoRegenActive || inferredRegenLevel == REGEN_LEVEL_IPEDAL) {
+            autoLightThrottleSinceMs = -1L;
+        }
         if (sccActive) {
             onsetThresh = BASE_ONSET_SCC_MPS2 * threshScale;
             releaseThresh = BASE_RELEASE_SCC_MPS2 * threshScale;
         } else if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
             float spdVal = in.speedKmh != null ? in.speedKmh.floatValue() : 0.0f;
             float accVal = in.accelPedal != null ? in.accelPedal.floatValue() : 0.0f;
+            if (accVal >= 2.2f) {
+                if (autoLightThrottleSinceMs < 0L) autoLightThrottleSinceMs = effPollMs;
+            } else {
+                autoLightThrottleSinceMs = -1L;
+            }
+            boolean sustainedAutoThrottle = smoothedPollIntervalMs < 350.0f
+                    && autoLightThrottleSinceMs > 0L
+                    && (effPollMs - autoLightThrottleSinceMs) >= 350L;
             boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
+            boolean recentFootBrakeMid = lastFootBrakeMs > 0L && (effPollMs - lastFootBrakeMs) < 1600L;
+            float deadzoneAccMax = spdVal >= 56.0f ? 1.7f : 0.8f;
             if (spdVal < CREEP_TAPER_RELEASE_SPEED_KMH) {
                 onsetThresh = BASE_ONSET_STANDARD_MPS2 * threshScale;
                 releaseThresh = 1.08f * threshScale;
-            } else if (accVal < 0.8f) {
+            } else if (accVal < deadzoneAccMax) {
                 if (spdVal >= 39.5f) {
                     onsetThresh = 0.68f * threshScale;
                     releaseThresh = 0.68f * threshScale;
                 } else {
                     boolean settledAutoMidTaper = smoothedPollIntervalMs < 350.0f
-                            && zeroPedalLiftStartMs > 0L
-                            && (effPollMs - zeroPedalLiftStartMs) >= 2050L;
+                            && (recentFootBrakeMid
+                                    || (zeroPedalLiftStartMs > 0L && (effPollMs - zeroPedalLiftStartMs) >= 2050L));
                     onsetThresh = 0.88f * threshScale;
                     releaseThresh = (settledAutoMidTaper ? 0.88f : 0.64f) * threshScale;
                 }
             } else if (noRecentFootBrake && accVal < 4.4f) {
-                onsetThresh = (spdVal >= 48.0f ? 0.86f : 0.84f) * threshScale;
-                releaseThresh = 0.78f * threshScale;
+                onsetThresh = (!decelLatched && accVal >= 1.8f)
+                        ? ((accVal >= 3.2f ? 1.25f : BASE_ONSET_STANDARD_MPS2) * threshScale)
+                        : ((sustainedAutoThrottle ? 1.02f : (spdVal >= 48.0f ? 0.86f : 0.84f)) * threshScale);
+                releaseThresh = (sustainedAutoThrottle ? 1.02f : 0.78f) * threshScale;
             } else if (noRecentFootBrake && spdVal >= 48.0f && accVal < 9.6f) {
-                onsetThresh = 1.02f * threshScale;
-                releaseThresh = 0.88f * threshScale;
+                onsetThresh = (!decelLatched ? 1.25f : (sustainedAutoThrottle ? 1.08f : 1.02f)) * threshScale;
+                releaseThresh = (sustainedAutoThrottle ? 1.08f : 0.88f) * threshScale;
             } else {
-                onsetThresh = BASE_ONSET_STANDARD_MPS2 * threshScale;
+                onsetThresh = (accVal >= 3.2f ? 1.25f : BASE_ONSET_STANDARD_MPS2) * threshScale;
                 releaseThresh = 0.75f * threshScale;
             }
         } else if (inferredRegenLevel >= REGEN_LEVEL_2) {
@@ -687,15 +703,18 @@ public final class BrakeEvaluator {
         }
 
         float evalDecelMps2 = sccActive ? smoothedDecelMps2 : motorDecelMps2;
+        float evalAbsSteer = in.steeringAngleDeg != null ? Math.abs(in.steeringAngleDeg.floatValue()) : 0.0f;
         float releaseAccelPct;
         if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
             boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
-            if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 48.0f && evalDecelMps2 >= 0.88f * threshScale) {
+            if (decelLatched && in.speedKmh != null && in.speedKmh >= 22.0f && evalAbsSteer < 85.0f && evalDecelMps2 >= 1.18f * threshScale) {
+                releaseAccelPct = 12.8f;
+            } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 48.0f && evalDecelMps2 >= 0.88f * threshScale) {
                 releaseAccelPct = 9.6f;
             } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 15.0f && evalDecelMps2 >= 0.78f * threshScale) {
                 releaseAccelPct = 4.4f;
             } else {
-                releaseAccelPct = 1.2f;
+                releaseAccelPct = (in.speedKmh != null && in.speedKmh >= 56.0f) ? 1.7f : 1.2f;
             }
         } else {
             releaseAccelPct = regenReleaseAccelPct(inferredRegenLevel, sccActive, in.speedKmh);
@@ -726,7 +745,7 @@ public final class BrakeEvaluator {
         boolean autoRegenSustainedBraking = false;
         if (!sccActive && autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL && canRegenBrake
                 && in.speedKmh >= 39.5f
-                && (in.accelPedal == null || in.accelPedal < 0.8f)
+                && (in.accelPedal == null || in.accelPedal < (in.speedKmh >= 56.0f ? 1.7f : 0.8f))
                 && motorDecelMps2 >= 0.60f * threshScale) {
             if (autoRegenSustainedSinceMs < 0L) {
                 autoRegenSustainedSinceMs = effPollMs;
@@ -816,8 +835,9 @@ public final class BrakeEvaluator {
         float paddleStrongCancelPct;
         if (autoRegenActive && inferredRegenLevel != REGEN_LEVEL_IPEDAL) {
             boolean noRecentFootBrake = lastFootBrakeMs < 0L || (effPollMs - lastFootBrakeMs) >= 1200L;
-            if (evalDecelMps2 >= 2.2f * threshScale) {
-                paddleStrongCancelPct = 12.0f;
+            if (evalDecelMps2 >= 2.2f * threshScale
+                    || (decelLatched && in.speedKmh != null && in.speedKmh >= 22.0f && evalAbsSteer < 85.0f && evalDecelMps2 >= 1.18f * threshScale)) {
+                paddleStrongCancelPct = 12.8f;
             } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 48.0f && evalDecelMps2 >= 0.88f * threshScale) {
                 paddleStrongCancelPct = 9.6f;
             } else if (noRecentFootBrake && in.speedKmh != null && in.speedKmh >= 15.0f && evalDecelMps2 >= 0.78f * threshScale) {
@@ -852,7 +872,9 @@ public final class BrakeEvaluator {
                 && in.accelPedal >= releaseAccelPct
                 && evalDecelMps2 < mildRegenCeiling;
 
+        boolean intersectionTurnScrub = in.speedKmh != null && in.speedKmh >= 18.0f && evalAbsSteer >= 80.0f;
         boolean highDecelAutoRegenContinuation = in.speedKmh != null
+                && !intersectionTurnScrub
                 && (in.accelPedal == null || in.accelPedal < 0.8f)
                 && ((in.speedKmh >= 20.0f && motorDecelMps2 >= 1.98f * threshScale)
                         || (postBrakeStepConfirmed && in.speedKmh >= 12.0f && motorDecelMps2 >= 1.05f * threshScale));
@@ -864,10 +886,11 @@ public final class BrakeEvaluator {
                         && inferredRegenLevel >= REGEN_LEVEL_2
                         && zeroPedalAboveLiftMin)
                 || highDecelAutoRegenContinuation;
+        long postBrakeSettleWindowMs = intersectionTurnScrub ? 950L : POST_BRAKE_REGEN_SETTLE_MS;
         boolean postFootBrakeDecelBleed = !pressureLatched
                 && !strongZeroPedalRegenMode
                 && lastFootBrakeMs > 0L
-                && (effPollMs - lastFootBrakeMs) < POST_BRAKE_REGEN_SETTLE_MS;
+                && (effPollMs - lastFootBrakeMs) < postBrakeSettleWindowMs;
 
         if (!canRegenBrake
                 || throttleCancelsPaddleRegen
@@ -1165,6 +1188,7 @@ public final class BrakeEvaluator {
             confirmedZeroRegenCoast = false;
             autoRegenBaseLevel = REGEN_LEVEL_0;
             autoRegenSustainedSinceMs = -1L;
+            autoLightThrottleSinceMs = -1L;
             featheredIpedalSinceMs = -1L;
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
@@ -1183,6 +1207,7 @@ public final class BrakeEvaluator {
             coastMaxChordDecel = -Float.MAX_VALUE;
             coastRecordedHigh = false;
             autoRegenSustainedSinceMs = -1L;
+            autoLightThrottleSinceMs = -1L;
             featheredIpedalSinceMs = -1L;
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
@@ -1270,13 +1295,18 @@ public final class BrakeEvaluator {
                         if (inferredRegenLevel != REGEN_LEVEL_IPEDAL && prevLevel != REGEN_LEVEL_IPEDAL) {
                             if (classified == REGEN_LEVEL_0) {
                                 autoRegenBaseLevel = REGEN_LEVEL_0;
-                                if (curSpd >= 24.5f && chordDtMs >= 950L && chordDecel < 0.36f) {
-                                    confirmedZeroRegenCoast = true;
+                                if (curSpd >= 24.5f && chordDtMs >= 950L) {
+                                    consecutiveFixedHighCoasts = 0;
+                                    if (chordDecel < 0.36f) {
+                                        confirmedZeroRegenCoast = true;
+                                    }
                                 }
                                 if (prevLevel >= REGEN_LEVEL_2) {
                                     autoRegenActive = true;
                                     consecutiveFixedHighCoasts = 0;
                                 }
+                            } else if (classified == REGEN_LEVEL_1 && curSpd >= 24.5f && chordDtMs >= 950L) {
+                                consecutiveFixedHighCoasts = 0;
                             } else if (confirmedZeroRegenCoast && classified >= REGEN_LEVEL_2
                                     && smoothedPollIntervalMs < 350.0f && curSpd >= 24.5f
                                     && chordDtMs >= 950L && consecutiveFixedHighCoasts == 0) {
@@ -1289,10 +1319,12 @@ public final class BrakeEvaluator {
                                         || (coastMaxChordDecel >= 1.08f && chordDecel <= (coastMaxChordDecel - 0.45f))) {
                                     autoRegenActive = true;
                                     consecutiveFixedHighCoasts = 0;
+                                } else if (coastRecordedHigh && (coastMaxChordDecel - coastMinChordDecel) >= 0.36f) {
+                                    consecutiveFixedHighCoasts = 0;
                                 }
                                 if (!coastRecordedHigh && (effPollMs - coastStartMs) >= 1600L && chordDecel >= 0.85f) {
                                     coastRecordedHigh = true;
-                                    if (coastMinChordDecel >= 0.78f) {
+                                    if (coastMinChordDecel >= 0.78f && (coastMaxChordDecel - coastMinChordDecel) < 0.36f) {
                                         consecutiveFixedHighCoasts++;
                                         if (consecutiveFixedHighCoasts >= 3) {
                                             autoRegenActive = false;

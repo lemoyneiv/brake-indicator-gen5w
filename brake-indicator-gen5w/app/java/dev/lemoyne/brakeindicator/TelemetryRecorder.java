@@ -594,7 +594,7 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.7.9 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.7.10 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');

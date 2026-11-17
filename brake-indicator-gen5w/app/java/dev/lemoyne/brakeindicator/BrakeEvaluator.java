@@ -8,9 +8,9 @@ package dev.lemoyne.brakeindicator;
  * Control (`SCC`) auto-detection.
  *
  * Calibrated directly against multi-mode city, arterial, Auto-Hold ON/OFF, Auto Regen
- * (`Smart Recuperation`), drive-through stop-and-go, Smart Cruise Control, and `70 mph`
- * (`112.6 km/h`) highway E-GMP drive logs on both `50-100 ms` patched HMG-API `Hub`s and
- * `650 ms` legacy KitKat `Hub`s:
+ * (`Smart Recuperation`), drive-through stop-and-go, Smart Cruise Control, mid-drive
+ * `Auto -> i-Pedal` transitions, and `84 mph` (`135.2 km/h`) highway E-GMP drive logs on both
+ * `50-100 ms` patched HMG-API `Hub`s and `650 ms` legacy KitKat `Hub`s:
  * - Aligns `-dv/dt` updates to actual HMG-API poll timestamps (`hmgSampleElapsedMs`) and
  *   suppresses `< 560 ms` `0.8 km/h` cluster speed-quantization repeats.
  * - Compensates passive aerodynamic drag excess above `36 km/h` (`10 m/s`) and low-speed
@@ -19,8 +19,9 @@ package dev.lemoyne.brakeindicator;
  *   nor false-trigger UN ECE R13-H motor-torque brake-lamp estimation.
  * - Uses a settled `>= 21 km/h` history-ring coasting chord (`1.05-1.95 s` preferred) to
  *   separate `L0`, `L1`, `L2`, and `L3+`, steps down stale Auto-Regen `L2/L3 -> L0` on
- *   near-zero `< 2%` feather coasting, and distinguishes `i-Pedal` (`4`) from `L3` (`3`)
- *   via low-speed full-stop regen and urban neutral-pedal signatures.
+ *   near-zero `< 2%` feather coasting, and distinguishes `i-Pedal` (`4`) from `L3` (`3`) /
+ *   `Auto Regen` via low-speed full-stop regen, `16-105 km/h` neutral-pedal cruise, and
+ *   sustained feathered one-pedal braking signatures.
  * - Automatically detects Smart Cruise Control (`sccActive`) from settled zero-pedal
  *   acceleration or sustained zero-pedal cruise (with an extended `L0` downgrade guard),
  *   freezing driver paddle regen inference and applying SCC braking thresholds until cancelled.
@@ -67,14 +68,18 @@ public final class BrakeEvaluator {
     private static final float ZERO_PEDAL_HIGH_REGEN_RELEASE_MPS2 = 0.42f;
     private static final float CREEP_TAPER_RELEASE_SPEED_KMH = 14.2f;
 
-    // Speed-dependent i-Pedal one-pedal braking map (5.5% <= 5 km/h -> 16.0% >= 55 km/h onset;
-    // 11.2% <= 8 km/h -> 18.6% >= 55 km/h release; 12.2% coarse-poll legacy Hub onset floor):
+    // Speed-dependent i-Pedal one-pedal braking map (5.5% <= 5 km/h -> 16.0% @ 55 km/h -> 22.6% >= 125 km/h onset;
+    // 11.2% <= 8 km/h -> 18.6% @ 55 km/h -> 24.8% >= 92 km/h release; 12.2% coarse-poll legacy Hub onset floor):
     private static final float IPEDAL_ONSET_MIN_PCT = 12.2f;
     private static final float IPEDAL_ONSET_MAX_PCT = 16.0f;
+    private static final float IPEDAL_ONSET_HWY_85_PCT = 21.0f;
+    private static final float IPEDAL_ONSET_HWY_MAX_PCT = 22.6f;
     private static final float IPEDAL_RELEASE_MIN_PCT = 16.8f;
     private static final float IPEDAL_RELEASE_MAX_PCT = 18.6f;
+    private static final float IPEDAL_RELEASE_HWY_MAX_PCT = 24.8f;
     private static final float IPEDAL_FEATHER_IMMEDIATE_DECEL_MPS2 = 0.88f;
     private static final float IPEDAL_FEATHER_MIN_DECEL_MPS2 = 0.22f;
+    private static final float IPEDAL_FEATHER_HWY_MIN_DECEL_MPS2 = 0.58f;
     private static final float IPEDAL_FEATHER_HOLD_DECEL_MPS2 = 0.20f;
     private static final long IPEDAL_FEATHER_CONFIRM_MS = 220L;
     private static final long IPEDAL_FEATHER_SETTLED_CONFIRM_MS = 450L;
@@ -108,9 +113,11 @@ public final class BrakeEvaluator {
     private static final long MAX_WINDOW_MS = 2000L;
     private static final int SPEED_HISTORY_CAP = 24;
 
-    private static final float MAX_REGEN_ACCEL_PEDAL = 25.0f;
-    /** Any deliberate throttle press (>= 1.5%) or creep (>= 0.7 km/h) releases standstill hold. */
-    private static final float STANDSTILL_RELEASE_ACCEL = 1.5f;
+    private static final float MAX_REGEN_ACCEL_PEDAL = 27.5f;
+    /** Any deliberate throttle press (>= 1.0%) or creep (>= 0.7 km/h) releases standstill hold. */
+    private static final float STANDSTILL_RELEASE_ACCEL = 1.0f;
+    /** At 0 km/h in i-Pedal, VCU engages standstill lamp hold once pedal drops below 0.6% (0.0-0.4%). */
+    private static final float STANDSTILL_IPEDAL_LATCH_ACCEL = 0.6f;
     private static final float STANDSTILL_SPEED_MAX_KMH = 0.7f;
     private static final long STANDSTILL_ARM_WINDOW_MS = 3000L;
 
@@ -135,7 +142,10 @@ public final class BrakeEvaluator {
     private static final float IPEDAL_LOW_SPD_DECEL_MPS2 = 1.35f;
     private static final long IPEDAL_LOW_SPD_CONFIRM_MS = 250L;
     private static final float IPEDAL_CRUISE_MAX_SPD_KMH = 56.0f;
+    private static final float IPEDAL_HWY_CRUISE_MAX_SPD_KMH = 105.0f;
     private static final long IPEDAL_CRUISE_CONFIRM_MS = 1100L;
+    private static final long IPEDAL_HWY_CRUISE_CONFIRM_MS = 1650L;
+    private static final long IPEDAL_FEATHER_PROMOTE_CONFIRM_MS = 1150L;
     private static final long IPEDAL_LAUNCH_CONFIRM_MS = 1350L;
     private static final long CREEP_TAPER_CONFIRM_MS = 780L;
     private static final long IPEDAL_LOW_PEDAL_CRUISE_CONFIRM_MS = 1200L;
@@ -509,6 +519,7 @@ public final class BrakeEvaluator {
     private long ipedalLowSpdSinceMs = -1L;
     private long ipedalCruiseSinceMs = -1L;
     private long ipedalLaunchSinceMs = -1L;
+    private long ipedalFeatherPromoteSinceMs = -1L;
     private long creepTaperSinceMs = -1L;
     private long lowPedalCruiseSinceMs = -1L;
     private int inferredRegenLevel = REGEN_LEVEL_UNKNOWN;
@@ -664,13 +675,13 @@ public final class BrakeEvaluator {
                 releaseThresh = 0.75f * threshScale;
             }
         } else if (inferredRegenLevel >= REGEN_LEVEL_2) {
-            boolean lowSpdAboveIpedalOnset = inferredRegenLevel == REGEN_LEVEL_IPEDAL
+            boolean aboveIpedalOnset = inferredRegenLevel == REGEN_LEVEL_IPEDAL
                     && smoothedPollIntervalMs < 350.0f
                     && in.speedKmh != null
-                    && in.speedKmh < 20.0f
+                    && (in.speedKmh < 20.0f || (!decelLatched && in.speedKmh >= 50.0f))
                     && in.accelPedal != null
                     && in.accelPedal > (ipedalOnsetPct + 0.8f);
-            onsetThresh = (lowSpdAboveIpedalOnset ? BASE_ONSET_STANDARD_MPS2 : BASE_ONSET_HIGH_REGEN_MPS2) * threshScale;
+            onsetThresh = (aboveIpedalOnset ? BASE_ONSET_STANDARD_MPS2 : BASE_ONSET_HIGH_REGEN_MPS2) * threshScale;
             if (inferredRegenLevel != REGEN_LEVEL_IPEDAL
                     && smoothedPollIntervalMs < 350.0f
                     && in.speedKmh != null
@@ -809,7 +820,9 @@ public final class BrakeEvaluator {
             long featherMs = effPollMs - featheredIpedalSinceMs;
             long reqFeatherConfirmMs = coarseFeatherHub ? 0L : IPEDAL_FEATHER_CONFIRM_MS;
             float minFeatherDecel = IPEDAL_FEATHER_MIN_DECEL_MPS2;
-            if (!coarseFeatherHub && in.speedKmh < 7.0f && in.accelPedal >= 3.2f) {
+            if (!coarseFeatherHub && in.accelPedal > IPEDAL_ONSET_MAX_PCT) {
+                minFeatherDecel = IPEDAL_FEATHER_HWY_MIN_DECEL_MPS2;
+            } else if (!coarseFeatherHub && in.speedKmh < 7.0f && in.accelPedal >= 3.2f) {
                 minFeatherDecel = 0.52f;
             } else if (!coarseFeatherHub && !decelLatched && in.speedKmh < 4.5f && lastFootBrakeMs > 0L
                     && (effPollMs - lastFootBrakeMs) < 1200L) {
@@ -825,7 +838,7 @@ public final class BrakeEvaluator {
             } else if ((coarseFeatherHub || (in.speedKmh >= 9.0f && (in.speedKmh >= 14.5f || in.accelPedal >= 1.0f) && featherMs <= 1200L))
                     && featherMs >= IPEDAL_FEATHER_SETTLED_CONFIRM_MS
                     && smoothedDecelMps2 >= 0.0f
-                    && in.accelPedal <= (effIpedalOnsetPct - (in.speedKmh < 18.0f ? 0.1f : 1.2f))) {
+                    && in.accelPedal <= Math.min(IPEDAL_ONSET_MAX_PCT, effIpedalOnsetPct) - (in.speedKmh < 18.0f ? 0.1f : 1.2f)) {
                 featheredIpedal = true;
             }
         } else {
@@ -996,7 +1009,8 @@ public final class BrakeEvaluator {
                 || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
             standstillLatched = false;
         } else if (standstillLatched
-                || inferredRegenLevel == REGEN_LEVEL_IPEDAL
+                || (inferredRegenLevel == REGEN_LEVEL_IPEDAL
+                        && (in.accelPedal == null || in.accelPedal < STANDSTILL_IPEDAL_LATCH_ACCEL))
                 || (lastBrakingNearStopMs > 0L && in.nowMs - lastBrakingNearStopMs <= STANDSTILL_ARM_WINDOW_MS)) {
             standstillLatched = true;
         }
@@ -1073,7 +1087,15 @@ public final class BrakeEvaluator {
         if (spd < 24.0f) {
             return 11.0f + (13.4f - 11.0f) * clamp01((spd - 17.0f) / 7.0f);
         }
-        return 13.4f + (IPEDAL_ONSET_MAX_PCT - 13.4f) * clamp01((spd - 24.0f) / 31.0f);
+        if (spd < 55.0f) {
+            return 13.4f + (IPEDAL_ONSET_MAX_PCT - 13.4f) * clamp01((spd - 24.0f) / 31.0f);
+        }
+        if (spd < 85.0f) {
+            return IPEDAL_ONSET_MAX_PCT
+                    + (IPEDAL_ONSET_HWY_85_PCT - IPEDAL_ONSET_MAX_PCT) * clamp01((spd - 55.0f) / 30.0f);
+        }
+        return IPEDAL_ONSET_HWY_85_PCT
+                + (IPEDAL_ONSET_HWY_MAX_PCT - IPEDAL_ONSET_HWY_85_PCT) * clamp01((spd - 85.0f) / 40.0f);
     }
 
     public static float ipedalReleasePedalPct(Float speedKmh) {
@@ -1081,8 +1103,14 @@ public final class BrakeEvaluator {
         if (spd < 21.0f) {
             return 11.2f + (IPEDAL_RELEASE_MIN_PCT - 11.2f) * clamp01((spd - 8.0f) / 13.0f);
         }
-        return IPEDAL_RELEASE_MIN_PCT
-                + (IPEDAL_RELEASE_MAX_PCT - IPEDAL_RELEASE_MIN_PCT) * clamp01((spd - 25.0f) / 30.0f);
+        if (spd < 55.0f) {
+            return IPEDAL_RELEASE_MIN_PCT
+                    + (IPEDAL_RELEASE_MAX_PCT - IPEDAL_RELEASE_MIN_PCT) * clamp01((spd - 25.0f) / 30.0f);
+        }
+        if (spd < 60.0f) {
+            return IPEDAL_RELEASE_MAX_PCT + (19.0f - IPEDAL_RELEASE_MAX_PCT) * clamp01((spd - 55.0f) / 5.0f);
+        }
+        return 19.0f + (IPEDAL_RELEASE_HWY_MAX_PCT - 19.0f) * clamp01((spd - 60.0f) / 32.0f);
     }
 
     private static float ipedalStrongCancelPedalPct(Float speedKmh) {
@@ -1193,6 +1221,7 @@ public final class BrakeEvaluator {
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
             ipedalLaunchSinceMs = -1L;
+            ipedalFeatherPromoteSinceMs = -1L;
             creepTaperSinceMs = -1L;
             lowPedalCruiseSinceMs = -1L;
             lowDecelFeatherCoastSinceMs = -1L;
@@ -1212,6 +1241,7 @@ public final class BrakeEvaluator {
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
             ipedalLaunchSinceMs = -1L;
+            ipedalFeatherPromoteSinceMs = -1L;
             creepTaperSinceMs = -1L;
             lowPedalCruiseSinceMs = -1L;
             lowDecelFeatherCoastSinceMs = -1L;
@@ -1385,23 +1415,50 @@ public final class BrakeEvaluator {
                 ipedalLowSpdSinceMs = -1L;
             }
 
-            // 2) High neutral cruise / gentle creep-up throttle in urban speeds (16..56 km/h) at 23..30% pedal
+            // 2) High neutral cruise / gentle creep-up throttle (16..56 km/h urban at 23..30% pedal,
+            //    or 56..105 km/h arterial/highway neutral cruise at 24..38.5% pedal)
             boolean steadyNeutralCruise = spd >= 16.0f && spd <= IPEDAL_CRUISE_MAX_SPD_KMH
                     && acc >= 23.0f && acc <= 30.0f
                     && Math.abs(smoothedDecelMps2) <= 0.15f;
             boolean gentleNeutralCreepUp = spd >= 18.0f && spd <= IPEDAL_CRUISE_MAX_SPD_KMH
                     && acc >= 23.5f && acc <= 30.0f
                     && smoothedDecelMps2 >= -0.42f && smoothedDecelMps2 <= 0.15f;
-            if (steadyNeutralCruise || gentleNeutralCreepUp) {
+            float hwyNeutralMinAcc = 24.0f + 4.0f * clamp01((spd - 56.0f) / 34.0f);
+            float hwyNeutralMaxAcc = 30.5f + 8.0f * clamp01((spd - 56.0f) / 28.0f);
+            boolean highwayNeutralCruise = spd > IPEDAL_CRUISE_MAX_SPD_KMH && spd <= IPEDAL_HWY_CRUISE_MAX_SPD_KMH
+                    && absSteerDeg < 25.0f
+                    && acc >= hwyNeutralMinAcc && acc <= hwyNeutralMaxAcc
+                    && Math.abs(smoothedDecelMps2) <= 0.15f;
+            if (steadyNeutralCruise || gentleNeutralCreepUp || highwayNeutralCruise) {
+                long reqCruiseConfirmMs = spd > IPEDAL_CRUISE_MAX_SPD_KMH
+                        ? IPEDAL_HWY_CRUISE_CONFIRM_MS : IPEDAL_CRUISE_CONFIRM_MS;
                 if (ipedalCruiseSinceMs < 0L) {
                     ipedalCruiseSinceMs = effPollMs;
-                } else if ((effPollMs - ipedalCruiseSinceMs) >= IPEDAL_CRUISE_CONFIRM_MS) {
+                } else if ((effPollMs - ipedalCruiseSinceMs) >= reqCruiseConfirmMs) {
                     inferredRegenLevel = REGEN_LEVEL_IPEDAL;
                     autoRegenActive = false;
                     confirmedZeroRegenCoast = false;
                 }
             } else {
                 ipedalCruiseSinceMs = -1L;
+            }
+
+            // 2c) Mid-drive switch to i-Pedal feathered one-pedal braking (>= 24 km/h at 13.5..22.5% pedal
+            //     while sustaining >= 0.68 m/s^2 motor regen deceleration)
+            float featherPromoteMotorDecel = smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh);
+            if (spd >= 24.0f && spd <= 125.0f
+                    && acc >= 13.5f && acc <= 22.5f
+                    && absSteerDeg < 35.0f
+                    && featherPromoteMotorDecel >= 0.68f) {
+                if (ipedalFeatherPromoteSinceMs < 0L) {
+                    ipedalFeatherPromoteSinceMs = effPollMs;
+                } else if ((effPollMs - ipedalFeatherPromoteSinceMs) >= IPEDAL_FEATHER_PROMOTE_CONFIRM_MS) {
+                    inferredRegenLevel = REGEN_LEVEL_IPEDAL;
+                    autoRegenActive = false;
+                    confirmedZeroRegenCoast = false;
+                }
+            } else {
+                ipedalFeatherPromoteSinceMs = -1L;
             }
 
             // 2b) Post-Park / pull-away urban launch in i-Pedal
@@ -1471,6 +1528,7 @@ public final class BrakeEvaluator {
             ipedalLowSpdSinceMs = -1L;
             ipedalCruiseSinceMs = -1L;
             ipedalLaunchSinceMs = -1L;
+            ipedalFeatherPromoteSinceMs = -1L;
             creepTaperSinceMs = -1L;
             lowPedalCruiseSinceMs = -1L;
             lowDecelFeatherCoastSinceMs = -1L;

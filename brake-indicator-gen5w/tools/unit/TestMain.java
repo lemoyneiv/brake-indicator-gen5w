@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.9:
+ * Host JVM unit tests for v0.7.10:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -35,6 +35,8 @@ import java.util.Map;
  *   priority sorting, transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
  *   settled L0..L3 coasting chord + first-class Auto Regen detection & traffic-stop stability,
+ *   mid-drive Auto/Paddle -> i-Pedal highway cruise & feathered braking promotion,
+ *   55-135 km/h highway i-Pedal feathered onset/release curves & 0 km/h standstill pedal hysteresis,
  *   light-throttle cold-onset guard & sustained feather release, highway <1.7% deadzone & active R13-H strong-decel hold,
  *   intersection trail-braking turn scrub suppression, strict i-Pedal vs Auto mutual exclusion,
  *   early >=1.5 km/h brake-release standstill clear, 20 Hz flat-speed quantization ceiling,
@@ -63,6 +65,7 @@ public final class TestMain {
         testV077AutoRegenDetectionHysteresisAndQuantizationDecay();
         testV078BleScanReconnectAndAutoRegenFeatherCalibration();
         testV079AutoRegenTrafficStabilityThrottleOnsetAndTurnBleed();
+        testV0710MidDriveAutoToIpedalHighwayFeatherAndStandstill();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1036,8 +1039,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.9",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.9 Calibration Summary")));
+        eq("Summary banner is v0.7.10",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.10 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -2362,6 +2365,212 @@ public final class TestMain {
         }
         eq("v0.7.9 >=80 deg intersection trail-braking turn scrub suppresses post-foot-brake REGEN_DECEL FP",
                 Boolean.FALSE, Boolean.valueOf(turnScrubFp));
+    }
+
+    private static void testV0710MidDriveAutoToIpedalHighwayFeatherAndStandstill() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Extended highway (55-135 km/h) piecewise i-Pedal onset & release curves (preserving <=55 km/h):
+        eq("v0.7.10 ipedalOnsetPedalPct(55 km/h) == 16.0%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(55.0f) - 16.0f) < 0.02f));
+        eq("v0.7.10 ipedalOnsetPedalPct(85 km/h) == 21.0%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(85.0f) - 21.0f) < 0.02f));
+        eq("v0.7.10 ipedalOnsetPedalPct(125 km/h) == 22.6%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalOnsetPedalPct(125.0f) - 22.6f) < 0.02f));
+        eq("v0.7.10 ipedalReleasePedalPct(55 km/h) == 18.6%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(55.0f) - 18.6f) < 0.02f));
+        eq("v0.7.10 ipedalReleasePedalPct(60 km/h) == 19.0%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(60.0f) - 19.0f) < 0.02f));
+        eq("v0.7.10 ipedalReleasePedalPct(92 km/h) == 24.8%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(92.0f) - 24.8f) < 0.02f));
+
+        // 2a. Mid-drive Auto Regen -> i-Pedal promotion via >=1.65 s highway neutral cruise (Signature B2):
+        BrakeEvaluator evCruise = new BrakeEvaluator();
+        long t = 600000L;
+        float spd = 62.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        for (int i = 0; i <= 36; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.08f;
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 79.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 30; i++) {
+            if (i % 2 == 0) spd -= 0.42f;
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 79.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 pre-switch Auto Regen active", Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive));
+
+        // Settle speed at 82 km/h on normal Auto-Regen throttle (15%), then verify a brief 600 ms uphill 34% press does NOT promote:
+        spd = 82.0f;
+        for (int i = 0; i < 14; i++) {
+            float s = spd + ((i / 6) % 2 == 0 ? 0.0f : 0.08f);
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, s, 15.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.5f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 0; i < 12; i++) { // 600 ms (< 1650 ms)
+            float s = spd + ((i / 6) % 2 == 0 ? 0.0f : 0.08f);
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, s, 34.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.5f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 brief 600 ms uphill 34% press in Auto Regen does NOT false-promote i-Pedal",
+                Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive && snap.inferredRegenLevel != 4));
+
+        // Reset briefly to 15% pedal, then switch to i-Pedal and hold 82 km/h neutral cruise at 34.5% pedal for 1.9 s (>= 1.65 s):
+        for (int i = 0; i < 4; i++) {
+            evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, 82.0f, 15.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.5f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 0; i < 38; i++) {
+            float s = 82.0f + ((i / 12) % 2 == 0 ? 0.0f : 0.08f);
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, s, 34.5f, 2.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 >=1.65 s highway neutral cruise promotes Auto Regen -> i-Pedal (4) and clears autoRegenActive",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 4 && !snap.autoRegenActive));
+
+        // 2b. Mid-drive Auto Regen -> i-Pedal promotion via >=1.15 s feathered highway one-pedal braking (Signature B2c):
+        BrakeEvaluator evFeatherPromote = new BrakeEvaluator();
+        long tf = 700000L;
+        float fSpd = 62.0f;
+        for (int i = 0; i <= 36; i++) {
+            if (i > 0 && i % 2 == 0) fSpd -= 0.08f;
+            evFeatherPromote.evaluate(cfg, new BrakeEvaluator.Input(
+                    tf, 0.0f, fSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 79.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tf));
+            tf += 50L;
+        }
+        for (int i = 1; i <= 30; i++) {
+            if (i % 2 == 0) fSpd -= 0.42f;
+            snap = evFeatherPromote.evaluate(cfg, new BrakeEvaluator.Input(
+                    tf, 0.0f, fSpd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 79.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tf));
+            tf += 50L;
+        }
+        eq("v0.7.10 second evaluator starts in Auto Regen", Boolean.TRUE, Boolean.valueOf(snap.autoRegenActive));
+        tf += 2500L;
+        fSpd = 78.0f;
+        for (int i = 0; i < 8; i++) {
+            float s = fSpd + ((i / 4) % 2 == 0 ? 0.0f : 0.08f);
+            evFeatherPromote.evaluate(cfg, new BrakeEvaluator.Input(
+                    tf, 0.0f, s, 20.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tf));
+            tf += 50L;
+        }
+        for (int i = 1; i <= 34; i++) { // 1.70 s (>= 1.15 s confirm) at 17.5% pedal with ~1.08 m/s^2 motor decel
+            if (i % 2 == 0) fSpd -= 0.42f;
+            snap = evFeatherPromote.evaluate(cfg, new BrakeEvaluator.Input(
+                    tf, 0.0f, fSpd, 17.5f, 3.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 78.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tf));
+            tf += 50L;
+        }
+        eq("v0.7.10 >=1.15 s feathered highway braking promotes Auto Regen -> i-Pedal (4) and lights REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 4 && !snap.autoRegenActive && snap.modelIlluminated));
+
+        // 3. Highway i-Pedal cold above-onset spike guard (58.7 km/h @ 18.4% pedal) vs true highway feathered braking (86 km/h):
+        t += 1500L;
+        spd = 60.0f;
+        for (int i = 0; i < 10; i++) {
+            evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 28.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 77.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        boolean coldHwyAboveOnsetFp = false;
+        for (int i = 1; i <= 10; i++) {
+            if (i % 2 == 0) spd -= 0.36f; // ~1.00 m/s^2 total (~0.96 m/s^2 motor < 1.15 m/s^2 standard onset guard)
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 18.4f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 77.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) coldHwyAboveOnsetFp = true;
+            t += 50L;
+        }
+        eq("v0.7.10 cold >=50 km/h above-onset 18.4% pedal transient (~0.96 m/s^2) stays OFF",
+                Boolean.FALSE, Boolean.valueOf(coldHwyAboveOnsetFp));
+
+        // True highway feathered i-Pedal braking at ~86 km/h (20.2% pedal <= 21.04% onset, ~0.99 m/s^2 motor decel):
+        t += 1500L;
+        spd = 88.0f;
+        for (int i = 0; i < 10; i++) {
+            evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 35.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 76.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 1; i <= 12; i++) {
+            if (i % 2 == 0) spd -= 0.40f; // ~1.11 m/s^2 total (~0.99 m/s^2 motor)
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 20.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 76.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 86 km/h feathered i-Pedal braking at 20.2% pedal latches REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
+
+        // Hold at 22.2% pedal (< ~23.5% highway release) keeps REGEN_DECEL ON, then 26.8% pedal cancels cleanly:
+        for (int i = 1; i <= 6; i++) {
+            if (i % 2 == 0) spd -= 0.36f;
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 22.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 76.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 84 km/h feathered i-Pedal holds REGEN_DECEL at 22.2% pedal",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        for (int i = 0; i < 4; i++) {
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 26.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 76.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 84 km/h feathered i-Pedal releases REGEN_DECEL at 26.8% pedal",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 4. i-Pedal 0 km/h standstill hold pedal hysteresis (<0.6% latch, <1.0% hold, >=1.0% release):
+        t += 4000L; // expire any prior lastBrakingNearStopMs arm window
+        for (int i = 0; i < 4; i++) {
+            snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, 0.0f, 1.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.10 0 km/h i-Pedal with 1.2% pedal stays OFF",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+        snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.10 unlatched 0 km/h i-Pedal at 0.8% (>=0.6%) does NOT cold-latch STANDSTILL_HOLD",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+        snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.4f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.10 0 km/h i-Pedal easing to 0.4% (<0.6%) latches STANDSTILL_HOLD",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "STANDSTILL_HOLD".equals(snap.modelSource)));
+        snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 0.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        t += 50L;
+        eq("v0.7.10 latched 0 km/h i-Pedal holds STANDSTILL_HOLD at 0.8% (<1.0% hysteresis)",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated && "STANDSTILL_HOLD".equals(snap.modelSource)));
+        snap = evCruise.evaluate(cfg, new BrakeEvaluator.Input(
+                t, 0.0f, 0.0f, 1.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("v0.7.10 latched 0 km/h i-Pedal releases STANDSTILL_HOLD at 1.2% (>=1.0%)",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

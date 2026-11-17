@@ -6,7 +6,7 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
 
 ---
 
-## Architecture (`v0.7.10`)
+## Architecture (`v0.7.11`)
 
 `brake-indicator-gen5w` is completely standalone (`"live": true`, `"ble": {"central": true}`, zero `/system` file patches, zero `root` mod daemons) and runs inside a single lightweight Android app (`app/BrakeIndicator.apk`, `OverlayService` + `BrakeEngine`):
 
@@ -33,9 +33,9 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
    - Buffers up to `36,000` synchronized HMG-API + OBD + Regen Mode rows (~30 minutes at `20 Hz`, automatically downsampled to `1 Hz` while quietly parked) in compact primitive arrays in RAM (zero internal eMMC flash writes).
    - **Export USB** atomically writes `BrakeIndicator/brake-dataset-<timestamp>.csv` and `BrakeIndicator/brake-summary-<timestamp>.txt` (`*.part` + `fsync` + `rename`) to any mounted FAT32/exFAT USB drive.
 
-5. **Top-Bar Overlay & Diagnostic Dashboard (`OverlayService` + `MainActivity`)**:
+5. **Top-Bar Overlay & Material 3 Widescreen Dashboard (`OverlayService` + `MainActivity`)**:
    - Renders an anti-aliased brake-lamp icon in a non-touchable `TYPE_SYSTEM_OVERLAY` window (`FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE | FLAG_LAYOUT_IN_SCREEN`) aligned with the top status bar row (`51×36` px default), visible across the Gen5W launcher, built-in navigation, and wireless projection without intercepting touches.
-   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) with live HMG-API vs OBD telemetry, detected `L0..i-Pedal` + `(Auto)` / `(SCC)` mode readout, quick **OBD Mode** toggle, instant **Mark Log** bookmark button, **Scan BLE** / **Pair** controls, live transition log, and **Export USB**.
+   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) styled in **Material 3 Dark**: a driver-side control sidebar (`Mark Log`, **OBD Mode** toggle, `Test (3s)`, `Export USB`, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close` stadium-pill buttons), a full-vertical-height driving-legible **Status Monitor** (`Real OBD` through `RAM Dataset Buffer` with semantic tonal status pills), and a full-height BLE pairing & live transition log card.
 
 ---
 
@@ -63,9 +63,9 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 
 Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
 
-- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.10-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.10.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
-- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.10-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
-- **Direct Packages:** `brake-indicator-gen5w-v0.7.10.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.10-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.11-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.11.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.11-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
+- **Direct Packages:** `brake-indicator-gen5w-v0.7.11.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.11-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
 
 > **Note on USB Export & USB Host Mode:** When exporting calibration CSV datasets via **Export USB**, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
 

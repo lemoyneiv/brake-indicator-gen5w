@@ -28,7 +28,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.8.0 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.8.1 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
  *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Upload Cloud`, `Test Cloud`,
  *    `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close`), and inline action feedback.
@@ -504,7 +504,7 @@ public final class MainActivity extends Activity
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("Brake Indicator v0.8.0");
+        configSummaryText.setText("Brake Indicator v0.8.1");
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
@@ -694,7 +694,7 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.8.0 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
+                "v0.8.1 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
 
         // 1. Real OBD (770 / 22BC06)

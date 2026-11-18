@@ -46,7 +46,7 @@ import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 
 /**
- * Host JVM unit tests for v0.8.0:
+ * Host JVM unit tests for v0.8.1:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -55,6 +55,7 @@ import javax.net.ssl.SSLSocket;
  *   priority sorting, transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
  *   settled L0..L3 coasting chord + first-class Auto Regen detection & traffic-stop stability,
+ *   L3 vs i-Pedal 4-tier neutral-pedal separation, speed-scaled L3 feathered braking & L1-Auto coast guard,
  *   cold-start & mid-drive Auto/Paddle -> i-Pedal 16-125 km/h cruise & 6.8-22.5% feathered braking promotion,
  *   shift-interlock forward <7 km/h 0%-pedal liftoff vs Reverse creep guard & 2.4 km/h crawl release,
  *   1.5-135 km/h crawl-to-highway i-Pedal feathered onset/release curves, sharp-turn boost & 0 km/h standstill hysteresis,
@@ -98,6 +99,7 @@ public final class TestMain {
         testV080EcCurveP256AndP384CrossCheck();
         testV080PinnedRootsAndLoopbackTls12Handshakes();
         testV080TarGzUsbProvisioningAndCloudOrchestration();
+        testV081L3VsIpedalDiscriminationFeatheredL3AndAutoL1Base();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1071,8 +1073,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.8.0",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.8.0 Calibration Summary")));
+        eq("Summary banner is v0.8.1",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.8.1 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -3667,6 +3669,195 @@ public final class TestMain {
             if (ghServer != null) ghServer.close();
             deleteRecursive(tmpDir);
         }
+    }
+
+    private static void testV081L3VsIpedalDiscriminationFeatheredL3AndAutoL1Base() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Speed-scaled L3 feathered onset & release curve points:
+        eq("v0.8.1 l3OnsetPedalPct is 0% below 38 km/h and scales 10.6% -> 14.0% across 55..88 km/h",
+                Boolean.TRUE,
+                Boolean.valueOf(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(30.0f)) == 0.0f
+                        && Math.abs(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(55.0f)) - 10.6f) < 0.01f
+                        && Math.abs(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(88.0f)) - 14.0f) < 0.01f));
+        eq("v0.8.1 l3ReleasePedalPct scales 7.5% -> 11.8% -> 15.6% across 28..55..88 km/h",
+                Boolean.TRUE,
+                Boolean.valueOf(Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(28.0f)) - 7.5f) < 0.01f
+                        && Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(55.0f)) - 11.8f) < 0.01f
+                        && Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(88.0f)) - 15.6f) < 0.01f));
+
+        // 2. Manual L3 post-ignition coast -> highway neutral cruise (78 km/h @ 28.2% pedal)
+        //    and unlit highway feathering (84 km/h @ 16.0% pedal, ~0.72 m/s^2 decel) MUST stay L3 (3), NOT i-Pedal (4):
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 2100000L;
+        BrakeEvaluator.Snapshot snap = null;
+        float spd = 62.0f;
+        for (int i = 0; i < 40; i++) {
+            spd -= 0.33f; // ~1.83 m/s^2 settled L3 coast over 2.0 s at 50 ms HMG-API polling
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 0%-pedal settled ~1.83 m/s^2 coast learns manual L3 (3) without Auto Regen",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 3 && !snap.autoRegenActive));
+
+        // Highway cruise in manual L3 at 78 km/h & 28.2% pedal (L3's neutral cruise band, below i-Pedal's 31.8% floor):
+        spd = 78.0f;
+        boolean l3CruiseLit = false;
+        for (int i = 0; i < 60; i++) { // 3.0 s steady highway cruise
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 28.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) l3CruiseLit = true;
+            t += 50L;
+        }
+        eq("v0.8.1 manual L3 78 km/h @ 28.2% neutral cruise stays L3 (does NOT misclassify as i-Pedal)",
+                Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+        eq("v0.8.1 manual L3 78 km/h @ 28.2% neutral cruise keeps brake lamp OFF",
+                Boolean.FALSE, Boolean.valueOf(l3CruiseLit));
+
+        // Unlit highway feathering in manual L3 at 84 -> 80.9 km/h & 16.0% pedal (~0.72 m/s^2 total decel):
+        spd = 84.0f;
+        boolean l3MildFeatherLit = false;
+        for (int i = 0; i < 24; i++) { // 1.2 s
+            spd -= 0.13f; // ~0.72 m/s^2 total (~0.55 m/s^2 motor decel, < 0.86 promote & > 13.6% L3 onset)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 16.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            if (snap.modelIlluminated) l3MildFeatherLit = true;
+            t += 50L;
+        }
+        eq("v0.8.1 manual L3 84 km/h @ 16.0% mild feather (~0.72 m/s^2) stays L3 and unlit",
+                Boolean.TRUE, Boolean.valueOf(snap.inferredRegenLevel == 3 && !l3MildFeatherLit));
+
+        // 3. Deeper manual L3 highway feathered braking (~80.9 km/h @ 12.2% pedal <= l3OnsetPedalPct, ~0.97 m/s^2)
+        //    lights REGEN_DECEL, and easing back to 16.2% (>= l3ReleasePedalPct) releases cleanly:
+        for (int i = 0; i < 12; i++) {
+            spd -= 0.175f; // ~0.97 m/s^2 total decel (~0.82 m/s^2 motor decel) continuing smoothly
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 manual L3 ~80 km/h @ 12.2% feathered regen (~0.97 m/s^2) lights REGEN_DECEL while staying L3",
+                Boolean.TRUE,
+                Boolean.valueOf(snap.inferredRegenLevel == 3
+                        && snap.modelIlluminated
+                        && "REGEN_DECEL".equals(snap.modelSource)));
+        for (int i = 0; i < 8; i++) {
+            spd -= 0.05f; // ~0.28 m/s^2 gentle coast-down above l3ReleasePedalPct
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 16.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 manual L3 highway feather releases REGEN_DECEL when pedal rises above l3ReleasePedalPct",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 4. L3 low-speed coast taper (27.5 -> 21.9 km/h tapering to ~1.11 m/s^2 toward 15 km/h creep) preserves L3:
+        spd = 27.5f;
+        for (int i = 0; i < 16; i++) { // settle speed EMA at 27.5 km/h before lifting throttle
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        for (int i = 0; i < 28; i++) {
+            spd -= 0.20f; // (0.20 / 3.6) / 0.05 = 1.11 m/s^2 L3 low-speed taper (in L2's 0.85..1.55 band)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 manual L3 <26.5 km/h creep-taper coast preserves L3 instead of dropping to L2",
+                Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 5. Speed-scaled mid-drive paddle step-down i-Pedal (4) -> L3 (3) at 48 km/h @ 16% and 80 km/h @ 22% flat pedal:
+        spd = 48.0f;
+        for (int i = 0; i < 56; i++) { // settle EMA + >= 1.8 s @ 26.5% neutral pedal (> urbNeutralMinAcc = 24.09%)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 26.5f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 48 km/h @ 26.5% steady neutral cruise promotes to i-Pedal (4)",
+                Integer.valueOf(4), Integer.valueOf(snap.inferredRegenLevel));
+        for (int i = 0; i < 34; i++) { // 1.7 s @ 16.0% flat pedal (impossible without decel in i-Pedal)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 16.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 48 km/h @ 16.0% flat cruise steps i-Pedal (4) down to L3 (3)",
+                Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+
+        spd = 80.0f;
+        for (int i = 0; i < 72; i++) { // settle EMA + >= 2450 ms L3->i-Pedal confirm @ 34.0% highway neutral pedal
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 34.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 80 km/h @ 34.0% highway neutral cruise promotes L3 -> i-Pedal (4)",
+                Integer.valueOf(4), Integer.valueOf(snap.inferredRegenLevel));
+        for (int i = 0; i < 34; i++) { // 1.7 s @ 22.0% flat highway pedal (<= subIpedalCruiseMaxAcc(80) = 22.43%)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 22.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.8.1 80 km/h @ 22.0% flat highway cruise steps i-Pedal (4) down to L3 (3)",
+                Integer.valueOf(3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 6. L1 (Auto) passive ~0.65 m/s^2 motor coast at 70 km/h stays OFF while >= 0.92 m/s^2 radar boost lights REGEN_DECEL:
+        BrakeEvaluator evAuto = new BrakeEvaluator();
+        long ta = 3100000L;
+        spd = 65.0f;
+        for (int i = 0; i < 40; i++) { // 2.0 s L0 coast (~0.29 m/s^2 total, ~0.20 m/s^2 motor -> confirmedZeroRegenCoast)
+            spd -= 0.052f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    ta, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ta));
+            ta += 50L;
+        }
+        for (int i = 0; i < 30; i++) { // radar boost to L2 (~1.15 m/s^2) -> autoRegenActive = true
+            spd -= 0.21f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    ta, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ta));
+            ta += 50L;
+        }
+        // Driver presses throttle and accelerates to 71 km/h, then coasts in L1 (Auto) at ~0.65 m/s^2 motor decel:
+        for (int i = 0; i < 10; i++) {
+            spd = 71.0f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    ta, 0.0f, spd, 12.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ta));
+            ta += 50L;
+        }
+        boolean l1AutoPassiveLit = false;
+        for (int i = 0; i < 40; i++) { // 2.0 s L1 (Auto) coast (~0.76 m/s^2 total, ~0.65 m/s^2 motor -> classified == 1)
+            spd -= 0.137f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    ta, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ta));
+            if (i >= 32 && snap.modelIlluminated) l1AutoPassiveLit = true;
+            ta += 50L;
+        }
+        eq("v0.8.1 L1 (Auto) passive ~0.65 m/s^2 highway coast classifies L1 + Auto and stays OFF",
+                Boolean.TRUE,
+                Boolean.valueOf(snap.autoRegenActive && snap.inferredRegenLevel == 1 && !l1AutoPassiveLit));
+        for (int i = 0; i < 8; i++) { // radar boosts L1 (Auto) to ~0.95 m/s^2 motor decel (>= 0.85 onset)
+            spd -= 0.19f;
+            snap = evAuto.evaluate(cfg, new BrakeEvaluator.Input(
+                    ta, 0.0f, spd, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ta));
+            ta += 50L;
+        }
+        eq("v0.8.1 L1 (Auto) radar boost >= 0.85 m/s^2 motor decel illuminates REGEN_DECEL",
+                Boolean.TRUE,
+                Boolean.valueOf(snap.modelIlluminated && "REGEN_DECEL".equals(snap.modelSource)));
     }
 
     private static byte[] hexBytes(String hex) {

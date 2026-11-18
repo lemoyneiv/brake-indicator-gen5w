@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.12:
+ * Host JVM unit tests for v0.7.13:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -35,7 +35,8 @@ import java.util.Map;
  *   priority sorting, transient empty-GATT auto-retry, PROTECT_CHAR guard, + 127.0.0.1 bridge coexistence)
  * - IndicatorConfig & BrakeEvaluator (poll-aligned 650 ms legacy & 50-250 ms HMG-API speed handling,
  *   settled L0..L3 coasting chord + first-class Auto Regen detection & traffic-stop stability,
- *   mid-drive Auto/Paddle -> i-Pedal highway cruise & feathered braking promotion,
+ *   cold-start & mid-drive Auto/Paddle -> i-Pedal 16-125 km/h cruise & 6.8-22.5% feathered braking promotion,
+ *   shift-interlock forward <7 km/h 0%-pedal liftoff vs Reverse creep guard & 2.4 km/h crawl release,
  *   1.5-135 km/h crawl-to-highway i-Pedal feathered onset/release curves, sharp-turn boost & 0 km/h standstill hysteresis,
  *   light-throttle cold-onset guard & sustained feather release, highway <1.7% deadzone & active R13-H strong-decel hold,
  *   intersection trail-braking turn scrub suppression, strict i-Pedal vs Auto mutual exclusion,
@@ -67,6 +68,7 @@ public final class TestMain {
         testV079AutoRegenTrafficStabilityThrottleOnsetAndTurnBleed();
         testV0710MidDriveAutoToIpedalHighwayFeatherAndStandstill();
         testV0712IpedalCrawlCurveHighwayFeatherAndSharpTurn();
+        testV0713ColdStartIpedalForwardCrawlAndUrbanGrade();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1040,8 +1042,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.12",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.12 Calibration Summary")));
+        eq("Summary banner is v0.7.13",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.13 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -2685,6 +2687,111 @@ public final class TestMain {
                 BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
         eq("v0.7.12 unwinding steering to 0 deg at 13.5 km/h & 12.8% pedal releases REGEN_DECEL",
                 Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+    }
+
+    private static void testV0713ColdStartIpedalForwardCrawlAndUrbanGrade() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+
+        // 1. Sub-4 km/h crawl release curve anchor at 2.4 km/h (3.9%):
+        eq("v0.7.13 ipedalReleasePedalPct at 2.4 km/h is 3.9%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(2.4f) - 3.9f) < 0.01f));
+        eq("v0.7.13 ipedalReleasePedalPct at 4.0 km/h remains 6.1%",
+                Boolean.TRUE, Boolean.valueOf(Math.abs(BrakeEvaluator.ipedalReleasePedalPct(4.0f) - 6.1f) < 0.01f));
+
+        // 2. Cold-start deep feathered braking promotion (6.8..13.5% pedal at >= 18 km/h
+        //    sustaining >= 1.05 m/s^2 motor decel for >= 1.15 s, matching 170504/171339 cold start):
+        BrakeEvaluator ev = new BrakeEvaluator();
+        long t = 10000L;
+        float spd = 34.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        for (int i = 0; i < 30; i++) {
+            if (i > 0 && i % 2 == 0) spd -= 0.44f; // ~1.22 m/s^2 decel at 9.8% pedal
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, 0.0f, spd, 9.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            t += 50L;
+        }
+        eq("v0.7.13 cold-start deep feathered regen (9.8% pedal, ~1.2 m/s^2) promotes i-Pedal in <1.5 s",
+                Boolean.valueOf(true),
+                Boolean.valueOf(snap.inferredRegenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL
+                        && snap.modelIlluminated));
+
+        // Negative guard: brief 600 ms transient (< 1150 ms confirm) or recent foot-brake bleed does NOT promote i-Pedal
+        BrakeEvaluator evGuard = new BrakeEvaluator();
+        long tg = 10000L;
+        float spdg = 34.0f;
+        BrakeEvaluator.Snapshot snapG = null;
+        snapG = evGuard.evaluate(cfg, new BrakeEvaluator.Input(
+                tg, 2.5f, spdg, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tg));
+        tg += 100L;
+        for (int i = 0; i < 26; i++) {
+            if (i > 0 && i % 2 == 0) spdg -= 0.45f;
+            snapG = evGuard.evaluate(cfg, new BrakeEvaluator.Input(
+                    tg, 0.0f, spdg, 9.8f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tg));
+            tg += 50L;
+        }
+        eq("v0.7.13 post-foot-brake hydraulic settle blocks false deep-feather i-Pedal promotion",
+                Boolean.FALSE, Boolean.valueOf(snapG.inferredRegenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL));
+
+        // 3. Urban 21.2% neutral cruise (22 km/h) & high-speed 108 km/h highway cruise (42.0% pedal) promote i-Pedal:
+        BrakeEvaluator evUrb = new BrakeEvaluator();
+        long tu = 10000L;
+        BrakeEvaluator.Snapshot snapU = null;
+        for (int i = 0; i < 40; i++) {
+            snapU = evUrb.evaluate(cfg, new BrakeEvaluator.Input(
+                    tu, 0.0f, 22.0f, 21.2f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tu));
+            tu += 50L;
+        }
+        eq("v0.7.13 steady 22 km/h urban cruise at 21.2% pedal promotes i-Pedal",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snapU.inferredRegenLevel));
+
+        BrakeEvaluator evHwy = new BrakeEvaluator();
+        long th = 10000L;
+        BrakeEvaluator.Snapshot snapH = null;
+        for (int i = 0; i < 52; i++) {
+            snapH = evHwy.evaluate(cfg, new BrakeEvaluator.Input(
+                    th, 0.0f, 108.0f, 42.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, th));
+            th += 50L;
+        }
+        eq("v0.7.13 108 km/h highway neutral cruise at 42.0% pedal promotes i-Pedal",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snapH.inferredRegenLevel));
+
+        // 4. Shift-interlock confirmedForwardDrive: after >=18 km/h forward travel (evUrb above),
+        //    <7 km/h 0%-pedal liftoff lights REGEN_DECEL right after 150 ms ramp even across a flat
+        //    0.8 km/h quantized step, whereas foot-braking below 4.5 km/h clears confirmedForwardDrive
+        //    so Reverse 0%-pedal creep stays OFF:
+        tu += 500L;
+        for (int i = 0; i < 5; i++) {
+            snapU = evUrb.evaluate(cfg, new BrakeEvaluator.Input(
+                    tu, 0.0f, 5.6f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tu));
+            tu += 50L;
+        }
+        eq("v0.7.13 confirmed-forward <7 km/h 0%-pedal liftoff lights REGEN_DECEL after 150 ms ramp",
+                Boolean.TRUE, Boolean.valueOf(snapU.modelIlluminated && "REGEN_DECEL".equals(snapU.modelSource)));
+
+        // Press foot brake at 1.6 km/h (enables shifting D -> R), release, then creep at 4.8 km/h & 0% pedal
+        tu += 500L;
+        evUrb.evaluate(cfg, new BrakeEvaluator.Input(
+                tu, 3.0f, 1.6f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tu));
+        tu += 1500L;
+        evUrb.evaluate(cfg, new BrakeEvaluator.Input(
+                tu, 0.0f, 4.8f, 8.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tu));
+        tu += 200L;
+        for (int i = 0; i < 5; i++) {
+            snapU = evUrb.evaluate(cfg, new BrakeEvaluator.Input(
+                    tu, 0.0f, 4.8f, 0.0f, 0.0f, Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 75.0f,
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, tu));
+            tu += 50L;
+        }
+        eq("v0.7.13 foot-brake <4.5 km/h resets confirmedForwardDrive so Reverse 0%-pedal flat creep stays OFF",
+                Boolean.FALSE, Boolean.valueOf(snapU.modelIlluminated));
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

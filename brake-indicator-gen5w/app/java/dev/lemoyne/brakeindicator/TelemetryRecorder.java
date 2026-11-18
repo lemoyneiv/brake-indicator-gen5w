@@ -198,6 +198,28 @@ public final class TelemetryRecorder {
     private int transitionHead;
     private int transitionSize;
 
+    public static final class ExportPayload {
+        public final String csv;
+        public final String summary;
+        public final int exportedRows;
+        public final long exportedTotalRecordedRows;
+
+        public ExportPayload(
+                String csv,
+                String summary,
+                int exportedRows,
+                long exportedTotalRecordedRows) {
+            this.csv = csv;
+            this.summary = summary;
+            this.exportedRows = exportedRows;
+            this.exportedTotalRecordedRows = exportedTotalRecordedRows;
+        }
+    }
+
+    public synchronized int bufferedRows() {
+        return size;
+    }
+
     public synchronized void clear() {
         head = 0;
         size = 0;
@@ -234,6 +256,110 @@ public final class TelemetryRecorder {
         rawCodeCounts.clear();
         transitionHead = 0;
         transitionSize = 0;
+    }
+
+    /**
+     * Clears all rows included in a completed USB export while preserving and rebasing any
+     * in-flight samples recorded after {@code exportedTotalRecordedRows} during the USB write.
+     *
+     * @return number of post-snapshot in-flight rows retained for the next clean log segment
+     */
+    public synchronized int clearAfterExport(long exportedTotalRecordedRows, String transitionNote) {
+        long delta = totalRecordedRows - exportedTotalRecordedRows;
+        int keep = (delta > 0L && size > 0) ? (int) Math.min((long) size, delta) : 0;
+        if (keep <= 0) {
+            clear();
+            if (transitionNote != null && !transitionNote.isEmpty()) {
+                pushTransitionLine("[   0.00s] " + transitionNote);
+            }
+            return 0;
+        }
+
+        int newHead = (head + (size - keep)) % CAPACITY;
+        long baseRel = elapsedMs[newHead];
+        for (int i = 0; i < keep; i++) {
+            int idx = (newHead + i) % CAPACITY;
+            elapsedMs[idx] = Math.max(0L, elapsedMs[idx] - baseRel);
+        }
+        head = newHead;
+        size = keep;
+        totalRecordedRows = keep;
+        if (startElapsedMs >= 0L && baseRel > 0L) {
+            startElapsedMs += baseRel;
+        }
+        lastStoredElapsedMs = elapsedMs[(head + keep - 1) % CAPACITY];
+        idleParkedSinceMs = -1L;
+
+        scoredSamples = 0L;
+        tp = 0L;
+        fp = 0L;
+        tn = 0L;
+        fn = 0L;
+        pedalObdOnSamples = 0L;
+        pedalModelMatchedSamples = 0L;
+        regenObdOnSamples = 0L;
+        regenModelMatchedSamples = 0L;
+        prevStateValid = false;
+        prevModelLit = false;
+        prevModelSource = "OFF";
+        prevObdFresh = false;
+        prevObdLit = false;
+        prevObdRaw = -1;
+        prevInferredRegen = -1;
+        prevSccActive = false;
+        prevAutoRegenActive = false;
+        lastModelRiseMs = -1L;
+        lastModelFallMs = -1L;
+        pendingObdRiseMs = -1L;
+        pendingObdFallMs = -1L;
+        onsetCount = 0;
+        onsetLagSumMs = 0L;
+        releaseCount = 0;
+        releaseLagSumMs = 0L;
+        rawCodeCounts.clear();
+        transitionHead = 0;
+        transitionSize = 0;
+
+        if (transitionNote != null && !transitionNote.isEmpty()) {
+            pushTransitionLine("[   0.00s] " + transitionNote);
+        }
+
+        for (int i = 0; i < keep; i++) {
+            int idx = (head + i) % CAPACITY;
+            int f = flags[idx] & 0xFF;
+            short raw = obdLampRaw[idx];
+            short age = obdAgeMs[idx];
+            if (raw >= 0 && age >= 0 && age <= MAX_SCORING_OBD_AGE_MS) {
+                boolean mLit = (f & FLAG_MODEL_LIT) != 0;
+                boolean oLit = (f & FLAG_OBD_LIT) != 0;
+                boolean oPed = (f & FLAG_OBD_PEDAL) != 0;
+                scoredSamples++;
+                if (mLit && oLit) tp++;
+                else if (mLit) fp++;
+                else if (!oLit) tn++;
+                else fn++;
+                if (oLit && oPed) {
+                    pedalObdOnSamples++;
+                    if (mLit) pedalModelMatchedSamples++;
+                } else if (oLit) {
+                    regenObdOnSamples++;
+                    if (mLit) regenModelMatchedSamples++;
+                }
+                Integer key = Integer.valueOf(raw);
+                Long prev = rawCodeCounts.get(key);
+                rawCodeCounts.put(key, Long.valueOf(prev == null ? 1L : prev.longValue() + 1L));
+            }
+        }
+        int lastIdx = (head + keep - 1) % CAPACITY;
+        int lf = flags[lastIdx] & 0xFF;
+        prevStateValid = true;
+        prevModelLit = (lf & FLAG_MODEL_LIT) != 0;
+        prevModelSource = decodeModelSource(modelSourceCode[lastIdx]);
+        prevObdFresh = obdLampRaw[lastIdx] >= 0;
+        prevObdLit = (lf & FLAG_OBD_LIT) != 0;
+        prevObdRaw = obdLampRaw[lastIdx];
+        prevInferredRegen = inferredRegen[lastIdx];
+        return keep;
     }
 
     public synchronized void recordExternalEvent(long nowMonoMs, String eventText) {
@@ -583,8 +709,22 @@ public final class TelemetryRecorder {
         return sb.toString();
     }
 
+    public synchronized ExportPayload snapshotForExport(
+            IndicatorConfig cfg,
+            String obdStatusSummary,
+            String hmgStatusSummary,
+            String hevProbeCompactSummary,
+            String exportTriggerLabel) {
+        int rowsNow = size;
+        long totalNow = totalRecordedRows;
+        String csv = toCsvString();
+        String summary = buildSummaryReport(
+                cfg, obdStatusSummary, hmgStatusSummary, hevProbeCompactSummary, exportTriggerLabel);
+        return new ExportPayload(csv, summary, rowsNow, totalNow);
+    }
+
     public synchronized String buildSummaryReport(IndicatorConfig cfg, String obdStatusSummary) {
-        return buildSummaryReport(cfg, obdStatusSummary, null, null);
+        return buildSummaryReport(cfg, obdStatusSummary, null, null, null);
     }
 
     public synchronized String buildSummaryReport(
@@ -592,18 +732,31 @@ public final class TelemetryRecorder {
             String obdStatusSummary,
             String hmgStatusSummary,
             String hevProbeCompactSummary) {
+        return buildSummaryReport(cfg, obdStatusSummary, hmgStatusSummary, hevProbeCompactSummary, null);
+    }
+
+    public synchronized String buildSummaryReport(
+            IndicatorConfig cfg,
+            String obdStatusSummary,
+            String hmgStatusSummary,
+            String hevProbeCompactSummary,
+            String exportTriggerLabel) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.7.13 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.7.14 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
+        if (exportTriggerLabel != null && !exportTriggerLabel.isEmpty()) {
+            sb.append("Export Trigger      : ").append(exportTriggerLabel).append('\n');
+        }
         if (cfg != null) {
             sb.append("OBD Mode            : ").append(cfg.obdMode.wireValue).append('\n');
             sb.append("HMG-API Model Mode  : ").append(cfg.signalMode.name()).append('\n');
             sb.append("Thresholds          : pressure=").append(cfg.pressureThreshold)
               .append(", decel=").append(cfg.decelThresholdMps2).append(" m/s^2")
-              .append(", standstillHold=").append(cfg.standstillHold).append('\n');
+              .append(", standstillHold=").append(cfg.standstillHold)
+              .append(", autoExportUsb=").append(cfg.autoExportUsb).append('\n');
         }
         if (hmgStatusSummary != null) {
             sb.append("HMG-API Session     : ").append(hmgStatusSummary).append('\n');

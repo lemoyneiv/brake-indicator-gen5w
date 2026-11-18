@@ -28,7 +28,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.7.13 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.7.14 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
  *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Scan BLE`, `Reconnect`,
  *    `Clear`, `Unpair`, and `Close`), and inline action feedback right beside the driver.
@@ -115,6 +115,7 @@ public final class MainActivity extends Activity
     private TextView transitionLogText;
 
     private long lastRightRefreshMs;
+    private int lastObservedAutoExportSeq = -1;
 
     private static final class StatusRow {
         final LinearLayout container;
@@ -422,7 +423,7 @@ public final class MainActivity extends Activity
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
-                        engine.getRecorder().clear();
+                        engine.clearDataset();
                         refreshObdPanel();
                         actionNoticeText.setText("Cleared in-RAM dataset and scorecard.");
                     }
@@ -456,7 +457,7 @@ public final class MainActivity extends Activity
         actionNoticeText.setLineSpacing(2.0f, 1.0f);
         actionNoticeText.setMaxLines(3);
         actionNoticeText.setEllipsize(TextUtils.TruncateAt.END);
-        actionNoticeText.setText("Exports CSV + summary to <usb>/BrakeIndicator/.");
+        actionNoticeText.setText("Auto-exports CSV + summary to <usb>/BrakeIndicator/ on Park or 95% buffer.");
         sidebarFooterInfo.addView(actionNoticeText);
 
         configSummaryText = new TextView(this);
@@ -465,7 +466,7 @@ public final class MainActivity extends Activity
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("Brake Indicator v0.7.13");
+        configSummaryText.setText("Brake Indicator v0.7.14");
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
@@ -655,7 +656,7 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.7.13 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
+                "v0.7.14 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
 
         // 1. Real OBD (770 / 22BC06)
@@ -742,14 +743,56 @@ public final class MainActivity extends Activity
             rowAccuracy.updateValue("Awaiting live OBD 22BC06 samples", M3_ON_SURFACE_VARIANT);
         }
 
-        // 8. RAM Dataset Buffer
-        rowBuffer.updateBadge(BADGE_NONE, "");
-        rowBuffer.updateValue(
-                String.format(Locale.US, "%,d / %,d rows  (%,d scored)",
-                        Integer.valueOf(sc.bufferedRows),
-                        Integer.valueOf(TelemetryRecorder.CAPACITY),
-                        Long.valueOf(sc.scoredSamples)),
-                M3_ON_SURFACE);
+        // 8. RAM Dataset Buffer & Auto-Export Status
+        AutoExportCoordinator.StatusSnapshot autoSnap = engine.getAutoExportStatus();
+        if (engine.isExportInFlight()) {
+            rowBuffer.updateBadge(BADGE_PRIMARY, "WRITING USB");
+        } else if (!cfg.autoExportUsb) {
+            rowBuffer.updateBadge(BADGE_OFF, "MANUAL");
+        } else if (autoSnap.waitingForUsb) {
+            rowBuffer.updateBadge(BADGE_OFF, "WAIT USB");
+        } else if (autoSnap.autoExportCount > 0) {
+            rowBuffer.updateBadge(BADGE_PRIMARY, "AUTO \u00B7 " + autoSnap.autoExportCount);
+        } else {
+            rowBuffer.updateBadge(BADGE_PRIMARY, "AUTO USB");
+        }
+
+        String shortSaved = autoSnap.shortLastSavedLabel();
+        if (autoSnap.waitingForUsb && autoSnap.waitingReason != null) {
+            rowBuffer.updateValue(
+                    String.format(Locale.US, "%,d / %,d rows  \u00B7  Insert USB (%s)",
+                            Integer.valueOf(sc.bufferedRows),
+                            Integer.valueOf(TelemetryRecorder.CAPACITY),
+                            autoSnap.waitingReason),
+                    M3_WARNING_AMBER);
+        } else if (shortSaved != null) {
+            rowBuffer.updateValue(
+                    String.format(Locale.US, "%,d / %,d rows  \u00B7  Saved %s",
+                            Integer.valueOf(sc.bufferedRows),
+                            Integer.valueOf(TelemetryRecorder.CAPACITY),
+                            shortSaved),
+                    M3_ON_SURFACE);
+        } else {
+            rowBuffer.updateValue(
+                    String.format(Locale.US, "%,d / %,d rows  (%,d scored)",
+                            Integer.valueOf(sc.bufferedRows),
+                            Integer.valueOf(TelemetryRecorder.CAPACITY),
+                            Long.valueOf(sc.scoredSamples)),
+                    M3_ON_SURFACE);
+        }
+
+        if (lastObservedAutoExportSeq < 0) {
+            lastObservedAutoExportSeq = autoSnap.exportSeq;
+            if (autoSnap.lastNotice != null) {
+                setTextIfChanged(actionNoticeText, autoSnap.lastNotice);
+            }
+        } else if (autoSnap.exportSeq != lastObservedAutoExportSeq) {
+            lastObservedAutoExportSeq = autoSnap.exportSeq;
+            if (autoSnap.lastTrigger != AutoExportCoordinator.Trigger.MANUAL
+                    && autoSnap.lastNotice != null) {
+                setTextIfChanged(actionNoticeText, autoSnap.lastNotice);
+            }
+        }
 
         long now = System.currentTimeMillis();
         if (now - lastRightRefreshMs >= 450L) {
@@ -855,7 +898,8 @@ public final class MainActivity extends Activity
                     @Override
                     public void run() {
                         if (res.ok) {
-                            actionNoticeText.setText("Saved CSV + summary: " + res.csvPath);
+                            actionNoticeText.setText("Saved & cleared buffer: " + res.csvPath);
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
                         } else {
                             actionNoticeText.setText(res.errorMessage);
                         }

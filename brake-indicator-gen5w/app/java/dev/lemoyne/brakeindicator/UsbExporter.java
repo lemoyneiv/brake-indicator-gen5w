@@ -90,6 +90,44 @@ public final class UsbExporter {
 
     private UsbExporter() {}
 
+    public static boolean hasMountedUsb(List<String> extraUsbFolders) {
+        return !findMountedUsbRoots(extraUsbFolders).isEmpty();
+    }
+
+    public static List<String> findMountedUsbRoots(List<String> extraUsbFolders) {
+        Set<String> roots = new LinkedHashSet<String>();
+        if (extraUsbFolders != null) {
+            for (String folder : extraUsbFolders) {
+                if (folder == null || folder.trim().isEmpty()) {
+                    continue;
+                }
+                File f = new File(folder.trim());
+                File parent = SUBFOLDER.equals(f.getName()) ? f.getParentFile() : f;
+                if (parent != null && parent.isDirectory()) {
+                    roots.add(parent.getAbsolutePath());
+                }
+            }
+        }
+        String mountsText = readProcMounts();
+        List<String> mountedUsb = parseUsbMountPoints(mountsText);
+        for (int i = 0; i < mountedUsb.size(); i++) {
+            File dir = new File(mountedUsb.get(i));
+            if (dir.isDirectory()) {
+                roots.add(dir.getAbsolutePath());
+            }
+        }
+
+        if (mountsText.isEmpty()) {
+            for (int i = 0; i < DIRECT_USB_CANDIDATES.length; i++) {
+                File dir = new File(DIRECT_USB_CANDIDATES[i]);
+                if (dir.isDirectory() && dir.canWrite()) {
+                    roots.add(dir.getAbsolutePath());
+                }
+            }
+        }
+        return new ArrayList<String>(roots);
+    }
+
     public static ExportResult exportDatasetAndSummary(
             String csvContent,
             String summaryContent,
@@ -102,33 +140,8 @@ public final class UsbExporter {
             String summaryContent,
             String hevProbeContent,
             List<String> extraUsbFolders) {
-        Set<String> roots = new LinkedHashSet<String>();
-        if (extraUsbFolders != null) {
-            for (String folder : extraUsbFolders) {
-                if (folder == null || folder.trim().isEmpty()) {
-                    continue;
-                }
-                File f = new File(folder.trim());
-                File parent = SUBFOLDER.equals(f.getName()) ? f.getParentFile() : f;
-                if (parent != null) {
-                    roots.add(parent.getAbsolutePath());
-                }
-            }
-        }
-        String mountsText = readProcMounts();
-        List<String> mountedUsb = parseUsbMountPoints(mountsText);
-        roots.addAll(mountedUsb);
-
-        if (mountsText.isEmpty()) {
-            for (int i = 0; i < DIRECT_USB_CANDIDATES.length; i++) {
-                File dir = new File(DIRECT_USB_CANDIDATES[i]);
-                if (dir.isDirectory() && dir.canWrite()) {
-                    roots.add(dir.getAbsolutePath());
-                }
-            }
-        }
-
-        return exportToDirectories(csvContent, summaryContent, hevProbeContent, new ArrayList<String>(roots), SUBFOLDER);
+        List<String> roots = findMountedUsbRoots(extraUsbFolders);
+        return exportToDirectories(csvContent, summaryContent, hevProbeContent, roots, SUBFOLDER);
     }
 
     public static ExportResult exportToDirectories(

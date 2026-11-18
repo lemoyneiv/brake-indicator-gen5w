@@ -7,12 +7,16 @@ import hmgapi.client.HmgApi;
 
 import org.json.JSONObject;
 
+import java.io.File;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -24,7 +28,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * KitKat `Hub`), aligns `-dv/dt` and `L0..i-Pedal` detection to exact HMG-API poll
  * timestamps, fuses or compares them against {@link ObdBrakeClient} (`@hmgapi-ble`
  * central + `127.0.0.1:35000` bridge coexistence), records a 30-minute synchronized CSV
- * dataset in RAM, and exports to removable USB.
+ * dataset in RAM, and exports to removable USB (automatically on Park / near-full buffer,
+ * or manually from {@link MainActivity}).
  */
 public final class BrakeEngine {
 
@@ -78,11 +83,23 @@ public final class BrakeEngine {
     private final Context appContext;
     private final BrakeEvaluator evaluator = new BrakeEvaluator();
     private final TelemetryRecorder recorder = new TelemetryRecorder();
+    private final AutoExportCoordinator autoExport = new AutoExportCoordinator();
     private final HevRegenProbe hevProbe = new HevRegenProbe();
     private final ObdBrakeClient obdClient;
     private final List<StateListener> listeners = new CopyOnWriteArrayList<StateListener>();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicInteger markSeq = new AtomicInteger(0);
+    private final Object exportLock = new Object();
+    private final AtomicBoolean exportInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean autoExportQueued = new AtomicBoolean(false);
+    private final ExecutorService autoExportExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "BrakeAutoExport");
+            t.setDaemon(true);
+            return t;
+        }
+    });
 
     private volatile IndicatorConfig config = IndicatorConfig.defaults();
     private volatile BrakeEvaluator.Snapshot latestSnapshot;
@@ -198,6 +215,22 @@ public final class BrakeEngine {
         return hevProbe;
     }
 
+    public AutoExportCoordinator.StatusSnapshot getAutoExportStatus() {
+        return autoExport.statusSnapshot();
+    }
+
+    public boolean isExportInFlight() {
+        return exportInFlight.get();
+    }
+
+    public void clearDataset() {
+        BrakeEvaluator.Snapshot snap = latestSnapshot;
+        boolean outOfPark = snap != null
+                && AutoExportCoordinator.isOutOfParkState(snap.gearPark, snap.speedKmh, snap.moving);
+        recorder.clear();
+        autoExport.onManualClear(outOfPark);
+    }
+
     public String getHmgStatusSummary() {
         if (!hmgConnected) {
             return "WAITING";
@@ -209,7 +242,7 @@ public final class BrakeEngine {
         int n = markSeq.incrementAndGet();
         BrakeEvaluator.Snapshot snap = latestSnapshot;
         String reg = snap != null
-                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive)
+                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive)
                 : "?";
         String spd = (snap != null && snap.speedKmh != null)
                 ? String.format(java.util.Locale.US, "%.1f km/h", snap.speedKmh)
@@ -259,6 +292,7 @@ public final class BrakeEngine {
             updated.put("decel_threshold", Integer.toString(Math.round(config.decelThresholdMps2 * 10.0f)));
             updated.put("standstill_hold", Boolean.toString(config.standstillHold));
             updated.put("bridge_port", Integer.toString(config.bridgePort));
+            updated.put("auto_export_usb", Boolean.toString(config.autoExportUsb));
         }
         IndicatorConfig newCfg = IndicatorConfig.fromMap(updated);
         config = newCfg;
@@ -267,18 +301,56 @@ public final class BrakeEngine {
     }
 
     public UsbExporter.ExportResult exportDatasetToUsb() {
-        String csv = recorder.toCsvString();
-        String summary = recorder.buildSummaryReport(
-                config,
-                obdClient.getStatusSummary(),
-                getHmgStatusSummary(),
-                null);
-        List<String> extraFolders = null;
-        try {
-            extraFolders = HmgApi.connect().timeout(1500).usbFolders();
-        } catch (Exception ignored) {
+        return performExport(AutoExportCoordinator.Trigger.MANUAL, false);
+    }
+
+    private UsbExporter.ExportResult performExport(
+            AutoExportCoordinator.Trigger trigger,
+            boolean notifyToastOnSuccess) {
+        synchronized (exportLock) {
+            exportInFlight.set(true);
+            try {
+                final IndicatorConfig cfg = config;
+                AutoExportCoordinator.UsbRootLocator locator = new AutoExportCoordinator.UsbRootLocator() {
+                    @Override
+                    public List<String> findMountedUsbRoots() {
+                        List<String> extraFolders = null;
+                        try {
+                            extraFolders = HmgApi.connect().timeout(800).usbFolders();
+                        } catch (Exception ignored) {
+                        }
+                        return UsbExporter.findMountedUsbRoots(extraFolders);
+                    }
+                };
+                AutoExportCoordinator.OutOfParkCheck liveDriveCheck = new AutoExportCoordinator.OutOfParkCheck() {
+                    @Override
+                    public boolean isCurrentlyOutOfPark() {
+                        BrakeEvaluator.Snapshot s = latestSnapshot;
+                        return s != null && AutoExportCoordinator.isOutOfParkState(
+                                s.gearPark, s.speedKmh, s.moving);
+                    }
+                };
+                UsbExporter.ExportResult res = autoExport.executeExport(
+                        trigger,
+                        recorder,
+                        cfg,
+                        obdClient.getStatusSummary(),
+                        getHmgStatusSummary(),
+                        locator,
+                        AutoExportCoordinator.DEFAULT_USB_WRITER,
+                        liveDriveCheck,
+                        obdClient.monotonicMs());
+                if (res.ok && notifyToastOnSuccess && res.csvPath != null) {
+                    try {
+                        HmgApi.toast(appContext, "Auto-saved " + new File(res.csvPath).getName());
+                    } catch (Throwable ignored) {
+                    }
+                }
+                return res;
+            } finally {
+                exportInFlight.set(false);
+            }
         }
-        return UsbExporter.exportDatasetAndSummary(csv, summary, null, extraFolders);
     }
 
     private void hmgPollLoop() {
@@ -357,6 +429,29 @@ public final class BrakeEngine {
                 BrakeEvaluator.Snapshot snap = evaluator.evaluate(cfg, input);
                 latestSnapshot = snap;
                 recorder.record(snap, System.currentTimeMillis());
+
+                final AutoExportCoordinator.Trigger dueTrigger = autoExport.pollDueTrigger(
+                        cfg.autoExportUsb,
+                        snap.gearPark,
+                        snap.speedKmh,
+                        snap.moving,
+                        recorder.bufferedRows(),
+                        tickStartMono);
+                if (dueTrigger != AutoExportCoordinator.Trigger.NONE
+                        && !exportInFlight.get()
+                        && autoExportQueued.compareAndSet(false, true)) {
+                    autoExportExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                performExport(dueTrigger, true);
+                            } catch (Throwable ignored) {
+                            } finally {
+                                autoExportQueued.set(false);
+                            }
+                        }
+                    });
+                }
 
                 for (int i = 0; i < listeners.size(); i++) {
                     try {

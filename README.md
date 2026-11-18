@@ -6,7 +6,7 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
 
 ---
 
-## Architecture (`v0.7.13`)
+## Architecture (`v0.7.14`)
 
 `brake-indicator-gen5w` is completely standalone (`"live": true`, `"ble": {"central": true}`, zero `/system` file patches, zero `root` mod daemons) and runs inside a single lightweight Android app (`app/BrakeIndicator.apk`, `OverlayService` + `BrakeEngine`):
 
@@ -28,14 +28,14 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
      1. **Coexistence Check — Localhost ELM327 Bridge (`127.0.0.1:35000`)**: Automatically detects when [`obd-gen5w`](https://github.com/lemoyneiv/obd-gen5w)'s local TCP ELM327 multiplexer bridge is active (`ATI` check) and yields to `127.0.0.1:35000` so two apps never interleave stateful `ATSH` CAN headers over a shared BLE GATT link. Traffic stays strictly on the Linux kernel loopback interface (`lo`) and never touches `wlan0` or wireless projection.
      2. **Direct Native BLE — HMG-API `@hmgapi-ble` (`hmgapi.client.Ble`)**: Uses HMG-API's built-in `"ble": {"central": true}` stack (`@hmgapi-ble` inside `com.android.bluetooth`) to scan and connect directly over BLE GATT to ELM327/STN scanners (Veepeak OBDCheck BLE, Vgate, OBDLink, Nordic NUS, ISSC, etc.) with uninterrupted manual BLE scan windows, immediate `@hmgapi-ble` stream recycling + wake-scan recovery on reconnect/timeout, sticky `ADV_IND` + `SCAN_RSP` advertisement merging, OBD-first scan priority sorting, automatic recovery from incomplete cold-boot GATT discovery, negotiated ATT MTU chunking, strict LNEX BVM02 12V battery-sensor MAC/GATT exclusion + `PROTECT_CHAR fff1` defense-in-depth, read-only command filtering (blocks VIN `0902`/`22F190` and all UDS write services), and `IG OFF` CAN sleep protection.
 
-4. **Live Accuracy Scorer & Zero-Flash-Write Calibration Dataset (`TelemetryRecorder` + `UsbExporter`)**:
+4. **Live Accuracy Scorer, Zero-Flash-Write RAM Dataset, & Automatic USB Export (`TelemetryRecorder` + `AutoExportCoordinator` + `UsbExporter`)**:
    - Continuously scores the HMG-API model against live OBD `22 BC06` ground truth (`TP`, `FP`, `TN`, `FN`, overall agreement %, precision %, recall %, separate Pedal Switch vs Pure Regen/SCC recall %, and signed onset/release lag in `ms`), and logs deduplicated BLE session/scan diagnostic transitions directly into `brake-summary-<timestamp>.txt`.
    - Buffers up to `36,000` synchronized HMG-API + OBD + Regen Mode rows (~30 minutes at `20 Hz`, automatically downsampled to `1 Hz` while quietly parked) in compact primitive arrays in RAM (zero internal eMMC flash writes).
-   - **Export USB** atomically writes `BrakeIndicator/brake-dataset-<timestamp>.csv` and `BrakeIndicator/brake-summary-<timestamp>.txt` (`*.part` + `fsync` + `rename`) to any mounted FAT32/exFAT USB drive.
+   - **Automatic & Manual USB Export (`auto_export_usb = true` by default)**: On a dedicated background thread, checks whether a FAT32/exFAT USB stick is attached and atomically writes `BrakeIndicator/brake-dataset-<timestamp>.csv` and `BrakeIndicator/brake-summary-<timestamp>.txt` (`*.part` + `fsync` + `rename`) whenever the car is **shifted into Park** after driving or when the **RAM buffer reaches 95% capacity** (`34,200 / 36,000` rows, ~28.5 min). If no USB stick is plugged in at the trigger, all buffered rows stay safely in RAM (auto-exporting if a USB stick is inserted while parked); immediately after a verified USB write, exported rows are cleared (preserving any in-flight samples recorded during the write) for a clean, zero-overlap next log.
 
 5. **Top-Bar Overlay & Material 3 Widescreen Dashboard (`OverlayService` + `MainActivity`)**:
    - Renders an anti-aliased brake-lamp icon in a non-touchable `TYPE_SYSTEM_OVERLAY` window (`FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE | FLAG_LAYOUT_IN_SCREEN`) aligned with the top status bar row (`51×36` px default), visible across the Gen5W launcher, built-in navigation, and wireless projection without intercepting touches.
-   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) styled in **Material 3 Dark**: a driver-side control sidebar (`Mark Log`, **OBD Mode** toggle, `Test (3s)`, `Export USB`, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close` stadium-pill buttons), a full-vertical-height driving-legible **Status Monitor** (`Real OBD` through `RAM Dataset Buffer` with semantic tonal status pills), and a full-height BLE pairing & live transition log card.
+   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) styled in **Material 3 Dark**: a driver-side control sidebar (`Mark Log`, **OBD Mode** toggle, `Test (3s)`, `Export USB`, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close` stadium-pill buttons), a full-vertical-height driving-legible **Status Monitor** (`Real OBD` through `RAM Dataset Buffer` with semantic tonal status pills including live `AUTO USB` / `WAIT USB` / last-saved status), and a full-height BLE pairing & live transition log card.
 
 ---
 
@@ -55,6 +55,7 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 | `pressure_threshold` | `4` | `brake.pressure` threshold in tenths (`4` = `0.4`) for immediate foot-pedal response |
 | `decel_threshold` | `12` | Regen / Smart Cruise deceleration threshold scale in tenths of `m/s²` (`12` = default E-GMP calibration) |
 | `standstill_hold` | `true` | Keep illuminated at `0 km/h` after an Auto-Hold, regen, or Smart Cruise stop until throttle, creep, EPB, or Park |
+| `auto_export_usb` | `true` | Automatically export CSV + summary to `<usb>/BrakeIndicator/` on shifting into Park or reaching 95% RAM buffer capacity when a USB stick is attached, then clear the buffer |
 | `bridge_port` | `35000` | Localhost TCP ELM327 coexistence/fallback port (`127.0.0.1:<port>`, matching `obd-gen5w`) |
 
 ---
@@ -63,11 +64,11 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 
 Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
 
-- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.13-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.13.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
-- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.13-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
-- **Direct Packages:** `brake-indicator-gen5w-v0.7.13.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.13-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.7.14-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.7.14.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.7.14-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
+- **Direct Packages:** `brake-indicator-gen5w-v0.7.14.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.7.14-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
 
-> **Note on USB Export & USB Host Mode:** When exporting calibration CSV datasets via **Export USB**, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
+> **Note on USB Export & USB Host Mode:** When exporting calibration CSV datasets (automatically on Park / 95% buffer or manually via **Export USB**), make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
 
 ---
 

@@ -24,6 +24,7 @@ has "apk contains ObdBrakeClient" "Ldev/lemoyne/brakeindicator/ObdBrakeClient;" 
 has "apk contains Elm327BrakeProtocol" "Ldev/lemoyne/brakeindicator/Elm327BrakeProtocol;" "$DEX_STRINGS"
 has "apk contains TelemetryRecorder" "Ldev/lemoyne/brakeindicator/TelemetryRecorder;" "$DEX_STRINGS"
 has "apk contains UsbExporter" "Ldev/lemoyne/brakeindicator/UsbExporter;" "$DEX_STRINGS"
+has "apk contains AutoExportCoordinator" "Ldev/lemoyne/brakeindicator/AutoExportCoordinator;" "$DEX_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$DEX_STRINGS"
 has "apk bundles HmgApi Ble client" "Lhmgapi/client/Ble;" "$DEX_STRINGS"
 check "apk drops legacy Gen5wBleClient" no "$(echo "$DEX_STRINGS" | grep -q 'Gen5wBleClient' && echo yes || echo no)"
@@ -55,6 +56,7 @@ has "mod published as on" "1 of 1 mods on" "$out"
 has "mod in public state.json" '"brake-indicator-gen5w"' "$(cat "$R/data/hmgapi/public/state.json")"
 has "default obd_mode is obd_when_connected" '"obd_when_connected"' "$(cat "$R/data/hmgapi/public/state.json")"
 has "default signal_mode is pressure_and_decel" '"pressure_and_decel"' "$(cat "$R/data/hmgapi/public/state.json")"
+has "default auto_export_usb is in state.json" '"auto_export_usb":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "starter registered in services.txt as system" "brake-indicator-gen5w starter system android no script svc/start.sh -" "$(cat "$R/data/hmgapi/state/services.txt")"
 has "vehicle hub auto-enabled in services.txt" "hmgapi vehicle root android yes jar" "$(cat "$R/data/hmgapi/state/services.txt")"
 for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
@@ -62,11 +64,12 @@ for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steer
 done
 
 # Test owner setting override round-trip
-printf '{"obd_mode":"model_only_icon","signal_mode":"pressure_only","off_state":"dim","x_offset":300,"standstill_hold":false}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
+printf '{"obd_mode":"model_only_icon","signal_mode":"pressure_only","off_state":"dim","x_offset":300,"standstill_hold":false,"auto_export_usb":false}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
 eng apply
 check "setting override applies cleanly" 0 "$rc"
 has "public state reflects model_only_icon override" '"model_only_icon"' "$(cat "$R/data/hmgapi/public/state.json")"
 has "public state reflects dim override" '"dim"' "$(cat "$R/data/hmgapi/public/state.json")"
+has "public state reflects auto_export_usb false override" '"auto_export_usb":false' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 
 eng remove brake-indicator-gen5w
 check "engine remove succeeds" 0 "$rc"

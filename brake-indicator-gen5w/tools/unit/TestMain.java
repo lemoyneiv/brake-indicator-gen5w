@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Host JVM unit tests for v0.7.13:
+ * Host JVM unit tests for v0.7.14:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -46,7 +46,8 @@ import java.util.Map;
  *   full-lock steering scrub compensation, Auto-Hold ON vs OFF standstill inference, <14.2 km/h creep-taper release,
  *   strong-decel throttle cancel, EPB actuator release & carryover hold)
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
- * - TelemetryRecorder & UsbExporter (confusion matrix, Pedal vs Pure Regen recall, Auto/i-Pedal labels, atomic USB export)
+ * - TelemetryRecorder, AutoExportCoordinator & UsbExporter (confusion matrix, Pedal vs Pure Regen recall,
+ *   Auto/i-Pedal labels, atomic USB export, automatic Park & 95%-buffer export with USB check & post-write clear)
  */
 public final class TestMain {
 
@@ -69,6 +70,7 @@ public final class TestMain {
         testV0710MidDriveAutoToIpedalHighwayFeatherAndStandstill();
         testV0712IpedalCrawlCurveHighwayFeatherAndSharpTurn();
         testV0713ColdStartIpedalForwardCrawlAndUrbanGrade();
+        testV0714AutoUsbExportParkNearFullAndClear();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1042,8 +1044,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.13",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.13 Calibration Summary")));
+        eq("Summary banner is v0.7.14",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.14 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -2792,6 +2794,234 @@ public final class TestMain {
         }
         eq("v0.7.13 foot-brake <4.5 km/h resets confirmedForwardDrive so Reverse 0%-pedal flat creep stays OFF",
                 Boolean.FALSE, Boolean.valueOf(snapU.modelIlluminated));
+    }
+
+    private static void testV0714AutoUsbExportParkNearFullAndClear() throws Exception {
+        // 1. IndicatorConfig auto_export_usb defaults & parsing:
+        IndicatorConfig defCfg = IndicatorConfig.defaults();
+        eq("v0.7.14 default autoExportUsb is true", Boolean.TRUE, Boolean.valueOf(defCfg.autoExportUsb));
+        Map<String, String> mapOff = new LinkedHashMap<String, String>();
+        mapOff.put("auto_export_usb", "false");
+        IndicatorConfig offCfg = IndicatorConfig.fromMap(mapOff);
+        eq("v0.7.14 auto_export_usb=false parses cleanly", Boolean.FALSE, Boolean.valueOf(offCfg.autoExportUsb));
+
+        File tmpRoot = Files.createTempDirectory("brake-auto-usb-v0714").toFile();
+        try {
+            final File fakeUsb0 = new File(tmpRoot, "usb0");
+            File missingUsb = new File(tmpRoot, "unmounted_usb");
+            eq("v0.7.14 non-existent extra USB folder -> hasMountedUsb false when no stick",
+                    Boolean.FALSE,
+                    Boolean.valueOf(UsbExporter.findMountedUsbRoots(
+                            Arrays.asList(new File(missingUsb, "BrakeIndicator").getAbsolutePath()))
+                            .contains(missingUsb.getAbsolutePath())));
+            fakeUsb0.mkdirs();
+            eq("v0.7.14 mounted extra USB folder -> findMountedUsbRoots includes usb0",
+                    Boolean.TRUE,
+                    Boolean.valueOf(UsbExporter.findMountedUsbRoots(
+                            Arrays.asList(new File(fakeUsb0, "BrakeIndicator").getAbsolutePath()))
+                            .contains(fakeUsb0.getAbsolutePath())));
+
+            final boolean[] usbAttached = {false};
+            AutoExportCoordinator.UsbRootLocator locator = new AutoExportCoordinator.UsbRootLocator() {
+                @Override
+                public List<String> findMountedUsbRoots() {
+                    return usbAttached[0]
+                            ? Arrays.asList(fakeUsb0.getAbsolutePath())
+                            : Collections.<String>emptyList();
+                }
+            };
+
+            TelemetryRecorder rec = new TelemetryRecorder();
+            final AutoExportCoordinator coord = new AutoExportCoordinator();
+            long t = 1000L;
+
+            // 2. Cold boot with null gear.park -> Park (TRUE) MUST NOT false-trigger Park export:
+            usbAttached[0] = true;
+            for (int i = 0; i < 3; i++) {
+                BrakeEvaluator.Snapshot bootNull = new BrakeEvaluator.Snapshot(
+                        t, false, "MODEL_OFF", false, "OFF",
+                        null, null, null, null, 0.0f,
+                        null, null, null, null,
+                        BrakeEvaluator.ObdSample.disconnected(), false, false, -1, -1);
+                rec.record(bootNull, 1700000000000L + t);
+                eq("v0.7.14 cold-boot null gear.park does not trigger export",
+                        AutoExportCoordinator.Trigger.NONE,
+                        coord.pollDueTrigger(true, bootNull.gearPark, bootNull.speedKmh, bootNull.moving, rec.bufferedRows(), t));
+                t += 50L;
+            }
+            for (int i = 0; i < 5; i++) {
+                BrakeEvaluator.Snapshot bootPark = new BrakeEvaluator.Snapshot(
+                        t, false, "MODEL_OFF", false, "OFF",
+                        Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                        Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(80.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), false, false, -1, -1);
+                rec.record(bootPark, 1700000000000L + t);
+                eq("v0.7.14 cold-boot in Park (gear.park=true) does not trigger export",
+                        AutoExportCoordinator.Trigger.NONE,
+                        coord.pollDueTrigger(true, bootPark.gearPark, bootPark.speedKmh, bootPark.moving, rec.bufferedRows(), t));
+                t += 50L;
+            }
+            rec.clear();
+            coord.onManualClear(false);
+
+            // 3. Drive out of Park (20 rows) -> shift to Park with NO USB attached:
+            //    Buffer MUST NOT be cleared; retries must throttle for 3,000 ms; plugging USB in while parked exports & clears!
+            usbAttached[0] = false;
+            for (int i = 0; i < 20; i++) {
+                BrakeEvaluator.Snapshot drv = makeScoredSnapshot(
+                        t, i >= 10, i >= 10 ? "REGEN_DECEL" : "OFF", i >= 10 ? 36 : 0, i >= 10, false, 4, -1);
+                rec.record(drv, 1700000000000L + t);
+                eq("v0.7.14 normal 20-row drive stays Trigger.NONE",
+                        AutoExportCoordinator.Trigger.NONE,
+                        coord.pollDueTrigger(true, drv.gearPark, drv.speedKmh, drv.moving, rec.bufferedRows(), t));
+                t += 50L;
+            }
+            // Shift into Park at 0 km/h:
+            BrakeEvaluator.Snapshot parkSnap = new BrakeEvaluator.Snapshot(
+                    t, false, "OBD_OFF", false, "OFF",
+                    Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                    Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(72.0f),
+                    new BrakeEvaluator.ObdSample(true, "BLE", t - 10L, 0, false, false),
+                    true, false, 4, -1);
+            rec.record(parkSnap, 1700000000000L + t);
+            AutoExportCoordinator.Trigger dueParkNoUsb = coord.pollDueTrigger(
+                    true, parkSnap.gearPark, parkSnap.speedKmh, parkSnap.moving, rec.bufferedRows(), t);
+            eq("v0.7.14 shifting D->P arms SHIFT_TO_PARK immediately",
+                    AutoExportCoordinator.Trigger.SHIFT_TO_PARK, dueParkNoUsb);
+
+            UsbExporter.ExportResult resNoUsb = coord.executeExport(
+                    dueParkNoUsb, rec, defCfg, "BLE OK", "OK (20Hz)", locator,
+                    AutoExportCoordinator.DEFAULT_USB_WRITER, false, t);
+            eq("v0.7.14 shift to Park without USB returns ok=false", Boolean.FALSE, Boolean.valueOf(resNoUsb.ok));
+            eq("v0.7.14 shift to Park without USB preserves all 21 buffered rows",
+                    Integer.valueOf(21), Integer.valueOf(rec.bufferedRows()));
+            eq("v0.7.14 statusSnapshot reports waitingForUsb=true",
+                    Boolean.TRUE, Boolean.valueOf(coord.statusSnapshot().waitingForUsb));
+            eq("v0.7.14 retry throttled during 3000 ms Park cooldown",
+                    AutoExportCoordinator.Trigger.NONE,
+                    coord.pollDueTrigger(true, Boolean.TRUE, Float.valueOf(0.0f), Boolean.FALSE, rec.bufferedRows(), t + 1500L));
+
+            // Plug USB stick in while still parked (+3,100 ms):
+            t += 3100L;
+            usbAttached[0] = true;
+            AutoExportCoordinator.Trigger dueParkUsbReady = coord.pollDueTrigger(
+                    true, Boolean.TRUE, Float.valueOf(0.0f), Boolean.FALSE, rec.bufferedRows(), t);
+            eq("v0.7.14 deferred Park export fires once cooldown elapses",
+                    AutoExportCoordinator.Trigger.SHIFT_TO_PARK, dueParkUsbReady);
+            UsbExporter.ExportResult resParkOk = coord.executeExport(
+                    dueParkUsbReady, rec, defCfg, "BLE OK", "OK (20Hz)", locator,
+                    AutoExportCoordinator.DEFAULT_USB_WRITER, false, t);
+            eq("v0.7.14 deferred Park export succeeds once USB is attached", Boolean.TRUE, Boolean.valueOf(resParkOk.ok));
+            eq("v0.7.14 RAM buffer cleared to 0 rows after successful Park export",
+                    Integer.valueOf(0), Integer.valueOf(rec.bufferedRows()));
+            eq("v0.7.14 scorecard reset to 0 ticks after successful Park export",
+                    Long.valueOf(0L), Long.valueOf(rec.scoreSnapshot().scoredSamples));
+            eq("v0.7.14 autoExportCount == 1",
+                    Integer.valueOf(1), Integer.valueOf(coord.statusSnapshot().autoExportCount));
+            String sum1 = new String(Files.readAllBytes(new File(resParkOk.summaryPath).toPath()), "UTF-8");
+            eq("v0.7.14 summary records Export Trigger: AUTO (SHIFT_TO_PARK)",
+                    Boolean.TRUE, Boolean.valueOf(sum1.contains("Export Trigger      : AUTO (SHIFT_TO_PARK)")));
+
+            // Sitting in Park afterward records quiet 1 Hz rows but MUST NOT re-trigger Park export:
+            t += 1500L;
+            rec.record(parkSnap, 1700000000000L + t);
+            eq("v0.7.14 remaining in Park after export does NOT re-trigger",
+                    AutoExportCoordinator.Trigger.NONE,
+                    coord.pollDueTrigger(true, Boolean.TRUE, Float.valueOf(0.0f), Boolean.FALSE, rec.bufferedRows(), t));
+            rec.clear();
+            coord.onManualClear(false);
+
+            // 4. Long drive hitting 95% RAM buffer capacity (34,200 rows) with 5 concurrent in-flight ticks
+            //    during USB write, followed seamlessly by Segment 2 Shift-to-Park export:
+            t = 100000L;
+            AutoExportCoordinator.Trigger trigBeforeThreshold = AutoExportCoordinator.Trigger.NONE;
+            for (int i = 0; i < AutoExportCoordinator.NEAR_FULL_THRESHOLD_ROWS; i++) {
+                BrakeEvaluator.Snapshot s = makeScoredSnapshot(
+                        t, (i % 4) == 0, (i % 4) == 0 ? "REGEN_DECEL" : "OFF",
+                        (i % 4) == 0 ? 36 : 0, (i % 4) == 0, false, 4, -1);
+                rec.record(s, 1700000000000L + t);
+                if (i == AutoExportCoordinator.NEAR_FULL_THRESHOLD_ROWS - 2) {
+                    trigBeforeThreshold = coord.pollDueTrigger(
+                            true, s.gearPark, s.speedKmh, s.moving, rec.bufferedRows(), t);
+                }
+                t += 50L;
+            }
+            eq("v0.7.14 34,199 rows stays Trigger.NONE",
+                    AutoExportCoordinator.Trigger.NONE, trigBeforeThreshold);
+            eq("v0.7.14 auto_export_usb=false suppresses near-full trigger",
+                    AutoExportCoordinator.Trigger.NONE,
+                    coord.pollDueTrigger(false, Boolean.FALSE, Float.valueOf(64.0f), Boolean.TRUE, rec.bufferedRows(), t));
+
+            AutoExportCoordinator.Trigger dueNearFull = coord.pollDueTrigger(
+                    true, Boolean.FALSE, Float.valueOf(64.0f), Boolean.TRUE, rec.bufferedRows(), t);
+            eq("v0.7.14 reaching 34,200 rows triggers BUFFER_NEAR_FULL",
+                    AutoExportCoordinator.Trigger.BUFFER_NEAR_FULL, dueNearFull);
+
+            final TelemetryRecorder recRef = rec;
+            final long[] writerClock = {t};
+            AutoExportCoordinator.UsbWriter concurrentSimWriter = new AutoExportCoordinator.UsbWriter() {
+                @Override
+                public UsbExporter.ExportResult write(String csv, String summary, List<String> roots) {
+                    // Simulate 5 new 20 Hz ticks arriving on evalLoop while USB write is running!
+                    for (int k = 0; k < 5; k++) {
+                        BrakeEvaluator.Snapshot inflight = makeScoredSnapshot(
+                                writerClock[0], true, "REGEN_DECEL", 44, true, false, 4, -1);
+                        recRef.record(inflight, 1700000000000L + writerClock[0]);
+                        writerClock[0] += 50L;
+                    }
+                    return AutoExportCoordinator.DEFAULT_USB_WRITER.write(csv, summary, roots);
+                }
+            };
+
+            UsbExporter.ExportResult resNearFull = coord.executeExport(
+                    dueNearFull, rec, defCfg, "BLE OK", "OK (20Hz)", locator,
+                    concurrentSimWriter, true, t);
+            t = writerClock[0];
+            eq("v0.7.14 near-full USB export succeeds", Boolean.TRUE, Boolean.valueOf(resNearFull.ok));
+            String sumNearFull = new String(Files.readAllBytes(new File(resNearFull.summaryPath).toPath()), "UTF-8");
+            eq("v0.7.14 near-full summary records AUTO (BUFFER_NEAR_FULL) and 34200 rows",
+                    Boolean.TRUE,
+                    Boolean.valueOf(sumNearFull.contains("Export Trigger      : AUTO (BUFFER_NEAR_FULL)")
+                            && sumNearFull.contains("Buffered CSV Rows   : 34200 / 36000")));
+            eq("v0.7.14 clearAfterExport drops 34,200 exported rows while preserving 5 in-flight rows",
+                    Integer.valueOf(5), Integer.valueOf(rec.bufferedRows()));
+            eq("v0.7.14 retained 5 in-flight rows have exact TP=5 scorecard",
+                    Long.valueOf(5L), Long.valueOf(rec.scoreSnapshot().tp));
+            String[] retainedCsvLines = rec.toCsvString().trim().split("\n");
+            eq("v0.7.14 retained in-flight segment rebases first row to elapsed_ms=0",
+                    Boolean.TRUE, Boolean.valueOf(retainedCsvLines.length == 6 && retainedCsvLines[1].startsWith("0,")));
+
+            // Continue driving 15 more rows (total 20 rows in Segment 2), then shift to Park:
+            for (int i = 0; i < 15; i++) {
+                BrakeEvaluator.Snapshot s2 = makeScoredSnapshot(
+                        t, false, "OFF", 0, false, false, 4, -1);
+                rec.record(s2, 1700000000000L + t);
+                coord.pollDueTrigger(true, s2.gearPark, s2.speedKmh, s2.moving, rec.bufferedRows(), t);
+                t += 50L;
+            }
+            BrakeEvaluator.Snapshot seg2Park = new BrakeEvaluator.Snapshot(
+                    t, false, "OBD_OFF", false, "OFF",
+                    Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                    Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(70.0f),
+                    new BrakeEvaluator.ObdSample(true, "BLE", t - 10L, 0, false, false),
+                    true, false, 4, -1);
+            rec.record(seg2Park, 1700000000000L + t);
+            AutoExportCoordinator.Trigger dueSeg2Park = coord.pollDueTrigger(
+                    true, seg2Park.gearPark, seg2Park.speedKmh, seg2Park.moving, rec.bufferedRows(), t);
+            eq("v0.7.14 Segment 2 after near-full clear still triggers SHIFT_TO_PARK at end of drive",
+                    AutoExportCoordinator.Trigger.SHIFT_TO_PARK, dueSeg2Park);
+            UsbExporter.ExportResult resSeg2 = coord.executeExport(
+                    dueSeg2Park, rec, defCfg, "BLE OK", "OK (20Hz)", locator,
+                    AutoExportCoordinator.DEFAULT_USB_WRITER, false, t);
+            eq("v0.7.14 Segment 2 Park export succeeds to distinct file",
+                    Boolean.TRUE, Boolean.valueOf(resSeg2.ok && !resSeg2.csvPath.equals(resNearFull.csvPath)));
+            eq("v0.7.14 Segment 2 clears buffer back to 0 rows",
+                    Integer.valueOf(0), Integer.valueOf(rec.bufferedRows()));
+            eq("v0.7.14 total autoExportCount == 3 across session",
+                    Integer.valueOf(3), Integer.valueOf(coord.statusSnapshot().autoExportCount));
+        } finally {
+            deleteRecursive(tmpRoot);
+        }
     }
 
     private static BrakeEvaluator.Snapshot makeScoredSnapshot(

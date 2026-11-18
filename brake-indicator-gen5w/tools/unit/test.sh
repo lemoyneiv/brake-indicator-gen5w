@@ -21,6 +21,7 @@ javac --release 8 -Xlint:-options -cp "$CLIENT_JAR" -d "$W" \
     "$SRC/Elm327BrakeProtocol.java" \
     "$SRC/TelemetryRecorder.java" \
     "$SRC/UsbExporter.java" \
+    "$SRC/AutoExportCoordinator.java" \
     "$SRC/ObdBrakeClient.java" \
     "$HERE/TestMain.java"
 

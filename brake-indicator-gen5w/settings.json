@@ -119,6 +119,13 @@
       "description": "Keeps the HMG-API model illuminated at 0 km/h after decelerating to a stop under Auto-Hold, i-Pedal, or Smart Cruise Control until throttle is applied, the car moves, EPB engages, or Park is selected."
     },
     {
+      "key": "auto_export_usb",
+      "type": "toggle",
+      "title": "Auto-export logs to USB (on Park & near-full buffer)",
+      "default": true,
+      "description": "Checks whether a FAT32/exFAT USB stick is attached and automatically writes the CSV dataset + calibration summary to <usb>/BrakeIndicator/ when shifting into Park after driving or when the 30-minute RAM buffer reaches 95% capacity, then clears the buffer for a clean next log."
+    },
+    {
       "key": "bridge_port",
       "type": "number",
       "title": "Loopback ELM327 bridge port",

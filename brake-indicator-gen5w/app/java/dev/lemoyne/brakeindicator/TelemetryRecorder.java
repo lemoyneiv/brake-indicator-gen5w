@@ -197,23 +197,51 @@ public final class TelemetryRecorder {
     private final String[] transitionRing = new String[TRANSITION_LOG_CAP];
     private int transitionHead;
     private int transitionSize;
+    private volatile String activeModelSummary =
+            BrakeEvaluator.BUILTIN_MODEL_VERSION + " (builtin, seq=" + BrakeEvaluator.BUILTIN_MODEL_SEQ + ")";
+    private volatile String activeModelTag =
+            BrakeEvaluator.BUILTIN_MODEL_VERSION + "-builtin";
 
     public static final class ExportPayload {
         public final String csv;
         public final String summary;
         public final int exportedRows;
         public final long exportedTotalRecordedRows;
+        public final String activeModelTag;
 
         public ExportPayload(
                 String csv,
                 String summary,
                 int exportedRows,
                 long exportedTotalRecordedRows) {
+            this(csv, summary, exportedRows, exportedTotalRecordedRows, null);
+        }
+
+        public ExportPayload(
+                String csv,
+                String summary,
+                int exportedRows,
+                long exportedTotalRecordedRows,
+                String activeModelTag) {
             this.csv = csv;
             this.summary = summary;
             this.exportedRows = exportedRows;
             this.exportedTotalRecordedRows = exportedTotalRecordedRows;
+            this.activeModelTag = activeModelTag;
         }
+    }
+
+    public void setActiveModelInfo(String summaryLine, String compactTag) {
+        if (summaryLine != null && !summaryLine.isEmpty()) {
+            this.activeModelSummary = summaryLine;
+        }
+        if (compactTag != null && !compactTag.isEmpty()) {
+            this.activeModelTag = compactTag;
+        }
+    }
+
+    public String getActiveModelSummary() {
+        return activeModelSummary;
     }
 
     public synchronized int bufferedRows() {
@@ -720,7 +748,7 @@ public final class TelemetryRecorder {
         String csv = toCsvString();
         String summary = buildSummaryReport(
                 cfg, obdStatusSummary, hmgStatusSummary, hevProbeCompactSummary, exportTriggerLabel);
-        return new ExportPayload(csv, summary, rowsNow, totalNow);
+        return new ExportPayload(csv, summary, rowsNow, totalNow, activeModelTag);
     }
 
     public synchronized String buildSummaryReport(IndicatorConfig cfg, String obdStatusSummary) {
@@ -742,14 +770,15 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary,
             String exportTriggerLabel) {
         ScoreSnapshot sc = scoreSnapshot();
-        StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.8.1 Calibration Summary ===\n");
+        StringBuilder sb = new StringBuilder(2400);
+        sb.append("=== Brake Light Indicator v0.9.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
         if (exportTriggerLabel != null && !exportTriggerLabel.isEmpty()) {
             sb.append("Export Trigger      : ").append(exportTriggerLabel).append('\n');
         }
+        sb.append("Active Brake Model  : ").append(activeModelSummary).append('\n');
         if (cfg != null) {
             sb.append("OBD Mode            : ").append(cfg.obdMode.wireValue).append('\n');
             sb.append("HMG-API Model Mode  : ").append(cfg.signalMode.name()).append('\n');
@@ -757,7 +786,8 @@ public final class TelemetryRecorder {
               .append(", decel=").append(cfg.decelThresholdMps2).append(" m/s^2")
               .append(", standstillHold=").append(cfg.standstillHold)
               .append(", autoExportUsb=").append(cfg.autoExportUsb)
-              .append(", autoUploadCloud=").append(cfg.autoUploadCloud).append('\n');
+              .append(", autoUploadCloud=").append(cfg.autoUploadCloud)
+              .append(", autoUpdateModel=").append(cfg.autoUpdateModel).append('\n');
         }
         if (hmgStatusSummary != null) {
             sb.append("HMG-API Session     : ").append(hmgStatusSummary).append('\n');

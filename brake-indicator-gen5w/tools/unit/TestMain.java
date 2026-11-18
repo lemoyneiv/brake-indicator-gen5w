@@ -46,7 +46,7 @@ import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 
 /**
- * Host JVM unit tests for v0.8.1:
+ * Host JVM unit tests for v0.9.0:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -72,6 +72,9 @@ import javax.net.ssl.SSLSocket;
  * - TlsHttpClient, PinnedRoots, TarGzArchive, CloudUploadConfig, PendingUploadQueue & GitHubUploader
  *   (NIST SP 800-38D AES-128/256-GCM, FIPS 186-4 P-256/P-384 ECDHE, live loopback TLS 1.2 ECDSA/RSA handshakes,
  *   .tar.gz compression & unpack, USB cloud-upload.json token scrubbing, offline RAM queue & LTE/USB orchestration)
+ * - BrakeModel, ModelBundleVerifier & ModelManager (ECDSA P-256 verification against pinned MOD_KEY,
+ *   tamper/downgrade/ABI rejection, zero-token TLS 1.2 ota fetch, ETag HTTP 304, offline signed USB import,
+ *   6-tick pre-swap self-test, same-tick runtime watchdog fallback & quarantine, and auto-retirement on APK upgrade)
  */
 public final class TestMain {
 
@@ -100,6 +103,7 @@ public final class TestMain {
         testV080PinnedRootsAndLoopbackTls12Handshakes();
         testV080TarGzUsbProvisioningAndCloudOrchestration();
         testV081L3VsIpedalDiscriminationFeatheredL3AndAutoL1Base();
+        testV090OtaModelSigningVerificationHotSwapAndWatchdog();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1073,8 +1077,9 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.8.1",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.8.1 Calibration Summary")));
+        eq("Summary banner is v0.9.0 with Active Brake Model",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.9.0 Calibration Summary")
+                        && summary.contains("Active Brake Model  :")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -4202,6 +4207,627 @@ public final class TestMain {
             this.mac = "";
             this.name = "";
             this.addrType = -1;
+        }
+    }
+
+    private static void testV090OtaModelSigningVerificationHotSwapAndWatchdog() throws Exception {
+        // 1. IndicatorConfig auto_update_model default + override
+        eq("v0.9.0 default autoUpdateModel is true",
+                Boolean.TRUE, Boolean.valueOf(IndicatorConfig.defaults().autoUpdateModel));
+        IndicatorConfig cfgNoAuto = IndicatorConfig.fromMap(
+                Collections.singletonMap("auto_update_model", "false"));
+        eq("v0.9.0 auto_update_model=false parsed cleanly",
+                Boolean.FALSE, Boolean.valueOf(cfgNoAuto.autoUpdateModel));
+
+        // 2. Pinned MOD_KEY UUID derivation & ECDSA P-256 signature tamper rejection
+        byte[] pinnedPubBytes = ModelBundleVerifier.decodeBase64(ModelBundleVerifier.PINNED_AUTHOR_PUBKEY_B64);
+        eq("v0.9.0 pinned MOD_KEY derives expected HMG-API author UUID",
+                ModelBundleVerifier.PINNED_AUTHOR_UUID,
+                ModelBundleVerifier.deriveAuthorUuid(pinnedPubBytes));
+
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
+        kpg.initialize(new ECGenParameterSpec("secp256r1"), new SecureRandom());
+        KeyPair kpTrusted = kpg.generateKeyPair();
+        KeyPair kpUntrusted = kpg.generateKeyPair();
+
+        byte[] trustedPriv = kpTrusted.getPrivate().getEncoded();
+        byte[] trustedPub = kpTrusted.getPublic().getEncoded();
+        String trustedUuid = ModelBundleVerifier.deriveAuthorUuid(trustedPub);
+        String trustedPubB64 = ModelBundleVerifier.encodeBase64(trustedPub);
+
+        File workDir = Files.createTempDirectory("v090-ota-test").toFile();
+        try {
+            // Dynamically compile 3 isolated dev.lemoyne.brakeindicator.model.* plugins
+            byte[] jarV2 = compileAndSignTestModelJar(
+                    workDir,
+                    "TestOtaModelV2",
+                    "2026.11.18.2",
+                    2026111802L,
+                    1,
+                    1,
+                    "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 40.0f"
+                            + " && in.accelPedal != null && in.accelPedal.floatValue() == 0.0f"
+                            + " && (in.brakePressure == null || in.brakePressure.floatValue() < 0.2f)) {\n"
+                            + "    return new Snapshot(in.nowMs, true, \"OTA_V2_REGEN\", true, \"OTA_V2_REGEN\","
+                            + " in.brakePressure, in.speedKmh, in.accelPedal, in.steeringAngleDeg, 1.45f,"
+                            + " in.gearPark, in.parkingBrake, in.moving, in.hvSocPct, in.obd, false, false, 3, -1, false, false);\n"
+                            + "}",
+                    trustedPriv,
+                    trustedPub);
+
+            byte[] jarV3Usb = compileAndSignTestModelJar(
+                    workDir,
+                    "TestOtaModelV3Usb",
+                    "2026.11.18.3",
+                    2026111803L,
+                    1,
+                    1,
+                    "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 40.0f"
+                            + " && in.accelPedal != null && in.accelPedal.floatValue() == 0.0f"
+                            + " && (in.brakePressure == null || in.brakePressure.floatValue() < 0.2f)) {\n"
+                            + "    return new Snapshot(in.nowMs, true, \"OTA_V3_USB\", true, \"OTA_V3_USB\","
+                            + " in.brakePressure, in.speedKmh, in.accelPedal, in.steeringAngleDeg, 1.50f,"
+                            + " in.gearPark, in.parkingBrake, in.moving, in.hvSocPct, in.obd, false, false, 4, -1, false, false);\n"
+                            + "}",
+                    trustedPriv,
+                    trustedPub);
+
+            // Passes 6-tick self-test (speed <= 80 km/h), throws RuntimeException when speed >= 110 km/h
+            byte[] jarFaultyV4 = compileAndSignTestModelJar(
+                    workDir,
+                    "TestFaultyModelV4",
+                    "2026.11.18.4",
+                    2026111804L,
+                    1,
+                    1,
+                    "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 110.0f) {\n"
+                            + "    throw new IllegalStateException(\"Simulated highway arithmetic fault\");\n"
+                            + "}",
+                    trustedPriv,
+                    trustedPub);
+
+            ModelBundleVerifier.VerifiedBundle okVer = ModelBundleVerifier.verifyBundle(
+                    jarV2, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 valid ECDSA-signed OTA jar verifies cleanly",
+                    Boolean.TRUE,
+                    Boolean.valueOf(okVer.ok && "2026.11.18.2".equals(okVer.modelVersion)
+                            && okVer.modelSeq == 2026111802L));
+
+            // Wrong author keypair -> rejected
+            ModelBundleVerifier.VerifiedBundle wrongKeyVer = ModelBundleVerifier.verifyBundle(
+                    jarV2,
+                    BrakeModel.HOST_MODEL_API_VERSION,
+                    ModelBundleVerifier.deriveAuthorUuid(kpUntrusted.getPublic().getEncoded()),
+                    ModelBundleVerifier.encodeBase64(kpUntrusted.getPublic().getEncoded()));
+            eq("v0.9.0 untrusted ECDSA keypair rejected",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!wrongKeyVer.ok && wrongKeyVer.error.contains("Untrusted model author uuid")));
+
+            // 1-byte tamper in classes.dex -> rejected
+            byte[] tamperedDexJar = mutateZipEntryByte(jarV2, "classes.dex", 16, null);
+            ModelBundleVerifier.VerifiedBundle badDexVer = ModelBundleVerifier.verifyBundle(
+                    tamperedDexJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 1-byte classes.dex tamper rejected by SHA-256 manifest",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!badDexVer.ok && badDexVer.error.contains("SHA-256 mismatch")));
+
+            // Tampered manifest.json -> ECDSA signature verification fails
+            byte[] tamperedManJar = replaceZipEntryText(
+                    jarV2, ModelBundleVerifier.MANIFEST_ENTRY, "2026111802", "2026111899");
+            ModelBundleVerifier.VerifiedBundle badSigVer = ModelBundleVerifier.verifyBundle(
+                    tamperedManJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 modified manifest.json rejected by ECDSA P-256 signature",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!badSigVer.ok && badSigVer.error.contains("ECDSA P-256 signature")));
+
+            // Extra unsigned ZIP entry -> rejected
+            byte[] extraFileJar = mutateZipEntryByte(jarV2, null, -1, "unsigned-extra.txt");
+            ModelBundleVerifier.VerifiedBundle extraVer = ModelBundleVerifier.verifyBundle(
+                    extraFileJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 extra unsigned ZIP entry rejected",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!extraVer.ok && extraVer.error.contains("Unsigned extra file")));
+
+            // Incompatible host ABI version -> rejected cleanly
+            byte[] futureAbiJar = compileAndSignTestModelJar(
+                    workDir, "TestFutureAbiModel", "2027.01.01.1", 2027010101L, 99, 99, "", trustedPriv, trustedPub);
+            ModelBundleVerifier.VerifiedBundle abiVer = ModelBundleVerifier.verifyBundle(
+                    futureAbiJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 future host ABI bundle rejected safely",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!abiVer.ok && abiVer.error.contains("requires host API [99..99]")));
+
+            // Host package collision attempt -> rejected
+            Map<String, byte[]> dummyPayload = new LinkedHashMap<String, byte[]>();
+            dummyPayload.put("classes.dex", makeValidDexStub());
+            byte[] badPkgJar = ModelBundleVerifier.buildSignedModelJar(
+                    dummyPayload, "2026.11.18.9", 2026111809L, 1, 1,
+                    "dev.lemoyne.brakeindicator.BrakeEvaluator", trustedPriv, trustedPub);
+            ModelBundleVerifier.VerifiedBundle badPkgVer = ModelBundleVerifier.verifyBundle(
+                    badPkgJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
+            eq("v0.9.0 non-isolated package entry_class rejected",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!badPkgVer.ok && badPkgVer.error.contains("Invalid entry_class")));
+
+            // 3. End-to-end Loopback TLS 1.2 OTA fetch, hot-swap, ETag 304, 15m cooldown, & log attribution
+            File p12 = new File(workDir, "ota-srv.p12");
+            X509Certificate srvCert = generateTestKeystore(
+                    p12, "EC", "256", "SHA256withECDSA", "CN=api.github.com", "dns:api.github.com");
+            SSLContext sslCtx = createServerSslContext(p12);
+            TlsHttpClient tlsClient = new TlsHttpClient(5000, 10000, Collections.singletonList(srvCert), false);
+
+            MockOtaHttpsServer otaSrv = new MockOtaHttpsServer(sslCtx);
+            otaSrv.setPublishedModel("2026.11.18.2", 2026111802L, "\"etag-v2\"", jarV2);
+
+            try {
+                File appFiles = new File(workDir, "app-files");
+                TelemetryRecorder rec = new TelemetryRecorder();
+                ModelManager mgr = new ModelManager(
+                        appFiles,
+                        new BrakeEvaluator(),
+                        tlsClient,
+                        ModelManager.DEFAULT_OTA_REPO,
+                        ModelManager.DEFAULT_OTA_BRANCH,
+                        "127.0.0.1",
+                        otaSrv.port,
+                        "api.github.com",
+                        trustedUuid,
+                        trustedPubB64);
+                mgr.initFromDisk(rec, 1000L);
+                eq("v0.9.0 starts on built-in model when cache empty",
+                        "2026.11.18.1 (builtin)", mgr.getActiveModelBadge());
+
+                IndicatorConfig cfg = IndicatorConfig.defaults();
+                AutoExportCoordinator.TransportInfo lteNet = new AutoExportCoordinator.TransportInfo(
+                        AutoExportCoordinator.TransportKind.CELLULAR, "LTE (rmnet_data0)");
+
+                // Automatic Park check downloads, verifies ECDSA, self-tests, and hot-swaps to v2
+                ModelManager.UpdateOutcome up1 = mgr.checkForUpdate(
+                        false, cfg, lteNet, Collections.<String>emptyList(), rec, 10_000L);
+                eq("v0.9.0 auto Park check hot-swaps to signed OTA 2026.11.18.2 over TLS 1.2",
+                        Boolean.TRUE,
+                        Boolean.valueOf(up1.ok && up1.updated && up1.activeIsOta
+                                && "2026.11.18.2".equals(up1.activeVersion)));
+                eq("v0.9.0 public ota fetch sends zero Authorization token",
+                        "", otaSrv.lastAuthHeader);
+                eq("v0.9.0 badge updates to 2026.11.18.2 (OTA)",
+                        "2026.11.18.2 (OTA)", mgr.getActiveModelBadge());
+
+                // Verify live 50ms tick executes the hot-swapped OTA plugin bytecode
+                BrakeEvaluator.Snapshot snapV2 = mgr.evaluateTick(
+                        cfg,
+                        new BrakeEvaluator.Input(
+                                10_050L, 0.0f, 52.0f, 0.0f, 0.0f,
+                                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, 10_050L),
+                        Collections.<String, String>emptyMap(),
+                        rec,
+                        10_050L);
+                eq("v0.9.0 evaluateTick executes dynamically loaded OTA v2 model",
+                        "OTA_V2_REGEN", snapV2.modelSource);
+                rec.record(snapV2, 1700000000000L);
+
+                // Verify summary & cloud commit message stamp the active OTA model version
+                TelemetryRecorder.ExportPayload exp = rec.snapshotForExport(
+                        cfg, "Standby", "OK (20Hz)", null, "SHIFT_TO_PARK");
+                eq("v0.9.0 ExportPayload records activeModelTag=2026.11.18.2-ota",
+                        "2026.11.18.2-ota", exp.activeModelTag);
+                eq("v0.9.0 summary stamps Active Brake Model (OTA + seq + sha256)",
+                        Boolean.TRUE,
+                        Boolean.valueOf(exp.summary.contains("Active Brake Model  : 2026.11.18.2 (OTA, seq=2026111802, sha256=")));
+                PendingUploadQueue.QueuedDrive qd = PendingUploadQueue.packageDrive(
+                        exp, rec.scoreSnapshot(), AutoExportCoordinator.Trigger.SHIFT_TO_PARK, 1700000000000L);
+                eq("v0.9.0 cloud upload commitMessage includes model=2026.11.18.2-ota",
+                        Boolean.TRUE,
+                        Boolean.valueOf(qd.commitMessage.contains("model=2026.11.18.2-ota")));
+
+                // Second automatic Park check 60s later is throttled in RAM with zero HTTP traffic
+                int reqBeforeCooldown = otaSrv.latestGetCount;
+                ModelManager.UpdateOutcome upCooldown = mgr.checkForUpdate(
+                        false, cfg, lteNet, Collections.<String>emptyList(), rec, 70_000L);
+                eq("v0.9.0 auto Park check within 15m cooldown is throttled with zero HTTP calls",
+                        Boolean.TRUE,
+                        Boolean.valueOf(upCooldown.ok && !upCooldown.updated && upCooldown.throttled
+                                && otaSrv.latestGetCount == reqBeforeCooldown));
+
+                // Manual Update Model check sends If-None-Match and receives HTTP 304 with zero .jar re-download
+                ModelManager.UpdateOutcome up304 = mgr.checkForUpdate(
+                        true, cfg, lteNet, Collections.<String>emptyList(), rec, 80_000L);
+                eq("v0.9.0 manual check sends If-None-Match ETag and handles HTTP 304 cleanly",
+                        Boolean.TRUE,
+                        Boolean.valueOf(up304.ok && !up304.updated
+                                && "\"etag-v2\"".equals(otaSrv.lastIfNoneMatch)
+                                && otaSrv.jarGetCount == 1));
+
+                // Reboot persistence: new ModelManager loads cached verified v2 from disk
+                ModelManager rebootedMgr = new ModelManager(
+                        appFiles,
+                        new BrakeEvaluator(),
+                        tlsClient,
+                        ModelManager.DEFAULT_OTA_REPO,
+                        ModelManager.DEFAULT_OTA_BRANCH,
+                        "127.0.0.1",
+                        otaSrv.port,
+                        "api.github.com",
+                        trustedUuid,
+                        trustedPubB64);
+                rebootedMgr.initFromDisk(rec, 82_000L);
+                eq("v0.9.0 rebooted ModelManager reloads verified OTA model from disk",
+                        "2026.11.18.2 (OTA)", rebootedMgr.getActiveModelBadge());
+
+                // 4. Offline signed USB .jar import + manual long-press resetToBuiltIn
+                File usbRoot = new File(workDir, "usb0");
+                File usbBiDir = new File(usbRoot, UsbExporter.SUBFOLDER);
+                usbBiDir.mkdirs();
+                Files.write(new File(usbBiDir, "brake-model-2026.11.18.3.jar").toPath(), jarV3Usb);
+
+                AutoExportCoordinator.TransportInfo offlineNet = new AutoExportCoordinator.TransportInfo(
+                        AutoExportCoordinator.TransportKind.NONE, "Offline");
+                ModelManager.UpdateOutcome usbUp = mgr.checkForUpdate(
+                        true, cfg, offlineNet, Collections.singletonList(usbRoot.getAbsolutePath()), rec, 90_000L);
+                eq("v0.9.0 offline manual Update Model imports signed USB brake-model-2026.11.18.3.jar",
+                        Boolean.TRUE,
+                        Boolean.valueOf(usbUp.ok && usbUp.updated && "2026.11.18.3".equals(usbUp.activeVersion)));
+                File modelsFolder = new File(appFiles, "models");
+                eq("v0.9.0 older cached v2 jar pruned after v3 activation",
+                        Boolean.FALSE,
+                        Boolean.valueOf(new File(modelsFolder, "brake-model-2026111802.jar").exists()));
+
+                ModelManager.UpdateOutcome resetOut = mgr.resetToBuiltIn(rec, 95_000L);
+                eq("v0.9.0 long-press resetToBuiltIn restores built-in 2026.11.18.1 and clears models dir",
+                        Boolean.TRUE,
+                        Boolean.valueOf(resetOut.ok && resetOut.updated && !mgr.isActiveOta()
+                                && "2026.11.18.1 (builtin)".equals(mgr.getActiveModelBadge())
+                                && !new File(modelsFolder, "brake-model-2026111803.jar").exists()));
+
+                // 5. Runtime watchdog: catches mid-drive exception on the exact same tick, reverts, & quarantines
+                otaSrv.setPublishedModel("2026.11.18.4", 2026111804L, "\"etag-v4\"", jarFaultyV4);
+                ModelManager.UpdateOutcome upFaulty = mgr.checkForUpdate(
+                        true, cfg, lteNet, Collections.<String>emptyList(), rec, 100_000L);
+                eq("v0.9.0 TestFaultyModelV4 passes 6-tick self-test (<100 km/h) and activates",
+                        Boolean.TRUE,
+                        Boolean.valueOf(upFaulty.ok && upFaulty.updated && "2026.11.18.4".equals(upFaulty.activeVersion)));
+
+                // Trigger 115 km/h + 14 bar foot brake -> faulty model throws, watchdog falls back on same tick!
+                BrakeEvaluator.Snapshot rescuedSnap = mgr.evaluateTick(
+                        cfg,
+                        new BrakeEvaluator.Input(
+                                105_000L, 14.0f, 115.0f, 0.0f, 0.0f,
+                                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, 74.0f,
+                                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, 105_000L),
+                        Collections.<String, String>emptyMap(),
+                        rec,
+                        105_000L);
+                eq("v0.9.0 runtime watchdog rescues throwing OTA model on exact same tick via built-in BrakeEvaluator",
+                        Boolean.TRUE,
+                        Boolean.valueOf(rescuedSnap != null
+                                && rescuedSnap.modelIlluminated
+                                && "BRAKE_PRESSURE".equals(rescuedSnap.modelSource)));
+                eq("v0.9.0 runtime watchdog reverts activeModel to built-in and deletes faulty jar",
+                        Boolean.TRUE,
+                        Boolean.valueOf(!mgr.isActiveOta()
+                                && "2026.11.18.1 (builtin)".equals(mgr.getActiveModelBadge())
+                                && !new File(modelsFolder, "brake-model-2026111804.jar").exists()));
+
+                ModelManager.UpdateOutcome retryQuarantined = mgr.checkForUpdate(
+                        true, cfg, lteNet, Collections.<String>emptyList(), rec, 110_000L);
+                eq("v0.9.0 quarantined model_seq is blocked from re-downloading",
+                        Boolean.TRUE,
+                        Boolean.valueOf(!retryQuarantined.updated
+                                && retryQuarantined.message.contains("quarantined")));
+
+                // 6. Automatic cached OTA retirement when a newer full APK (seq=2026120101) is installed
+                modelsFolder.mkdirs();
+                File staleCachedJar = new File(modelsFolder, "brake-model-2026111802.jar");
+                Files.write(staleCachedJar.toPath(), jarV2);
+                BrakeModel newerBuiltIn = new BrakeModel() {
+                    private final BrakeEvaluator delegate = new BrakeEvaluator();
+                    @Override public String modelVersion() { return "2026.12.01.1"; }
+                    @Override public long modelSeq() { return 2026120101L; }
+                    @Override public int modelApiVersion() { return BrakeModel.HOST_MODEL_API_VERSION; }
+                    @Override
+                    public BrakeEvaluator.Snapshot evaluate(
+                            IndicatorConfig c, BrakeEvaluator.Input in, Map<String, String> raw) {
+                        return delegate.evaluate(c, in, raw);
+                    }
+                    @Override public void reset() { delegate.reset(); }
+                };
+                ModelManager upgradedApkMgr = new ModelManager(
+                        appFiles,
+                        newerBuiltIn,
+                        tlsClient,
+                        ModelManager.DEFAULT_OTA_REPO,
+                        ModelManager.DEFAULT_OTA_BRANCH,
+                        "127.0.0.1",
+                        otaSrv.port,
+                        "api.github.com",
+                        trustedUuid,
+                        trustedPubB64);
+                upgradedApkMgr.initFromDisk(rec, 120_000L);
+                eq("v0.9.0 newer full APK automatically retires and deletes older cached OTA jar",
+                        Boolean.TRUE,
+                        Boolean.valueOf(!upgradedApkMgr.isActiveOta()
+                                && "2026.12.01.1 (builtin)".equals(upgradedApkMgr.getActiveModelBadge())
+                                && !staleCachedJar.exists()));
+            } finally {
+                otaSrv.close();
+            }
+        } finally {
+            deleteRecursive(workDir);
+        }
+    }
+
+    private static byte[] makeValidDexStub() {
+        byte[] dex = new byte[48];
+        dex[0] = 'd';
+        dex[1] = 'e';
+        dex[2] = 'x';
+        dex[3] = '\n';
+        dex[4] = '0';
+        dex[5] = '3';
+        dex[6] = '5';
+        dex[7] = 0;
+        return dex;
+    }
+
+    private static byte[] compileAndSignTestModelJar(
+            File workRoot,
+            String simpleClassName,
+            String modelVersion,
+            long modelSeq,
+            int minApi,
+            int maxApi,
+            String extraEvalBody,
+            byte[] privKey,
+            byte[] pubKey) throws Exception {
+        File srcRoot = new File(workRoot, "src-" + simpleClassName);
+        File pkgDir = new File(srcRoot, "dev/lemoyne/brakeindicator/model");
+        pkgDir.mkdirs();
+        File clsOut = new File(workRoot, "cls-" + simpleClassName);
+        clsOut.mkdirs();
+
+        String fqcn = "dev.lemoyne.brakeindicator.model." + simpleClassName;
+        String src = "package dev.lemoyne.brakeindicator.model;\n"
+                + "import dev.lemoyne.brakeindicator.BrakeEvaluator;\n"
+                + "import dev.lemoyne.brakeindicator.BrakeEvaluator.Input;\n"
+                + "import dev.lemoyne.brakeindicator.BrakeEvaluator.Snapshot;\n"
+                + "import dev.lemoyne.brakeindicator.BrakeModel;\n"
+                + "import dev.lemoyne.brakeindicator.IndicatorConfig;\n"
+                + "import java.util.Map;\n"
+                + "public final class " + simpleClassName + " implements BrakeModel {\n"
+                + "    private final BrakeEvaluator base = new BrakeEvaluator();\n"
+                + "    @Override public String modelVersion() { return \"" + modelVersion + "\"; }\n"
+                + "    @Override public long modelSeq() { return " + modelSeq + "L; }\n"
+                + "    @Override public int modelApiVersion() { return " + BrakeModel.HOST_MODEL_API_VERSION + "; }\n"
+                + "    @Override public void reset() { base.reset(); }\n"
+                + "    @Override public Snapshot evaluate(IndicatorConfig cfg, Input in, Map<String, String> raw) {\n"
+                + "        " + extraEvalBody + "\n"
+                + "        return base.evaluate(cfg, in, raw);\n"
+                + "    }\n"
+                + "}\n";
+        File javaFile = new File(pkgDir, simpleClassName + ".java");
+        Files.write(javaFile.toPath(), src.getBytes("UTF-8"));
+
+        ProcessBuilder pb = new ProcessBuilder(
+                "javac", "--release", "8", "-Xlint:-options",
+                "-cp", System.getProperty("java.class.path"),
+                "-d", clsOut.getAbsolutePath(),
+                javaFile.getAbsolutePath());
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
+        byte[] buf = new byte[512];
+        int n;
+        while ((n = p.getInputStream().read(buf)) >= 0) err.write(buf, 0, n);
+        if (p.waitFor() != 0) {
+            throw new IOException("javac test plugin failed: " + err.toString("UTF-8"));
+        }
+
+        Map<String, byte[]> payload = new LinkedHashMap<String, byte[]>();
+        payload.put("classes.dex", makeValidDexStub());
+        String relCls = "dev/lemoyne/brakeindicator/model/" + simpleClassName + ".class";
+        payload.put(relCls, Files.readAllBytes(new File(clsOut, relCls).toPath()));
+
+        deleteRecursive(srcRoot);
+        deleteRecursive(clsOut);
+
+        return ModelBundleVerifier.buildSignedModelJar(
+                payload, modelVersion, modelSeq, minApi, maxApi, fqcn, privKey, pubKey);
+    }
+
+    private static byte[] mutateZipEntryByte(
+            byte[] zipBytes,
+            String targetEntry,
+            int flipOffset,
+            String extraEntryName) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(zipBytes.length + 128);
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new ByteArrayInputStream(zipBytes));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(baos);
+        try {
+            java.util.zip.ZipEntry ze;
+            byte[] buf = new byte[2048];
+            while ((ze = zis.getNextEntry()) != null) {
+                ByteArrayOutputStream dataOut = new ByteArrayOutputStream();
+                int r;
+                while ((r = zis.read(buf)) > 0) dataOut.write(buf, 0, r);
+                byte[] data = dataOut.toByteArray();
+                if (ze.getName().equals(targetEntry) && flipOffset >= 0 && flipOffset < data.length) {
+                    data[flipOffset] ^= 0x5A;
+                }
+                zos.putNextEntry(new java.util.zip.ZipEntry(ze.getName()));
+                zos.write(data);
+                zos.closeEntry();
+            }
+            if (extraEntryName != null) {
+                zos.putNextEntry(new java.util.zip.ZipEntry(extraEntryName));
+                zos.write("untrusted".getBytes("UTF-8"));
+                zos.closeEntry();
+            }
+        } finally {
+            zis.close();
+            zos.close();
+        }
+        return baos.toByteArray();
+    }
+
+    private static byte[] replaceZipEntryText(
+            byte[] zipBytes,
+            String targetEntry,
+            String find,
+            String replace) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(zipBytes.length + 64);
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new ByteArrayInputStream(zipBytes));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(baos);
+        try {
+            java.util.zip.ZipEntry ze;
+            byte[] buf = new byte[2048];
+            while ((ze = zis.getNextEntry()) != null) {
+                ByteArrayOutputStream dataOut = new ByteArrayOutputStream();
+                int r;
+                while ((r = zis.read(buf)) > 0) dataOut.write(buf, 0, r);
+                byte[] data = dataOut.toByteArray();
+                if (ze.getName().equals(targetEntry)) {
+                    data = new String(data, "UTF-8").replace(find, replace).getBytes("UTF-8");
+                }
+                zos.putNextEntry(new java.util.zip.ZipEntry(ze.getName()));
+                zos.write(data);
+                zos.closeEntry();
+            }
+        } finally {
+            zis.close();
+            zos.close();
+        }
+        return baos.toByteArray();
+    }
+
+    private static final class MockOtaHttpsServer implements Closeable {
+        final SSLServerSocket srv;
+        final int port;
+        final Thread thread;
+        volatile String modelVersion = "";
+        volatile long modelSeq;
+        volatile String etag = "\"etag-init\"";
+        volatile byte[] jarBytes = new byte[0];
+        volatile String jarPath = "";
+        volatile int latestGetCount;
+        volatile int jarGetCount;
+        volatile String lastAuthHeader = "";
+        volatile String lastIfNoneMatch = "";
+
+        MockOtaHttpsServer(SSLContext sslCtx) throws Exception {
+            this.srv = (SSLServerSocket) sslCtx.getServerSocketFactory()
+                    .createServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+            this.srv.setEnabledProtocols(new String[]{"TLSv1.2"});
+            this.port = srv.getLocalPort();
+            this.thread = new Thread("MockOtaHttps") {
+                @Override
+                public void run() {
+                    while (!srv.isClosed()) {
+                        SSLSocket sock = null;
+                        try {
+                            sock = (SSLSocket) srv.accept();
+                            sock.setSoTimeout(5000);
+                            handleClient(sock);
+                        } catch (Throwable ignored) {
+                            if (srv.isClosed()) break;
+                        } finally {
+                            if (sock != null) {
+                                try { sock.close(); } catch (Throwable ignored) {}
+                            }
+                        }
+                    }
+                }
+            };
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
+
+        void setPublishedModel(String ver, long seq, String etagVal, byte[] jar) {
+            this.modelVersion = ver;
+            this.modelSeq = seq;
+            this.etag = etagVal;
+            this.jarBytes = jar;
+            this.jarPath = "models/brake-model-" + ver + ".jar";
+        }
+
+        private void handleClient(SSLSocket sock) throws Exception {
+            InputStream in = sock.getInputStream();
+            OutputStream out = sock.getOutputStream();
+            String reqLine = readHttpHeaderLine(in);
+            if (reqLine == null) return;
+            String auth = "";
+            String ifNoneMatch = "";
+            while (true) {
+                String h = readHttpHeaderLine(in);
+                if (h == null || h.isEmpty()) break;
+                String lower = h.toLowerCase(java.util.Locale.US);
+                if (lower.startsWith("authorization:")) {
+                    auth = h.substring(14).trim();
+                } else if (lower.startsWith("if-none-match:")) {
+                    ifNoneMatch = h.substring(14).trim();
+                }
+            }
+            lastAuthHeader = auth;
+            lastIfNoneMatch = ifNoneMatch;
+
+            String latestPrefix = "GET /repos/lemoyneiv/brake-indicator-gen5w/contents/latest.json?ref=ota ";
+            String jarPrefix = "GET /repos/lemoyneiv/brake-indicator-gen5w/contents/" + jarPath + "?ref=ota ";
+            if (reqLine.startsWith(latestPrefix)) {
+                latestGetCount++;
+                if (!ifNoneMatch.isEmpty() && ifNoneMatch.equals(etag)) {
+                    String head304 = "HTTP/1.1 304 Not Modified\r\n"
+                            + "ETag: " + etag + "\r\n"
+                            + "Content-Length: 0\r\n"
+                            + "Connection: close\r\n\r\n";
+                    out.write(head304.getBytes("US-ASCII"));
+                    out.flush();
+                    return;
+                }
+                String sha = ModelBundleVerifier.sha256Hex(jarBytes);
+                String json = "{\n"
+                        + "  \"format\": 1,\n"
+                        + "  \"model_version\": \"" + modelVersion + "\",\n"
+                        + "  \"model_seq\": " + modelSeq + ",\n"
+                        + "  \"min_host_api\": 1,\n"
+                        + "  \"max_host_api\": 1,\n"
+                        + "  \"jar_path\": \"" + jarPath + "\",\n"
+                        + "  \"jar_sha256\": \"" + sha + "\",\n"
+                        + "  \"jar_size\": " + jarBytes.length + "\n"
+                        + "}\n";
+                byte[] b = json.getBytes("UTF-8");
+                String head = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: application/vnd.github.raw+json\r\n"
+                        + "ETag: " + etag + "\r\n"
+                        + "Content-Length: " + b.length + "\r\n"
+                        + "Connection: close\r\n\r\n";
+                out.write(head.getBytes("US-ASCII"));
+                out.write(b);
+                out.flush();
+                return;
+            }
+            if (reqLine.startsWith(jarPrefix)) {
+                jarGetCount++;
+                byte[] b = jarBytes;
+                String head = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: application/octet-stream\r\n"
+                        + "Content-Length: " + b.length + "\r\n"
+                        + "Connection: close\r\n\r\n";
+                out.write(head.getBytes("US-ASCII"));
+                out.write(b);
+                out.flush();
+                return;
+            }
+            byte[] nf = "{\"message\":\"Not Found\"}".getBytes("UTF-8");
+            String head = "HTTP/1.1 404 Not Found\r\nContent-Length: " + nf.length + "\r\nConnection: close\r\n\r\n";
+            out.write(head.getBytes("US-ASCII"));
+            out.write(nf);
+            out.flush();
+        }
+
+        @Override
+        public void close() {
+            try { srv.close(); } catch (Throwable ignored) {}
+            try { thread.join(2000L); } catch (Throwable ignored) {}
         }
     }
 

@@ -31,6 +31,9 @@ has "apk contains TarGzArchive" "Ldev/lemoyne/brakeindicator/TarGzArchive;" "$DE
 has "apk contains CloudUploadConfig" "Ldev/lemoyne/brakeindicator/CloudUploadConfig;" "$DEX_STRINGS"
 has "apk contains PendingUploadQueue" "Ldev/lemoyne/brakeindicator/PendingUploadQueue;" "$DEX_STRINGS"
 has "apk contains GitHubUploader" "Ldev/lemoyne/brakeindicator/GitHubUploader;" "$DEX_STRINGS"
+has "apk contains BrakeModel" "Ldev/lemoyne/brakeindicator/BrakeModel;" "$DEX_STRINGS"
+has "apk contains ModelBundleVerifier" "Ldev/lemoyne/brakeindicator/ModelBundleVerifier;" "$DEX_STRINGS"
+has "apk contains ModelManager" "Ldev/lemoyne/brakeindicator/ModelManager;" "$DEX_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$DEX_STRINGS"
 has "apk bundles HmgApi Ble client" "Lhmgapi/client/Ble;" "$DEX_STRINGS"
 check "apk drops legacy Gen5wBleClient" no "$(echo "$DEX_STRINGS" | grep -q 'Gen5wBleClient' && echo yes || echo no)"
@@ -66,6 +69,7 @@ has "default auto_export_usb is in state.json" '"auto_export_usb":true' "$(tr -d
 has "default auto_upload_cloud is in state.json" '"auto_upload_cloud":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "default cloud_allow_lte is in state.json" '"cloud_allow_lte":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "default usb_backup_when_cloud is in state.json" '"usb_backup_when_cloud":false' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
+has "default auto_update_model is in state.json" '"auto_update_model":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "starter registered in services.txt as system" "brake-indicator-gen5w starter system android no script svc/start.sh -" "$(cat "$R/data/hmgapi/state/services.txt")"
 has "vehicle hub auto-enabled in services.txt" "hmgapi vehicle root android yes jar" "$(cat "$R/data/hmgapi/state/services.txt")"
 for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
@@ -73,7 +77,7 @@ for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steer
 done
 
 # Test owner setting override round-trip
-printf '{"obd_mode":"model_only_icon","signal_mode":"pressure_only","off_state":"dim","x_offset":300,"standstill_hold":false,"auto_export_usb":false,"auto_upload_cloud":false,"cloud_allow_lte":false,"usb_backup_when_cloud":true}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
+printf '{"obd_mode":"model_only_icon","signal_mode":"pressure_only","off_state":"dim","x_offset":300,"standstill_hold":false,"auto_export_usb":false,"auto_upload_cloud":false,"cloud_allow_lte":false,"usb_backup_when_cloud":true,"auto_update_model":false}\n' > "$R/data/hmgapi/settings/brake-indicator-gen5w.json"
 eng apply
 check "setting override applies cleanly" 0 "$rc"
 has "public state reflects model_only_icon override" '"model_only_icon"' "$(cat "$R/data/hmgapi/public/state.json")"
@@ -81,6 +85,7 @@ has "public state reflects dim override" '"dim"' "$(cat "$R/data/hmgapi/public/s
 has "public state reflects auto_export_usb false override" '"auto_export_usb":false' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "public state reflects auto_upload_cloud false override" '"auto_upload_cloud":false' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "public state reflects usb_backup_when_cloud true override" '"usb_backup_when_cloud":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
+has "public state reflects auto_update_model false override" '"auto_update_model":false' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 
 eng remove brake-indicator-gen5w
 check "engine remove succeeds" 0 "$rc"

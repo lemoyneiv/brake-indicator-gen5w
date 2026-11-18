@@ -16,7 +16,10 @@ javac --release 8 -Xlint:-options -cp "$CLIENT_JAR" -d "$W" \
     "$STUBS/android/net/LocalSocket.java" \
     "$STUBS/org/json/JSONObject.java" \
     "$SRC/IndicatorConfig.java" \
+    "$SRC/BrakeModel.java" \
     "$SRC/BrakeEvaluator.java" \
+    "$SRC/ModelBundleVerifier.java" \
+    "$SRC/ModelManager.java" \
     "$SRC/HmgVehiclePoller.java" \
     "$SRC/HevRegenProbe.java" \
     "$SRC/Elm327BrakeProtocol.java" \

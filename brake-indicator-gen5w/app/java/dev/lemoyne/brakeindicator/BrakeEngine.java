@@ -94,11 +94,11 @@ public final class BrakeEngine {
     }
 
     private final Context appContext;
-    private final BrakeEvaluator evaluator = new BrakeEvaluator();
     private final TelemetryRecorder recorder = new TelemetryRecorder();
     private final AutoExportCoordinator autoExport = new AutoExportCoordinator();
     private final HevRegenProbe hevProbe = new HevRegenProbe();
     private final GitHubUploader gitHubUploader = new GitHubUploader();
+    private final ModelManager modelManager;
     private final CloudUploadConfig.Store cloudStore;
     private final ObdBrakeClient obdClient;
     private final List<StateListener> listeners = new CopyOnWriteArrayList<StateListener>();
@@ -108,6 +108,8 @@ public final class BrakeEngine {
     private final AtomicBoolean exportInFlight = new AtomicBoolean(false);
     private final AtomicBoolean autoExportQueued = new AtomicBoolean(false);
     private final AtomicBoolean queueDrainInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean bootModelCheckInFlight = new AtomicBoolean(false);
+    private volatile long nextBootModelCheckMonoMs;
     private final ExecutorService autoExportExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -207,6 +209,10 @@ public final class BrakeEngine {
                 recorder.recordExternalEvent(monoMs, message);
             }
         });
+        this.modelManager = new ModelManager(appContext.getFilesDir());
+        long initMono = this.obdClient.monotonicMs();
+        this.nextBootModelCheckMonoMs = initMono + 4000L;
+        this.modelManager.initFromDisk(this.recorder, initMono);
     }
 
     private static CloudUploadConfig loadFromPrefs(SharedPreferences p) {
@@ -289,6 +295,28 @@ public final class BrakeEngine {
         return cloudStore.load();
     }
 
+    public ModelManager getModelManager() {
+        return modelManager;
+    }
+
+    public String getActiveModelBadge() {
+        return modelManager.getActiveModelBadge();
+    }
+
+    public ModelManager.UpdateOutcome updateModelNow() {
+        return modelManager.checkForUpdate(
+                true,
+                config,
+                detectActiveTransport(),
+                findUsbRoots(),
+                recorder,
+                obdClient.monotonicMs());
+    }
+
+    public ModelManager.UpdateOutcome resetToBuiltInModel() {
+        return modelManager.resetToBuiltIn(recorder, obdClient.monotonicMs());
+    }
+
     public boolean isExportInFlight() {
         return exportInFlight.get();
     }
@@ -366,6 +394,7 @@ public final class BrakeEngine {
             updated.put("auto_upload_cloud", Boolean.toString(config.autoUploadCloud));
             updated.put("cloud_allow_lte", Boolean.toString(config.cloudAllowLte));
             updated.put("usb_backup_when_cloud", Boolean.toString(config.usbBackupWhenCloud));
+            updated.put("auto_update_model", Boolean.toString(config.autoUpdateModel));
         }
         IndicatorConfig newCfg = IndicatorConfig.fromMap(updated);
         config = newCfg;
@@ -611,10 +640,40 @@ public final class BrakeEngine {
                 if (notifyToastOnSuccess && out.ok) {
                     notifyAutoToast(out);
                 }
+                if (!forceCloudOnly
+                        && trigger == AutoExportCoordinator.Trigger.SHIFT_TO_PARK
+                        && config.autoUpdateModel
+                        && !liveDriveCheckBridge().isCurrentlyOutOfPark()) {
+                    performParkedAutoModelCheck(notifyToastOnSuccess);
+                }
                 return out;
             } finally {
                 exportInFlight.set(false);
             }
+        }
+    }
+
+    private void performParkedAutoModelCheck(boolean notifyToastOnUpdate) {
+        BrakeEvaluator.Snapshot cur = latestSnapshot;
+        if (cur != null && AutoExportCoordinator.isOutOfParkState(cur.gearPark, cur.speedKmh, cur.moving)) {
+            return;
+        }
+        AutoExportCoordinator.TransportInfo net = detectActiveTransport();
+        if (net.kind == AutoExportCoordinator.TransportKind.NONE) {
+            return;
+        }
+        modelManager.markBootParkedCheckDone();
+        ModelManager.UpdateOutcome mOut = modelManager.checkForUpdate(
+                false,
+                config,
+                net,
+                null,
+                recorder,
+                obdClient.monotonicMs());
+        if (mOut.updated && notifyToastOnUpdate) {
+            try {
+                HmgApi.toast(appContext, mOut.message);
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -697,6 +756,7 @@ public final class BrakeEngine {
     }
 
     private void evalLoop() {
+        boolean sawOutOfParkForModel = false;
         while (running.get()) {
             long tickStartMono = obdClient.monotonicMs();
             try {
@@ -730,9 +790,16 @@ public final class BrakeEngine {
                         -1,
                         hmgSampleElapsedMs);
 
-                BrakeEvaluator.Snapshot snap = evaluator.evaluate(cfg, input);
+                BrakeEvaluator.Snapshot snap =
+                        modelManager.evaluateTick(cfg, input, readings, recorder, tickStartMono);
                 latestSnapshot = snap;
                 recorder.record(snap, System.currentTimeMillis());
+
+                if (Boolean.FALSE.equals(snap.gearPark)) {
+                    sawOutOfParkForModel = true;
+                }
+                boolean parkedNearRest = Boolean.TRUE.equals(snap.gearPark)
+                        && (snap.speedKmh == null || snap.speedKmh.floatValue() < 3.0f);
 
                 boolean anyAutoEnabled = cfg.autoExportUsb
                         || cloudStore.load().isReadyForAutoUpload(cfg);
@@ -746,6 +813,9 @@ public final class BrakeEngine {
                 if (dueTrigger != AutoExportCoordinator.Trigger.NONE
                         && !exportInFlight.get()
                         && autoExportQueued.compareAndSet(false, true)) {
+                    if (dueTrigger == AutoExportCoordinator.Trigger.SHIFT_TO_PARK) {
+                        sawOutOfParkForModel = false;
+                    }
                     autoExportExecutor.execute(new Runnable() {
                         @Override
                         public void run() {
@@ -768,6 +838,26 @@ public final class BrakeEngine {
                             } catch (Throwable ignored) {
                             } finally {
                                 queueDrainInFlight.set(false);
+                            }
+                        }
+                    });
+                } else if (parkedNearRest
+                        && cfg.autoUpdateModel
+                        && (sawOutOfParkForModel
+                                || (modelManager.shouldRunBootParkedCheck()
+                                        && tickStartMono >= nextBootModelCheckMonoMs))
+                        && !exportInFlight.get()
+                        && bootModelCheckInFlight.compareAndSet(false, true)) {
+                    sawOutOfParkForModel = false;
+                    nextBootModelCheckMonoMs = tickStartMono + 15000L;
+                    autoExportExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                performParkedAutoModelCheck(true);
+                            } catch (Throwable ignored) {
+                            } finally {
+                                bootModelCheckInFlight.set(false);
                             }
                         }
                     });

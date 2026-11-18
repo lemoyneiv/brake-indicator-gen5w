@@ -28,10 +28,10 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.8.1 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.9.0 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
  *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Upload Cloud`, `Test Cloud`,
- *    `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close`), and inline action feedback.
+ *    `Update Model`, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close`), and inline action feedback.
  *  - Center Status Monitor Card: Full-vertical-height, high-contrast driving-legible rows
  *    (`Real OBD (22BC06)` through `RAM Dataset Buffer`) with semantic M3 tonal status pills.
  *  - Right OBD-II & Transition Log Card: `@hmgapi-ble` scanner discovery list and full-height
@@ -296,7 +296,7 @@ public final class MainActivity extends Activity
         // Primary full-width driving action: Mark Log
         Button markLogBtn = m3Button(
                 "Mark Log",
-                widescreen ? 18.5f : 16.0f,
+                widescreen ? 18.0f : 16.0f,
                 M3_PRIMARY_CONTAINER,
                 M3_PRIMARY_CONTAINER_PRESSED,
                 M3_ON_PRIMARY_CONTAINER,
@@ -311,8 +311,8 @@ public final class MainActivity extends Activity
                     }
                 });
         LinearLayout.LayoutParams markLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 52 : 46);
-        markLp.topMargin = 12;
+                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 48 : 42);
+        markLp.topMargin = 10;
         sidebar.addView(markLogBtn, markLp);
 
         // Secondary full-width mode selector pill
@@ -331,11 +331,11 @@ public final class MainActivity extends Activity
                     }
                 });
         LinearLayout.LayoutParams modeLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 46 : 40);
-        modeLp.topMargin = 7;
+                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 42 : 38);
+        modeLp.topMargin = 6;
         sidebar.addView(modeToggleBtn, modeLp);
 
-        int pairRowHeight = widescreen ? 44 : 40;
+        int pairRowHeight = widescreen ? 41 : 37;
         float pairBtnFont = widescreen ? 15.0f : 13.0f;
 
         // 2-column row 1: Test (3s) | Export USB
@@ -476,6 +476,33 @@ public final class MainActivity extends Activity
                 });
         sidebar.addView(twoButtonRow(clearBtn, unpairBtn, pairRowHeight), rowPairLayoutParams());
 
+        // Full-width OTA Brake Model action: tap to fetch signed OTA model (or USB .jar), long-press to revert to built-in
+        Button updateModelBtn = m3Button(
+                "Update Model",
+                widescreen ? 15.5f : 13.5f,
+                M3_TERTIARY_CONTAINER,
+                M3_TERTIARY_CONTAINER_PRESSED,
+                M3_ON_PRIMARY_CONTAINER,
+                1,
+                M3_PRIMARY_BORDER,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        updateBrakeModelNow();
+                    }
+                });
+        updateModelBtn.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                resetBrakeModelToBuiltIn();
+                return true;
+            }
+        });
+        LinearLayout.LayoutParams updateModelLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 42 : 38);
+        updateModelLp.topMargin = 6;
+        sidebar.addView(updateModelBtn, updateModelLp);
+
         // Bottom-aligned feedback & app version/HMG-API caption
         LinearLayout sidebarFooterInfo = new LinearLayout(this);
         sidebarFooterInfo.setOrientation(LinearLayout.VERTICAL);
@@ -491,20 +518,19 @@ public final class MainActivity extends Activity
         CloudUploadConfig initialCloud = engine.getCloudUploadConfig();
         if (initialCloud.hasCredentials()) {
             actionNoticeText.setText("Cloud ready (" + initialCloud.repo
-                    + ") \u2014 auto-uploads .tar.gz on Park or 95% buffer.");
+                    + ") \u2014 Park auto-uploads log & checks OTA model.");
         } else {
-            actionNoticeText.setText("Auto-exports to USB on Park/95% (add BrakeIndicator/"
-                    + CloudUploadConfig.USB_CONFIG_FILE + " + Test Cloud for LTE GitHub upload).");
+            actionNoticeText.setText("Auto-checks OTA model on Park (hold Update Model to reset to built-in).");
         }
         sidebarFooterInfo.addView(actionNoticeText);
 
         configSummaryText = new TextView(this);
         configSummaryText.setTextColor(M3_ON_SURFACE_MUTED);
-        configSummaryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 13.5f : 12.0f);
+        configSummaryText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 13.0f : 11.5f);
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("Brake Indicator v0.8.1");
+        configSummaryText.setText("v0.9.0 \u00B7 Model " + engine.getActiveModelBadge());
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
@@ -513,7 +539,7 @@ public final class MainActivity extends Activity
         // Outlined Material 3 Close pill at bottom of sidebar
         Button closeBtn = m3Button(
                 "Close",
-                widescreen ? 16.5f : 14.5f,
+                widescreen ? 16.0f : 14.0f,
                 M3_SURFACE_CONTAINER,
                 M3_SURFACE_CONTAINER_HIGHEST,
                 M3_ON_SURFACE,
@@ -527,7 +553,7 @@ public final class MainActivity extends Activity
                 });
         LinearLayout.LayoutParams closeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, pairRowHeight);
-        closeLp.topMargin = 8;
+        closeLp.topMargin = 6;
         sidebar.addView(closeBtn, closeLp);
 
         root.addView(sidebar, sidebarLp);
@@ -694,7 +720,8 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.8.1 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
+                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                        + " \u00B7 HMG: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
 
         // 1. Real OBD (770 / 22BC06)
@@ -1012,6 +1039,57 @@ public final class MainActivity extends Activity
         worker.start();
     }
 
+    private void updateBrakeModelNow() {
+        actionNoticeText.setText("Checking GitHub ota channel for signed brake model update...");
+        Thread worker = new Thread("BrakeModelUpdate") {
+            @Override
+            public void run() {
+                final ModelManager.UpdateOutcome out = engine.updateModelNow();
+                if (out.updated) {
+                    try {
+                        HmgApi.toast(MainActivity.this, out.message);
+                    } catch (Exception ignored) {}
+                }
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        String suffix = (!out.updated && out.activeIsOta)
+                                ? " (hold button to reset to built-in)"
+                                : "";
+                        actionNoticeText.setText(out.message + suffix);
+                        setTextIfChanged(configSummaryText,
+                                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                        + " \u00B7 HMG: " + engine.getHmgStatusSummary());
+                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void resetBrakeModelToBuiltIn() {
+        Thread worker = new Thread("BrakeModelReset") {
+            @Override
+            public void run() {
+                final ModelManager.UpdateOutcome out = engine.resetToBuiltInModel();
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        actionNoticeText.setText(out.message);
+                        setTextIfChanged(configSummaryText,
+                                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                        + " \u00B7 HMG: " + engine.getHmgStatusSummary());
+                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
     private static String sidebarModeLabel(IndicatorConfig.ObdMode mode) {
         if (mode == IndicatorConfig.ObdMode.MODEL_ONLY_ICON) {
             return "Mode: Model Icon (Score OBD)";
@@ -1044,7 +1122,7 @@ public final class MainActivity extends Activity
     private static LinearLayout.LayoutParams rowPairLayoutParams() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = 7;
+        lp.topMargin = 6;
         return lp;
     }
 

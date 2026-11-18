@@ -113,6 +113,7 @@ public final class IndicatorConfig {
     public final boolean autoUploadCloud;
     public final boolean cloudAllowLte;
     public final boolean usbBackupWhenCloud;
+    public final boolean autoUpdateModel;
 
     public IndicatorConfig(
             ObdMode obdMode,
@@ -141,7 +142,8 @@ public final class IndicatorConfig {
                 true,
                 true,
                 true,
-                false);
+                false,
+                true);
     }
 
     public IndicatorConfig(
@@ -172,7 +174,8 @@ public final class IndicatorConfig {
                 autoExportUsb,
                 true,
                 true,
-                false);
+                false,
+                true);
     }
 
     public IndicatorConfig(
@@ -191,6 +194,42 @@ public final class IndicatorConfig {
             boolean autoUploadCloud,
             boolean cloudAllowLte,
             boolean usbBackupWhenCloud) {
+        this(
+                obdMode,
+                signalMode,
+                offState,
+                anchor,
+                xOffsetPx,
+                yOffsetPx,
+                iconSizePx,
+                pressureThreshold,
+                decelThresholdMps2,
+                standstillHold,
+                bridgePort,
+                autoExportUsb,
+                autoUploadCloud,
+                cloudAllowLte,
+                usbBackupWhenCloud,
+                true);
+    }
+
+    public IndicatorConfig(
+            ObdMode obdMode,
+            SignalMode signalMode,
+            OffState offState,
+            Anchor anchor,
+            int xOffsetPx,
+            int yOffsetPx,
+            int iconSizePx,
+            float pressureThreshold,
+            float decelThresholdMps2,
+            boolean standstillHold,
+            int bridgePort,
+            boolean autoExportUsb,
+            boolean autoUploadCloud,
+            boolean cloudAllowLte,
+            boolean usbBackupWhenCloud,
+            boolean autoUpdateModel) {
         this.obdMode = obdMode == null ? ObdMode.OBD_WHEN_CONNECTED : obdMode;
         this.signalMode = signalMode == null ? SignalMode.PRESSURE_AND_DECEL : signalMode;
         this.offState = offState == null ? OffState.HIDDEN : offState;
@@ -206,6 +245,7 @@ public final class IndicatorConfig {
         this.autoUploadCloud = autoUploadCloud;
         this.cloudAllowLte = cloudAllowLte;
         this.usbBackupWhenCloud = usbBackupWhenCloud;
+        this.autoUpdateModel = autoUpdateModel;
     }
 
     public static IndicatorConfig defaults() {
@@ -224,7 +264,8 @@ public final class IndicatorConfig {
                 true,
                 true,
                 true,
-                false);
+                false,
+                true);
     }
 
     public static IndicatorConfig fromMap(Map<String, String> values) {
@@ -246,6 +287,7 @@ public final class IndicatorConfig {
         boolean autoCloud = parseBoolean(values.get("auto_upload_cloud"), true);
         boolean allowLte = parseBoolean(values.get("cloud_allow_lte"), true);
         boolean usbBackup = parseBoolean(values.get("usb_backup_when_cloud"), false);
+        boolean autoModel = parseBoolean(values.get("auto_update_model"), true);
         return new IndicatorConfig(
                 obdMode,
                 mode,
@@ -261,7 +303,8 @@ public final class IndicatorConfig {
                 autoExport,
                 autoCloud,
                 allowLte,
-                usbBackup);
+                usbBackup,
+                autoModel);
     }
 
     /** Icon cell width matches Gen5W's ~1.42:1 status bar cell aspect ratio (51x36 at height 36). */

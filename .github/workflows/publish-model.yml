@@ -1,0 +1,182 @@
+# Build, unit-test, ECDSA-sign, and publish a standalone OTA brake model bundle
+# (models/brake-model-<ver>.jar + latest.json) to the public `ota` branch.
+# Triggered by pushing a `model-v*` tag (e.g. `model-v2026.11.19.1`) or via workflow_dispatch.
+name: Publish OTA Model
+
+on:
+  push:
+    tags: ["model-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MOD: brake-indicator-gen5w
+  HMGAPI_REPO: lemoyneiv/HMG-API
+  OTA_BRANCH: ota
+
+jobs:
+  check-secrets:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_key: ${{ steps.k.outputs.has_key }}
+    steps:
+      - id: k
+        env:
+          MOD_KEY: ${{ secrets.MOD_KEY }}
+          MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+        run: |
+          if [ -n "$MOD_KEY" ] && [ -n "$MOD_KEY_PUB" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "No MOD_KEY secret configured; skipping OTA model publish." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish-model:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_key == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate ota-model.json & tag
+        run: |
+          mver=$(python3 -c 'import json; print(json.load(open("ota-model.json"))["model_version"])')
+          mseq=$(python3 -c 'import json; print(json.load(open("ota-model.json"))["model_seq"])')
+          case "$GITHUB_REF_NAME" in
+            model-v*)
+              test "model-v$mver" = "$GITHUB_REF_NAME" || {
+                echo "tag $GITHUB_REF_NAME does not match ota-model.json model_version ($mver)"
+                exit 1
+              }
+              ;;
+          esac
+          echo "MODEL_VER=$mver" >> "$GITHUB_ENV"
+          echo "MODEL_SEQ=$mseq" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq clang lld zip unzip mksh
+
+      - name: Which SDK
+        id: pin
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          p = json.load(open("hmgapi-sdk.json"))
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          if set(p) == {"ref"} and re.fullmatch(r"[0-9a-f]{40}", p["ref"]):
+              out.write("form=ref\nref=%s\n" % p["ref"])
+          elif set(p) == {"version", "sha256"} and re.fullmatch(r"\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?", p["version"]) and re.fullmatch(r"[0-9a-f]{64}", p["sha256"]):
+              out.write("form=release\nversion=%s\nsha256=%s\n" % (p["version"], p["sha256"]))
+          else:
+              sys.exit('hmgapi-sdk.json: wanted {"ref": "<40 hex>"} or {"version": "x.y.z", "sha256": "<64 hex>"}')
+          PY
+
+      - name: HMG-API at the pinned commit
+        if: steps.pin.outputs.form == 'ref'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.HMGAPI_REPO }}
+          ref: ${{ steps.pin.outputs.ref }}
+          path: .hmgapi-src
+          persist-credentials: false
+
+      - name: The SDK
+        env:
+          FORM: ${{ steps.pin.outputs.form }}
+          SDK_VERSION: ${{ steps.pin.outputs.version }}
+          SHA256: ${{ steps.pin.outputs.sha256 }}
+        run: |
+          S="$RUNNER_TEMP/hmgapi-sdk"
+          if [ "$FORM" = ref ]; then
+            (cd .hmgapi-src && ./build.sh sdk)
+            Z=$(ls .hmgapi-src/out/dist/hmgapi-mod-sdk-*.zip)
+          else
+            Z="$RUNNER_TEMP/hmgapi-mod-sdk-$SDK_VERSION.zip"
+            curl -fsSL -o "$Z" "https://github.com/$HMGAPI_REPO/releases/download/v$SDK_VERSION/hmgapi-mod-sdk-$SDK_VERSION.zip"
+            echo "$SHA256  $Z" | sha256sum -c - || { echo "the SDK zip isn't the one hmgapi-sdk.json pins"; exit 1; }
+          fi
+          rm -rf "$S" && mkdir -p "$S" && unzip -q "$Z" -d "$S"
+          rm -rf .hmgapi-src
+          echo "HMGAPI_SDK=$S" >> "$GITHUB_ENV"
+          pip install --require-hashes -r "$S/requirements.txt"
+
+      - name: Run unit tests & build ECDSA-signed OTA model
+        env:
+          MOD_KEY: ${{ secrets.MOD_KEY }}
+          MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+        run: |
+          sh "$MOD/tools/unit/test.sh"
+          umask 077
+          k="$RUNNER_TEMP/keys"
+          mkdir -p "$k"
+          echo "$MOD_KEY" | base64 -d > "$k/author.key"
+          echo "$MOD_KEY_PUB" | base64 -d > "$k/author.key.pub"
+          umask 022
+          REQUIRE_PINNED_MOD_KEY=1 HMGAPI_KEY="$k/author.key" sh ./build-model.sh
+          rm -rf "$k"
+
+      - name: Publish bundle to ota branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          WORK="$RUNNER_TEMP/ota-publish"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$WORK" init -q
+          git -C "$WORK" config user.name "github-actions[bot]"
+          git -C "$WORK" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git -C "$WORK" fetch -q --depth=1 "$REMOTE" "refs/heads/$OTA_BRANCH"; then
+            git -C "$WORK" checkout -q -B "$OTA_BRANCH" FETCH_HEAD
+            if [ -f "$WORK/latest.json" ]; then
+              prev_seq=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model_seq", 0))' "$WORK/latest.json")
+              if [ "$MODEL_SEQ" -lt "$prev_seq" ]; then
+                echo "Refusing to downgrade ota branch model_seq ($MODEL_SEQ < $prev_seq)"
+                exit 1
+              fi
+            fi
+          else
+            git -C "$WORK" checkout -q --orphan "$OTA_BRANCH"
+          fi
+
+          mkdir -p "$WORK/models"
+          cp "dist-model/brake-model-${MODEL_VER}.jar" "$WORK/models/brake-model-${MODEL_VER}.jar"
+          cp "dist-model/latest.json" "$WORK/latest.json"
+
+          # Keep at most the 5 newest signed .jar bundles so the ota branch stays tiny
+          python3 - "$WORK/models" "brake-model-${MODEL_VER}.jar" <<'PY'
+          import os, sys
+          mdir, current = sys.argv[1:3]
+          jars = sorted(f for f in os.listdir(mdir) if f.startswith("brake-model-") and f.endswith(".jar"))
+          while len(jars) > 5:
+              victim = jars.pop(0)
+              if victim == current and jars:
+                  victim = jars.pop(0)
+              os.remove(os.path.join(mdir, victim))
+          PY
+
+          git -C "$WORK" add -A
+          if git -C "$WORK" diff --cached --quiet; then
+            echo "OTA branch already at model $MODEL_VER (seq=$MODEL_SEQ); nothing to push."
+          else
+            git -C "$WORK" commit -q -m "ota: publish signed brake model $MODEL_VER (seq=$MODEL_SEQ)"
+            git -C "$WORK" push -q "$REMOTE" "HEAD:refs/heads/$OTA_BRANCH"
+            echo "Published brake-model-${MODEL_VER}.jar (seq=$MODEL_SEQ) to branch $OTA_BRANCH."
+          fi
+          rm -rf "$WORK"

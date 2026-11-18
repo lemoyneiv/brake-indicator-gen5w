@@ -147,6 +147,13 @@
       "description": "When enabled and a USB stick is attached, writes plain CSV + summary to <usb>/BrakeIndicator/ in addition to uploading to GitHub."
     },
     {
+      "key": "auto_update_model",
+      "type": "toggle",
+      "title": "Auto-update brake model from GitHub on Park",
+      "default": true,
+      "description": "Checks the public ota branch of lemoyneiv/brake-indicator-gen5w while parked (throttled via ETag / 15m cooldown) and hot-swaps ECDSA-signed ~16 KB model updates without reinstalling the app."
+    },
+    {
       "key": "bridge_port",
       "type": "number",
       "title": "Loopback ELM327 bridge port",

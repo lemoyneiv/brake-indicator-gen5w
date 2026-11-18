@@ -1,5 +1,7 @@
 package dev.lemoyne.brakeindicator;
 
+import java.util.Map;
+
 /**
  * Evaluates built-in HMG-API vehicle readings (`brake.pressure`, `speed`, `pedal.accel`,
  * `gear.park`, `parking_brake`, `moving`, `steering.angle`, `hv.soc`) alongside optional
@@ -30,7 +32,10 @@ package dev.lemoyne.brakeindicator;
  *   release cleanly when the brake pedal is lifted while preserving true Auto-Hold, `i-Pedal`,
  *   and SCC standstill holds.
  */
-public final class BrakeEvaluator {
+public final class BrakeEvaluator implements BrakeModel {
+
+    public static final String BUILTIN_MODEL_VERSION = "2026.11.18.1";
+    public static final long BUILTIN_MODEL_SEQ = 2026111801L;
 
     public static final int REGEN_LEVEL_UNKNOWN = -1;
     public static final int REGEN_LEVEL_0       = 0;
@@ -213,6 +218,7 @@ public final class BrakeEvaluator {
         return 1.05f * norm * norm;
     }
 
+    // === HOST_ABI_DTOS_BEGIN ===
     public static final class ObdSample {
         public final boolean connected;
         public final String transport; // "BLE", "BRIDGE", or ""
@@ -495,6 +501,87 @@ public final class BrakeEvaluator {
             this.autoRegenActive = autoRegenActive;
         }
     }
+    // === HOST_ABI_DTOS_END ===
+
+    @Override
+    public String modelVersion() {
+        return BUILTIN_MODEL_VERSION;
+    }
+
+    @Override
+    public long modelSeq() {
+        return BUILTIN_MODEL_SEQ;
+    }
+
+    @Override
+    public int modelApiVersion() {
+        return BrakeModel.HOST_MODEL_API_VERSION;
+    }
+
+    @Override
+    public Snapshot evaluate(
+            IndicatorConfig config,
+            Input input,
+            Map<String, String> rawHmgReadings) {
+        return evaluate(config, input);
+    }
+
+    @Override
+    public void reset() {
+        pressureLatched = false;
+        decelLatched = false;
+        standstillLatched = false;
+        decelHoldUntilMs = 0L;
+        lastBrakingNearStopMs = 0L;
+        for (int i = 0; i < SPEED_HISTORY_CAP; i++) {
+            histTimeMs[i] = 0L;
+            histSpeedKmh[i] = 0.0f;
+        }
+        histCount = 0;
+        lastProcessedHmgPollMs = -1L;
+        smoothedPollIntervalMs = 100.0f;
+        lastRawDecelMps2 = 0.0f;
+        smoothedDecelMps2 = 0.0f;
+        hasDecelSample = false;
+        coastStartMs = -1L;
+        lastFootBrakeMs = -1L;
+        zeroPedalLiftStartMs = -1L;
+        zeroPedalLiftInitDecelMps2 = 0.0f;
+        featheredIpedalSinceMs = -1L;
+        featheredL3SinceMs = -1L;
+        ipedalLowSpdSinceMs = -1L;
+        ipedalCruiseSinceMs = -1L;
+        ipedalLaunchSinceMs = -1L;
+        ipedalFeatherPromoteSinceMs = -1L;
+        creepTaperSinceMs = -1L;
+        lowPedalCruiseSinceMs = -1L;
+        inferredRegenLevel = REGEN_LEVEL_UNKNOWN;
+        sccActive = false;
+        autoRegenActive = false;
+        confirmedZeroRegenCoast = false;
+        autoRegenBaseLevel = REGEN_LEVEL_0;
+        coastMinChordDecel = Float.MAX_VALUE;
+        coastMaxChordDecel = -Float.MAX_VALUE;
+        coastRecordedHigh = false;
+        consecutiveFixedHighCoasts = 0;
+        autoRegenSustainedSinceMs = -1L;
+        autoLightThrottleSinceMs = -1L;
+        postBrakeStepConfirmed = false;
+        pressureLatchPeakBar = 0.0f;
+        prevParkingBrake = false;
+        epbEngagedInDrive = false;
+        epbAutoReleasing = false;
+        autoHoldConfirmedOff = false;
+        recentZeroSpeedMs = -1L;
+        zeroPedalStationaryStartMs = -1L;
+        lowDecelFeatherCoastSinceMs = -1L;
+        sccZeroPedalStartMs = -1L;
+        sccAnchorMs = -1L;
+        sccAnchorSpeedKmh = 0.0f;
+        sccManualThrottleSinceMs = -1L;
+        sccSustainedDecelSinceMs = -1L;
+        confirmedForwardDrive = false;
+    }
 
     private boolean pressureLatched;
     private boolean decelLatched;
@@ -551,8 +638,12 @@ public final class BrakeEvaluator {
     private long sccSustainedDecelSinceMs = -1L;
     private boolean confirmedForwardDrive;
 
-    public Snapshot evaluate(IndicatorConfig cfg, Input in) {
+    public Snapshot evaluate(IndicatorConfig cfg, Input rawIn) {
         IndicatorConfig config = cfg == null ? IndicatorConfig.defaults() : cfg;
+        Input in = rawIn == null
+                ? new Input(0L, null, null, null, null, null, null, null, null,
+                        ObdSample.disconnected(), 0L, -1, -1L)
+                : rawIn;
         long effPollMs = in.hmgSampleElapsedMs > 0L ? in.hmgSampleElapsedMs : in.nowMs;
 
         // 1. Update poll-aligned longitudinal deceleration (-dv/dt)

@@ -6,11 +6,11 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
 
 ---
 
-## Architecture (`v0.8.1`)
+## Architecture (`v0.9.0`)
 
 `brake-indicator-gen5w` is completely standalone (`"live": true`, `"ble": {"central": true}`, zero `/system` file patches, zero `root` mod daemons) and runs inside a single lightweight Android app (`app/BrakeIndicator.apk`, `OverlayService` + `BrakeEngine`):
 
-1. **Poll-Aligned Evaluation & E-GMP UN ECE R13-H Brake-Lamp Model (`BrakeEngine` + `BrakeEvaluator`)**:
+1. **Poll-Aligned Evaluation & E-GMP UN ECE R13-H Brake-Lamp Model (`BrakeEngine` + `BrakeModel` + `BrakeEvaluator`)**:
    - Runs a dedicated `50 ms` (`20 Hz`) evaluation and RAM telemetry recorder thread while polling HMG-API's built-in readings (`brake.pressure`, `speed`, `pedal.accel`, `gear.park`, `parking_brake`, `moving`, `steering.angle`, `hv.soc`) over `@hmgapid` (`LFD1`) at `20 Hz` (`< 2 ms` with `100 ms` `speed`/`moving` freshness on updated HMG-API, or `650 ms` with automatic `90 ms` `'O'`-frame recovery on legacy KitKat `Hub`s).
    - Aligns longitudinal `-dv/dt` updates to exact HMG-API poll timestamps (`hmgSampleElapsedMs`), suppresses `< 560 ms` `0.8 km/h` (`0.5 mph`) cluster speed-quantization repeats while bounding stale high deceleration across flat-speed intervals on `20 Hz` Hubs, gates `lastFootBrakeMs` on latched pedal pressure (`pressureLatched`) so sub-latch pedal brushes never cut off active regen, isolates mild post-foot-brake hydraulic & intersection trail-braking turn-scrub (`>= 80°` steering above `18 km/h`) `-dv/dt` tails, and subtracts both passive highway aerodynamic drag excess above `36 km/h` (`10 m/s`) and low-speed full-lock Ackermann tire-scrub drag (`|steering.angle| > 220°` below `18.5 km/h` in `L0 / L1 / Auto`) so wind drag and sharp turns do not masquerade as motor regen torque:
      1. **Hydraulic / IEB Cylinder Pressure** (`brake.pressure` with a responsive `0.4` onset threshold, poll-rate-aware rolling brush sensitivity [`0.26 bar` on `20 Hz` Hubs], gentle low-speed feather hold [`0.18 bar` release], and `409.5` CAN-invalid filtering for instant foot-pedal & IEB hydraulic braking).
@@ -22,14 +22,20 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
    - **`i-Pedal` (`4`) vs `L3` (`3`) Shifted-Neutral Discrimination**: Accounts for E-GMP's ignition-cycle `i-Pedal → L3` reset and `L3`'s upward-shifted neutral-pedal curve (`7–11%` urban, `20–21%` at `45–60 km/h`, `27–31%` at `70–100 km/h`—sitting `5–12%` below `i-Pedal` across all speeds). Distinguishes `i-Pedal` from `L3` and `Auto Regen` via post-Park cold-start urban pull-away throttle (`29.5–38.5%` pedal at `8–36 km/h`), post-brake-settled steering-scrub-compensated low-speed zero-pedal full-stop regen (`2–14 km/h` at `>= 1.35 m/s²`), speed-scaled urban & highway neutral-pedal cruise strictly above `L3`'s neutral map (`20.8–31%` across `16–56 km/h` and `24.6–50%` across `56–125 km/h`), and feathered one-pedal braking above `L3`'s highway feathering envelope (`13.5–22.5%` pedal sustaining `>= 0.72–0.86 m/s²` motor regen or `6.8–13.5%` sustaining `>= 1.05 m/s²` at `18–44 km/h`), stepping back down `i-Pedal → L3` on settled low-speed creep taper (`>= 780 ms`) or speed-scaled sub-`i-Pedal` flat cruising (`3–12%` urban up to `24%` at `>= 90 km/h`).
    - **Smart Cruise Control (`SCC / HDA`) Detection**: Detects active SCC from settled zero-pedal acceleration or sustained zero-pedal constant-speed cruise (with an extended `9 s` `L0` slight-downgrade guard), freezing the driver's learned paddle regen mode during SCC stop-and-go and exiting immediately on foot brake, Park/EPB, or sustained manual throttle.
 
-3. **Optional OBD-II Ground-Truth Brake Lamp Reader (`IGMP 770 → 778`, UDS `22 BC06`)**:
+3. **Modular ECDSA-Signed OTA Brake Model Updates over Built-In LTE / Wi-Fi (`BrakeModel` + `ModelBundleVerifier` + `ModelManager`)**:
+   - Decouples the host APK (UI, overlay, `@hmgapid` poller, `@hmgapi-ble` OBD-II stack, TLS 1.2 uploader) from the brake-lamp & regen-inference algorithm (`BrakeModel` interface, `HOST_MODEL_API_VERSION = 1`) so future calibration curves and new state-machine logic ship as ~`16 KB` downloadable `brake-model-<ver>.jar` bundles (`classes.dex`, `min-api 19`) without a USB app reinstall.
+   - **Pinned ECDSA P-256 Verification (`ModelBundleVerifier`)**: Every `.jar` is signed with the mod author's `secp256r1` (`SHA256withECDSA`) key (`UUID = 28ad71e0-07c0-8e61-8bf3-380cc71f9280`, pinned inside the APK). No unverified or downgraded (`model_seq <= activeSeq`) bytecode is ever written to disk or passed to Dalvik `DexClassLoader`.
+   - **Zero-Token Public `ota` Channel + Zero-Flash-Wear Polling (`ModelManager`)**: Fetches `latest.json` and `models/brake-model-<ver>.jar` directly from the public `ota` branch of `lemoyneiv/brake-indicator-gen5w` over `api.github.com` (`Accept: application/vnd.github.raw+json`)—requiring **zero GitHub PAT** and **zero S3 redirects**—automatically when shifting into **Park** (or once per boot while Parked, `auto_update_model = true`), keeping `ETag` (`HTTP 304 Not Modified`) and `15 min` cooldown state strictly in RAM so up-to-date checks cause **zero internal eMMC writes**.
+   - **6-Tick Pre-Swap Self-Test, Same-Tick Watchdog Fallback, & Manual Reset**: Runs a 6-scenario deterministic sanity test before activating any new model, wraps every `50 ms` evaluation tick in a `try/catch (Throwable)` watchdog that falls back on the **exact same tick** to the compiled-in `BrakeEvaluator` and quarantines any faulting plugin, automatically retires older cached OTA models whenever a newer full APK is installed, and provides an **`Update Model`** sidebar button (tap to check GitHub `ota` or import an offline signed `<usb>/BrakeIndicator/brake-model-*.jar`; long-press to revert to the built-in APK model).
+
+4. **Optional OBD-II Ground-Truth Brake Lamp Reader (`IGMP 770 → 778`, UDS `22 BC06`)**:
    - Reads the physical E-GMP Integrated Gateway (`IGMP`) brake-lamp output byte (`22 BC06`: `0` = OFF; bit `0` = `0` [`4, 36, 40, 44`] = pure Regen / i-Pedal / Smart Cruise / Auto-Hold brake lamps ON; bit `0` = `1` [`37, 41, 45`] = physical foot-brake pedal switch active, including `36/37/40/41` turn-signal stop-channel states) to display exact hardware brake-lamp state and score the HMG-API model.
    - **Coexistence & Native HMG-API BLE Central (`ObdBrakeClient`)**:
      1. **Coexistence Check — Localhost ELM327 Bridge (`127.0.0.1:35000`)**: Automatically detects when [`obd-gen5w`](https://github.com/lemoyneiv/obd-gen5w)'s local TCP ELM327 multiplexer bridge is active (`ATI` check) and yields to `127.0.0.1:35000` so two apps never interleave stateful `ATSH` CAN headers over a shared BLE GATT link. Traffic stays strictly on the Linux kernel loopback interface (`lo`) and never touches `wlan0` or wireless projection.
      2. **Direct Native BLE — HMG-API `@hmgapi-ble` (`hmgapi.client.Ble`)**: Uses HMG-API's built-in `"ble": {"central": true}` stack (`@hmgapi-ble` inside `com.android.bluetooth`) to scan and connect directly over BLE GATT to ELM327/STN scanners (Veepeak OBDCheck BLE, Vgate, OBDLink, Nordic NUS, ISSC, etc.) with uninterrupted manual BLE scan windows, immediate `@hmgapi-ble` stream recycling + wake-scan recovery on reconnect/timeout, sticky `ADV_IND` + `SCAN_RSP` advertisement merging, OBD-first scan priority sorting, automatic recovery from incomplete cold-boot GATT discovery, negotiated ATT MTU chunking, strict LNEX BVM02 12V battery-sensor MAC/GATT exclusion + `PROTECT_CHAR fff1` defense-in-depth, read-only command filtering (blocks VIN `0902`/`22F190` and all UDS write services), and `IG OFF` CAN sleep protection.
 
-4. **Live Accuracy Scorer, Zero-Flash-Write RAM Dataset, Cloud LTE/Wi-Fi Upload, & USB Fallback (`TelemetryRecorder` + `AutoExportCoordinator` + `GitHubUploader` + `TlsHttpClient` + `UsbExporter`)**:
-   - Continuously scores the HMG-API model against live OBD `22 BC06` ground truth (`TP`, `FP`, `TN`, `FN`, overall agreement %, precision %, recall %, separate Pedal Switch vs Pure Regen/SCC recall %, and signed onset/release lag in `ms`), and logs deduplicated BLE session/scan diagnostic transitions directly into `brake-summary-<timestamp>.txt`.
+5. **Live Accuracy Scorer, Zero-Flash-Write RAM Dataset, Cloud LTE/Wi-Fi Upload, & USB Fallback (`TelemetryRecorder` + `AutoExportCoordinator` + `GitHubUploader` + `TlsHttpClient` + `UsbExporter`)**:
+   - Continuously scores the active `BrakeModel` against live OBD `22 BC06` ground truth (`TP`, `FP`, `TN`, `FN`, overall agreement %, precision %, recall %, separate Pedal Switch vs Pure Regen/SCC recall %, and signed onset/release lag in `ms`), stamps `Active Brake Model` (`builtin` vs `OTA` + SHA-256) into `brake-summary-<timestamp>.txt` and cloud upload commit messages, and logs deduplicated BLE/OTA diagnostic transitions.
    - Buffers up to `36,000` synchronized HMG-API + OBD + Regen Mode rows (~30 minutes at `20 Hz`, automatically downsampled to `1 Hz` while quietly parked) in compact primitive arrays in RAM (zero internal eMMC flash writes).
    - **Automatic Compressed GitHub Cloud Upload over Built-In LTE / Wi-Fi (`auto_upload_cloud = true` by default)**:
      - Compresses `brake-dataset-<stamp>.csv` + `brake-summary-<stamp>.txt` purely in RAM into a standard POSIX `.tar.gz` archive (`drives/YYYY-MM-DD/brake-drive-<stamp>-<trigger>.tar.gz`, shrinking a 30-min `~3.8 MB` drive to `~250–320 KB`) and uploads it via HTTPS (`PUT /repos/<owner>/<repo>/contents/...`) on **shift to Park** or **95% RAM buffer capacity** (`34,200 / 36,000` rows).
@@ -38,9 +44,9 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
      - **One-Time Zero-Typing USB Provisioning (`<usb>/BrakeIndicator/cloud-upload.json`)**: Drop a Fine-Grained GitHub PAT (`Contents: Read and write` scoped strictly to a dedicated private logs repository) into `BrakeIndicator/cloud-upload.json` on a USB drive once; the app imports the config into private `SharedPreferences` and atomically scrubs the plaintext `"token"` field on the USB stick (`"token_imported_at"` receipt).
    - **Automatic & Manual USB Fallback (`auto_export_usb = true` by default)**: Whenever cloud upload is unconfigured, disabled, or offline with a FAT32/exFAT USB stick attached (or when `usb_backup_when_cloud = true`), atomically writes plain `BrakeIndicator/brake-dataset-<timestamp>.csv` and `BrakeIndicator/brake-summary-<timestamp>.txt` (`*.part` + `fsync` + `rename`) and clears the exported rows cleanly.
 
-5. **Top-Bar Overlay & Material 3 Widescreen Dashboard (`OverlayService` + `MainActivity`)**:
+6. **Top-Bar Overlay & Material 3 Widescreen Dashboard (`OverlayService` + `MainActivity`)**:
    - Renders an anti-aliased brake-lamp icon in a non-touchable `TYPE_SYSTEM_OVERLAY` window (`FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE | FLAG_LAYOUT_IN_SCREEN`) aligned with the top status bar row (`51×36` px default), visible across the Gen5W launcher, built-in navigation, and wireless projection without intercepting touches.
-   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) styled in **Material 3 Dark**: a driver-side control sidebar (`Mark Log`, **OBD Mode** toggle, `Test (3s)`, `Export USB`, `Upload Cloud` | `Test Cloud` 4-stage LTE/TLS/GitHub diagnostic, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close` stadium-pill buttons), a full-vertical-height driving-legible **Status Monitor** (`Real OBD` through `RAM Dataset Buffer` with semantic tonal status pills including live `SYNCING`, `CLOUD · N`, `QUEUED · N`, `AUTO CLOUD`, `AUTO USB`, and `WAIT USB`), and a full-height BLE pairing & live transition log card.
+   - Provides a **Brake Indicator** tile in the Gen5W launcher (and an optional ★ custom button entry) styled in **Material 3 Dark**: a driver-side control sidebar (`Mark Log`, **OBD Mode** toggle, `Test (3s)`, `Export USB`, `Upload Cloud` | `Test Cloud` 4-stage LTE/TLS/GitHub diagnostic, `Update Model` [long-press to revert to built-in], `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close` stadium-pill buttons), a full-vertical-height driving-legible **Status Monitor** (`Real OBD` through `RAM Dataset Buffer` with semantic tonal status pills including live `SYNCING`, `CLOUD · N`, `QUEUED · N`, `AUTO CLOUD`, `AUTO USB`, and `WAIT USB`), and a full-height BLE pairing & live transition log card.
 
 ---
 
@@ -66,6 +72,8 @@ To stream compressed `.tar.gz` drive logs over the car's built-in LTE modem or W
    ```
 4. Plug the USB stick into the head unit once (with USB ADB off) and tap **`Test Cloud`** in **Brake Indicator**. The app imports your credentials, scrubs `"token"` from the USB stick, and verifies `Network → DNS → TCP :443 → TLS 1.2 → GitHub API` write access.
 
+> **Note:** OTA Brake Model updates (`auto_update_model`) fetch public ECDSA-signed `.jar` bundles from `lemoyneiv/brake-indicator-gen5w@ota` and work out-of-the-box over LTE/Wi-Fi **without** needing `cloud-upload.json`.
+
 ---
 
 ## Settings (`settings.json`)
@@ -84,8 +92,9 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 | `pressure_threshold` | `4` | `brake.pressure` threshold in tenths (`4` = `0.4`) for immediate foot-pedal response |
 | `decel_threshold` | `12` | Regen / Smart Cruise deceleration threshold scale in tenths of `m/s²` (`12` = default E-GMP calibration) |
 | `standstill_hold` | `true` | Keep illuminated at `0 km/h` after an Auto-Hold, regen, or Smart Cruise stop until throttle, creep, EPB, or Park |
+| `auto_update_model` | `true` | Automatically check for and verify ECDSA-signed OTA brake model updates (`ota` branch) when Parked over LTE/Wi-Fi |
 | `auto_upload_cloud` | `true` | Automatically compress and upload drive logs (`.tar.gz`) to GitHub when `cloud-upload.json` credentials have been imported |
-| `cloud_allow_lte` | `true` | Allow automatic cloud uploads over the head unit's built-in cellular/LTE modem (`false` restricts cloud uploads to Wi-Fi / hotspot) |
+| `cloud_allow_lte` | `true` | Allow automatic cloud uploads and automatic Park OTA model checks over the head unit's built-in cellular/LTE modem (`false` restricts auto network sync to Wi-Fi / hotspot) |
 | `usb_backup_when_cloud` | `false` | Also write plain `.csv` + `.txt` copies to a mounted USB drive even when cloud upload is active |
 | `auto_export_usb` | `true` | Automatically export CSV + summary to `<usb>/BrakeIndicator/` on shifting into Park or reaching 95% RAM buffer capacity when a USB stick is attached (acts as automatic offline fallback when cloud upload is unconfigured or unreachable), then clear the buffer |
 | `bridge_port` | `35000` | Localhost TCP ELM327 coexistence/fallback port (`127.0.0.1:<port>`, matching `obd-gen5w`) |
@@ -96,23 +105,24 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 
 Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
 
-- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.8.1-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.8.1.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
-- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.8.1-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
-- **Direct Packages:** `brake-indicator-gen5w-v0.8.1.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.8.1-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.9.0-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.9.0.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.9.0-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
+- **Direct Packages:** `brake-indicator-gen5w-v0.9.0.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.9.0-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
 
-> **Note on USB Provisioning / USB Export & USB Host Mode:** When importing `BrakeIndicator/cloud-upload.json` or exporting calibration CSV datasets to USB, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
+> **Note on USB Provisioning / USB Export & USB Host Mode:** When importing `BrakeIndicator/cloud-upload.json`, importing an offline `BrakeIndicator/brake-model-*.jar`, or exporting calibration CSV datasets to USB, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
 
 ---
 
-## Building & Signing Installable Packages
+## Building & Signing Installable Packages & OTA Models
 
 Requires Java 17+, Python 3, the Android SDK (`ANDROID_HOME` with `platforms/android-19` and `build-tools`), and an unpacked HMG-API Mod SDK (`HMGAPI_SDK` or `../HMG-API`):
 
 ```sh
-./build.sh
+./build.sh        # Full host APK + HMG-API & NEMESIS installable .zip packages into dist/
+./build-model.sh  # Standalone ~16 KB ECDSA-signed OTA brake-model-<ver>.jar + latest.json into dist-model/
 ```
 
-`./build.sh` compiles the APK, runs both test suites and `check-scripts.sh`, signs with `${HMGAPI_KEY:-~/.hmgapi/author.key}`, and writes all four installable `.zip` archives plus `SHA256SUMS` into `dist/`.
+Pushing a `model-v*` tag (for example `model-v2026.11.19.1` after bumping `ota-model.json`) triggers `.github/workflows/publish-model.yml` to run the host unit test suite, sign `brake-model-<ver>.jar` with `MOD_KEY`, and publish `latest.json` + `models/brake-model-<ver>.jar` onto the `ota` branch for automatic in-car download.
 
 ## License
 

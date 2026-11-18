@@ -1,0 +1,7 @@
+{
+  "model_version": "2026.11.18.1",
+  "model_seq": 2026111801,
+  "min_host_api": 1,
+  "max_host_api": 1,
+  "entry_class": "dev.lemoyne.brakeindicator.model.OtaBrakeEvaluator"
+}

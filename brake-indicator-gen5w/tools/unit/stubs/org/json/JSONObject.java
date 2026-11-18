@@ -89,6 +89,17 @@ public class JSONObject {
         return fallback;
     }
 
+    public long optLong(String name, long fallback) {
+        Object v = opt(name);
+        if (v instanceof Number) return ((Number) v).longValue();
+        if (v instanceof String) {
+            try {
+                return Long.parseLong(((String) v).trim());
+            } catch (NumberFormatException ignored) {}
+        }
+        return fallback;
+    }
+
     public JSONObject optJSONObject(String name) {
         Object v = opt(name);
         return (v instanceof JSONObject) ? (JSONObject) v : null;

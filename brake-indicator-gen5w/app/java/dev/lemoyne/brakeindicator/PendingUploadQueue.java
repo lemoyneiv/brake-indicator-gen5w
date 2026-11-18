@@ -102,11 +102,18 @@ public final class PendingUploadQueue {
             scorePart = "OBD=standby";
         }
 
+        String modelPart = (payload != null
+                && payload.activeModelTag != null
+                && !payload.activeModelTag.isEmpty())
+                ? (", model=" + payload.activeModelTag)
+                : "";
+
         String commitMsg = String.format(
                 Locale.US,
-                "drive(%s): %,d rows, %s (%d KB gz)",
+                "drive(%s): %,d rows%s, %s (%d KB gz)",
                 slug,
                 Integer.valueOf(payload.exportedRows),
+                modelPart,
                 scorePart,
                 Integer.valueOf(kb));
 

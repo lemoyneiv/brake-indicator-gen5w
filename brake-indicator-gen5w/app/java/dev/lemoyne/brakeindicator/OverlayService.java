@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.PixelFormat;
+import android.net.ConnectivityManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -35,7 +36,14 @@ public final class OverlayService extends Service implements BrakeEngine.StateLi
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            checkModEnabledAndReload();
+            String action = intent != null ? intent.getAction() : null;
+            if (ConnectivityManager.CONNECTIVITY_ACTION.equals(action)) {
+                if (engine != null) {
+                    engine.drainPendingCloudUploadsAsync();
+                }
+            } else {
+                checkModEnabledAndReload();
+            }
         }
     };
 
@@ -50,6 +58,7 @@ public final class OverlayService extends Service implements BrakeEngine.StateLi
         engine.addListener(this);
 
         IntentFilter filter = new IntentFilter(HmgApi.ACTION_STATE_CHANGED);
+        filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
         registerReceiver(stateReceiver, filter);
     }
 

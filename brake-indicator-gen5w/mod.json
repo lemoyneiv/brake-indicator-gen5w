@@ -1,12 +1,12 @@
 {
   "id": "brake-indicator-gen5w",
   "name": "Brake Light Indicator",
-  "version": "0.7.14",
+  "version": "0.8.0",
   "hmgapi": ">=1.0.0",
   "authors": ["lemoyneiv"],
   "license": "AGPL-3.0",
   "repo": "https://github.com/lemoyneiv/brake-indicator-gen5w",
-  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units using E-GMP-calibrated HMG-API vehicle readings, automatic L0/L1/L2/L3/i-Pedal + Auto Regen, Smart Cruise Control (SCC) & Auto-Hold detection, optional OBD-II ground-truth brake lamp telemetry via HMG-API's built-in BLE central (@hmgapi-ble + 127.0.0.1:35000 loopback bridge), and automatic/manual USB calibration dataset export.",
+  "description": "Displays a non-intrusive brake light indicator icon on the top status bar row of Gen5W head units using E-GMP-calibrated HMG-API vehicle readings, automatic L0/L1/L2/L3/i-Pedal + Auto Regen, Smart Cruise Control (SCC) & Auto-Hold detection, optional OBD-II ground-truth brake lamp telemetry via HMG-API's built-in BLE central (@hmgapi-ble + 127.0.0.1:35000 loopback bridge), and automatic compressed GitHub cloud log upload over LTE/Wi-Fi with removable USB fallback.",
   "live": true,
   "ble": {
     "central": true

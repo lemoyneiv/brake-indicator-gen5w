@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.lemoyne.brakeindicator"
-    android:versionCode="19"
-    android:versionName="0.7.14">
+    android:versionCode="20"
+    android:versionName="0.8.0">
 
     <uses-sdk
         android:minSdkVersion="19"
@@ -12,9 +12,10 @@
     <uses-permission android:name="android.permission.GET_TASKS" />
     <!-- Allows non-touchable TYPE_SYSTEM_OVERLAY indicator on the top status bar row -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <!-- Used strictly for 127.0.0.1:35000 loopback ELM327 fallback -->
+    <!-- Used for 127.0.0.1:35000 loopback ELM327 fallback and optional HTTPS GitHub log uploads -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Used for removable USB stick CSV dataset export (<usb>/BrakeIndicator/) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Used for removable USB stick CSV dataset export & one-time cloud-upload.json import -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />

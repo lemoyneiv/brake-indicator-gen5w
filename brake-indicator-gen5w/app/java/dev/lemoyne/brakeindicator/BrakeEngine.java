@@ -2,6 +2,8 @@ package dev.lemoyne.brakeindicator;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 
 import hmgapi.client.HmgApi;
 
@@ -28,8 +30,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * KitKat `Hub`), aligns `-dv/dt` and `L0..i-Pedal` detection to exact HMG-API poll
  * timestamps, fuses or compares them against {@link ObdBrakeClient} (`@hmgapi-ble`
  * central + `127.0.0.1:35000` bridge coexistence), records a 30-minute synchronized CSV
- * dataset in RAM, and exports to removable USB (automatically on Park / near-full buffer,
- * or manually from {@link MainActivity}).
+ * dataset in RAM, and uploads compressed `.tar.gz` logs to GitHub over LTE/Wi-Fi (with
+ * in-RAM offline queue and removable USB fallback).
  */
 public final class BrakeEngine {
 
@@ -53,6 +55,17 @@ public final class BrakeEngine {
     private static final String KEY_OBD_MAC = "obd_mac";
     private static final String KEY_OBD_NAME = "obd_name";
     private static final String KEY_OBD_ADDR_TYPE = "obd_addr_type";
+
+    private static final String CLOUD_PREFS_NAME = "brake_cloud_upload";
+    private static final String KEY_CLOUD_ENABLED = "enabled";
+    private static final String KEY_CLOUD_REPO = "repo";
+    private static final String KEY_CLOUD_BRANCH = "branch";
+    private static final String KEY_CLOUD_TOKEN = "token";
+    private static final String KEY_CLOUD_ALLOW_LTE = "allow_lte";
+    private static final String KEY_CLOUD_USB_TOO = "usb_backup_too";
+    private static final String KEY_CLOUD_DAILY_KB = "daily_limit_kb";
+    private static final String KEY_CLOUD_API_HOST = "api_host";
+    private static final String KEY_CLOUD_API_PORT = "api_port";
 
     private static final String[] VEHICLE_READINGS = {
         "brake.pressure",
@@ -85,6 +98,8 @@ public final class BrakeEngine {
     private final TelemetryRecorder recorder = new TelemetryRecorder();
     private final AutoExportCoordinator autoExport = new AutoExportCoordinator();
     private final HevRegenProbe hevProbe = new HevRegenProbe();
+    private final GitHubUploader gitHubUploader = new GitHubUploader();
+    private final CloudUploadConfig.Store cloudStore;
     private final ObdBrakeClient obdClient;
     private final List<StateListener> listeners = new CopyOnWriteArrayList<StateListener>();
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -92,6 +107,7 @@ public final class BrakeEngine {
     private final Object exportLock = new Object();
     private final AtomicBoolean exportInFlight = new AtomicBoolean(false);
     private final AtomicBoolean autoExportQueued = new AtomicBoolean(false);
+    private final AtomicBoolean queueDrainInFlight = new AtomicBoolean(false);
     private final ExecutorService autoExportExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
@@ -147,6 +163,43 @@ public final class BrakeEngine {
                         .commit();
             }
         };
+        final SharedPreferences cloudPrefs =
+                appContext.getSharedPreferences(CLOUD_PREFS_NAME, Context.MODE_PRIVATE);
+        this.cloudStore = new CloudUploadConfig.Store() {
+            private volatile CloudUploadConfig cached = loadFromPrefs(cloudPrefs);
+
+            @Override
+            public CloudUploadConfig load() {
+                return cached;
+            }
+
+            @Override
+            public void save(CloudUploadConfig cfg) {
+                // Written ONLY on one-time USB cloud-upload.json import (zero background flash writes)
+                CloudUploadConfig safe = cfg == null ? CloudUploadConfig.unconfigured() : cfg;
+                cloudPrefs.edit()
+                        .putBoolean(KEY_CLOUD_ENABLED, safe.enabled)
+                        .putString(KEY_CLOUD_REPO, safe.repo)
+                        .putString(KEY_CLOUD_BRANCH, safe.branch)
+                        .putString(KEY_CLOUD_TOKEN, safe.token)
+                        .putBoolean(KEY_CLOUD_ALLOW_LTE, safe.allowLte)
+                        .putBoolean(KEY_CLOUD_USB_TOO, safe.usbBackupToo)
+                        .putInt(KEY_CLOUD_DAILY_KB, safe.dailyLimitKb)
+                        .putString(KEY_CLOUD_API_HOST, safe.apiHost)
+                        .putInt(KEY_CLOUD_API_PORT, safe.apiPort)
+                        .commit();
+                cached = safe;
+                autoExport.setCloudConfiguredState(safe.hasCredentials());
+            }
+
+            @Override
+            public void clear() {
+                cloudPrefs.edit().clear().commit();
+                cached = CloudUploadConfig.unconfigured();
+                autoExport.setCloudConfiguredState(false);
+            }
+        };
+        this.autoExport.setCloudConfiguredState(this.cloudStore.load().hasCredentials());
         this.obdClient = new ObdBrakeClient(store);
         this.obdClient.setDiagnosticLogger(new ObdBrakeClient.DiagnosticLogger() {
             @Override
@@ -154,6 +207,19 @@ public final class BrakeEngine {
                 recorder.recordExternalEvent(monoMs, message);
             }
         });
+    }
+
+    private static CloudUploadConfig loadFromPrefs(SharedPreferences p) {
+        return new CloudUploadConfig(
+                p.getBoolean(KEY_CLOUD_ENABLED, true),
+                p.getString(KEY_CLOUD_REPO, CloudUploadConfig.DEFAULT_REPO),
+                p.getString(KEY_CLOUD_BRANCH, CloudUploadConfig.DEFAULT_BRANCH),
+                p.getString(KEY_CLOUD_TOKEN, ""),
+                p.getBoolean(KEY_CLOUD_ALLOW_LTE, true),
+                p.getBoolean(KEY_CLOUD_USB_TOO, false),
+                p.getInt(KEY_CLOUD_DAILY_KB, CloudUploadConfig.DEFAULT_DAILY_LIMIT_KB),
+                p.getString(KEY_CLOUD_API_HOST, CloudUploadConfig.DEFAULT_API_HOST),
+                p.getInt(KEY_CLOUD_API_PORT, CloudUploadConfig.DEFAULT_API_PORT));
     }
 
     public void ensureStarted() {
@@ -217,6 +283,10 @@ public final class BrakeEngine {
 
     public AutoExportCoordinator.StatusSnapshot getAutoExportStatus() {
         return autoExport.statusSnapshot();
+    }
+
+    public CloudUploadConfig getCloudUploadConfig() {
+        return cloudStore.load();
     }
 
     public boolean isExportInFlight() {
@@ -293,6 +363,9 @@ public final class BrakeEngine {
             updated.put("standstill_hold", Boolean.toString(config.standstillHold));
             updated.put("bridge_port", Integer.toString(config.bridgePort));
             updated.put("auto_export_usb", Boolean.toString(config.autoExportUsb));
+            updated.put("auto_upload_cloud", Boolean.toString(config.autoUploadCloud));
+            updated.put("cloud_allow_lte", Boolean.toString(config.cloudAllowLte));
+            updated.put("usb_backup_when_cloud", Boolean.toString(config.usbBackupWhenCloud));
         }
         IndicatorConfig newCfg = IndicatorConfig.fromMap(updated);
         config = newCfg;
@@ -300,56 +373,287 @@ public final class BrakeEngine {
         return next;
     }
 
-    public UsbExporter.ExportResult exportDatasetToUsb() {
-        return performExport(AutoExportCoordinator.Trigger.MANUAL, false);
+    public AutoExportCoordinator.ActionOutcome uploadDatasetToCloud() {
+        return performCloudOrUsbExport(AutoExportCoordinator.Trigger.MANUAL, true, false);
     }
 
-    private UsbExporter.ExportResult performExport(
+    public UsbExporter.ExportResult exportDatasetToUsb() {
+        synchronized (exportLock) {
+            exportInFlight.set(true);
+            try {
+                List<String> roots = findUsbRoots();
+                if (!roots.isEmpty() && !cloudStore.load().hasCredentials()) {
+                    CloudUploadConfig.UsbImportResult imp =
+                            CloudUploadConfig.tryImportFromUsbRoots(roots, cloudStore);
+                    if (imp.imported) {
+                        recorder.recordExternalEvent(obdClient.monotonicMs(), imp.message);
+                    }
+                }
+                // If active buffer was already packaged into PendingUploadQueue offline, unpack to USB
+                if (recorder.bufferedRows() <= 0 && !autoExport.getPendingQueue().isEmpty() && !roots.isEmpty()) {
+                    AutoExportCoordinator.ActionOutcome drained = autoExport.drainPendingQueue(
+                            false,
+                            recorder,
+                            config,
+                            CloudUploadConfig.unconfigured(),
+                            roots,
+                            AutoExportCoordinator.DEFAULT_USB_WRITER,
+                            new AutoExportCoordinator.NetworkCheck() {
+                                @Override
+                                public AutoExportCoordinator.TransportInfo activeTransport() {
+                                    return new AutoExportCoordinator.TransportInfo(
+                                            AutoExportCoordinator.TransportKind.NONE, "Offline");
+                                }
+                            },
+                            cloudUploaderBridge(),
+                            obdClient.monotonicMs(),
+                            System.currentTimeMillis());
+                    if (drained.wroteToUsb) {
+                        return new UsbExporter.ExportResult(true, drained.primaryTarget, null, null);
+                    }
+                }
+                return performDirectUsbExport(AutoExportCoordinator.Trigger.MANUAL, roots);
+            } finally {
+                exportInFlight.set(false);
+            }
+        }
+    }
+
+    /**
+     * Imports {@code <usb>/BrakeIndicator/cloud-upload.json} if attached, runs the 4-stage
+     * DNS -> TCP :443 -> TLS 1.2 -> GitHub REST API diagnostic probe, and drains any queued
+     * drives if connectivity is healthy.
+     */
+    public String testCloudAndImportFromUsb() {
+        synchronized (exportLock) {
+            exportInFlight.set(true);
+            try {
+                String importPrefix = "";
+                List<String> roots = findUsbRoots();
+                if (!roots.isEmpty()) {
+                    CloudUploadConfig.UsbImportResult imp =
+                            CloudUploadConfig.tryImportFromUsbRoots(roots, cloudStore);
+                    if (imp.imported) {
+                        importPrefix = imp.message + " ";
+                        recorder.recordExternalEvent(obdClient.monotonicMs(), imp.message);
+                    } else if (imp.foundFile && !cloudStore.load().hasCredentials()) {
+                        importPrefix = imp.message + " ";
+                    }
+                }
+
+                CloudUploadConfig cloudCfg = cloudStore.load();
+                autoExport.setCloudConfiguredState(cloudCfg.hasCredentials());
+                AutoExportCoordinator.TransportInfo net = detectActiveTransport();
+                String probeMsg = gitHubUploader.probeGitHubConnectivity(cloudCfg, net.label);
+                String combined = importPrefix + probeMsg;
+                recorder.recordExternalEvent(obdClient.monotonicMs(), "Cloud Probe: " + probeMsg);
+
+                if (cloudCfg.hasCredentials() && !autoExport.getPendingQueue().isEmpty()) {
+                    autoExport.requestImmediateQueueDrain();
+                    AutoExportCoordinator.ActionOutcome drainRes = autoExport.drainPendingQueue(
+                            true,
+                            recorder,
+                            config,
+                            cloudCfg,
+                            roots,
+                            AutoExportCoordinator.DEFAULT_USB_WRITER,
+                            networkCheckBridge(),
+                            cloudUploaderBridge(),
+                            obdClient.monotonicMs(),
+                            System.currentTimeMillis());
+                    if (drainRes.uploadedToCloud && drainRes.message != null) {
+                        combined = combined + " · " + drainRes.message;
+                    }
+                }
+                return combined;
+            } finally {
+                exportInFlight.set(false);
+            }
+        }
+    }
+
+    public void drainPendingCloudUploadsAsync() {
+        if (autoExport.getPendingQueue().isEmpty()) {
+            return;
+        }
+        autoExport.requestImmediateQueueDrain();
+        if (exportInFlight.get() || !queueDrainInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        autoExportExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    performPendingQueueDrain(true);
+                } catch (Throwable ignored) {
+                } finally {
+                    queueDrainInFlight.set(false);
+                }
+            }
+        });
+    }
+
+    public AutoExportCoordinator.TransportInfo detectActiveTransport() {
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                NetworkInfo info = cm.getActiveNetworkInfo();
+                if (info != null && info.isConnected()) {
+                    if (info.getType() == ConnectivityManager.TYPE_WIFI) {
+                        return new AutoExportCoordinator.TransportInfo(
+                                AutoExportCoordinator.TransportKind.WIFI, "Wi-Fi");
+                    }
+                    String tName = info.getTypeName();
+                    return new AutoExportCoordinator.TransportInfo(
+                            AutoExportCoordinator.TransportKind.CELLULAR,
+                            (tName == null || tName.isEmpty()) ? "LTE" : ("LTE (" + tName + ")"));
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return AutoExportCoordinator.readKernelDefaultRoute();
+    }
+
+    private List<String> findUsbRoots() {
+        List<String> extraFolders = null;
+        try {
+            extraFolders = HmgApi.connect().timeout(800).usbFolders();
+        } catch (Exception ignored) {
+        }
+        return UsbExporter.findMountedUsbRoots(extraFolders);
+    }
+
+    private AutoExportCoordinator.UsbRootLocator usbRootLocatorBridge() {
+        return new AutoExportCoordinator.UsbRootLocator() {
+            @Override
+            public List<String> findMountedUsbRoots() {
+                return findUsbRoots();
+            }
+        };
+    }
+
+    private AutoExportCoordinator.OutOfParkCheck liveDriveCheckBridge() {
+        return new AutoExportCoordinator.OutOfParkCheck() {
+            @Override
+            public boolean isCurrentlyOutOfPark() {
+                BrakeEvaluator.Snapshot s = latestSnapshot;
+                return s != null && AutoExportCoordinator.isOutOfParkState(
+                        s.gearPark, s.speedKmh, s.moving);
+            }
+        };
+    }
+
+    private AutoExportCoordinator.NetworkCheck networkCheckBridge() {
+        return new AutoExportCoordinator.NetworkCheck() {
+            @Override
+            public AutoExportCoordinator.TransportInfo activeTransport() {
+                return detectActiveTransport();
+            }
+        };
+    }
+
+    private AutoExportCoordinator.CloudUploader cloudUploaderBridge() {
+        return new AutoExportCoordinator.CloudUploader() {
+            @Override
+            public GitHubUploader.UploadResult upload(
+                    CloudUploadConfig cfg, PendingUploadQueue.QueuedDrive drive) {
+                return gitHubUploader.uploadDrive(cfg, drive);
+            }
+        };
+    }
+
+    private UsbExporter.ExportResult performDirectUsbExport(
             AutoExportCoordinator.Trigger trigger,
+            final List<String> prelocatedRoots) {
+        AutoExportCoordinator.UsbRootLocator locator = prelocatedRoots != null
+                ? new AutoExportCoordinator.UsbRootLocator() {
+                    @Override
+                    public List<String> findMountedUsbRoots() {
+                        return prelocatedRoots;
+                    }
+                }
+                : usbRootLocatorBridge();
+        return autoExport.executeExport(
+                trigger,
+                recorder,
+                config,
+                obdClient.getStatusSummary(),
+                getHmgStatusSummary(),
+                locator,
+                AutoExportCoordinator.DEFAULT_USB_WRITER,
+                liveDriveCheckBridge(),
+                obdClient.monotonicMs());
+    }
+
+    private AutoExportCoordinator.ActionOutcome performCloudOrUsbExport(
+            AutoExportCoordinator.Trigger trigger,
+            boolean forceCloudOnly,
             boolean notifyToastOnSuccess) {
         synchronized (exportLock) {
             exportInFlight.set(true);
             try {
-                final IndicatorConfig cfg = config;
-                AutoExportCoordinator.UsbRootLocator locator = new AutoExportCoordinator.UsbRootLocator() {
-                    @Override
-                    public List<String> findMountedUsbRoots() {
-                        List<String> extraFolders = null;
-                        try {
-                            extraFolders = HmgApi.connect().timeout(800).usbFolders();
-                        } catch (Exception ignored) {
-                        }
-                        return UsbExporter.findMountedUsbRoots(extraFolders);
-                    }
-                };
-                AutoExportCoordinator.OutOfParkCheck liveDriveCheck = new AutoExportCoordinator.OutOfParkCheck() {
-                    @Override
-                    public boolean isCurrentlyOutOfPark() {
-                        BrakeEvaluator.Snapshot s = latestSnapshot;
-                        return s != null && AutoExportCoordinator.isOutOfParkState(
-                                s.gearPark, s.speedKmh, s.moving);
-                    }
-                };
-                UsbExporter.ExportResult res = autoExport.executeExport(
+                AutoExportCoordinator.ActionOutcome out = autoExport.executeCloudOrUsb(
                         trigger,
+                        forceCloudOnly,
                         recorder,
-                        cfg,
+                        config,
+                        cloudStore,
                         obdClient.getStatusSummary(),
                         getHmgStatusSummary(),
-                        locator,
+                        usbRootLocatorBridge(),
                         AutoExportCoordinator.DEFAULT_USB_WRITER,
-                        liveDriveCheck,
-                        obdClient.monotonicMs());
-                if (res.ok && notifyToastOnSuccess && res.csvPath != null) {
-                    try {
-                        HmgApi.toast(appContext, "Auto-saved " + new File(res.csvPath).getName());
-                    } catch (Throwable ignored) {
-                    }
+                        networkCheckBridge(),
+                        cloudUploaderBridge(),
+                        liveDriveCheckBridge(),
+                        obdClient.monotonicMs(),
+                        System.currentTimeMillis());
+                if (notifyToastOnSuccess && out.ok) {
+                    notifyAutoToast(out);
                 }
-                return res;
+                return out;
             } finally {
                 exportInFlight.set(false);
             }
+        }
+    }
+
+    private void performPendingQueueDrain(boolean notifyToastOnSuccess) {
+        synchronized (exportLock) {
+            if (autoExport.getPendingQueue().isEmpty()) {
+                return;
+            }
+            exportInFlight.set(true);
+            try {
+                AutoExportCoordinator.ActionOutcome out = autoExport.drainPendingQueue(
+                        false,
+                        recorder,
+                        config,
+                        cloudStore.load(),
+                        findUsbRoots(),
+                        AutoExportCoordinator.DEFAULT_USB_WRITER,
+                        networkCheckBridge(),
+                        cloudUploaderBridge(),
+                        obdClient.monotonicMs(),
+                        System.currentTimeMillis());
+                if (notifyToastOnSuccess && out.ok) {
+                    notifyAutoToast(out);
+                }
+            } finally {
+                exportInFlight.set(false);
+            }
+        }
+    }
+
+    private void notifyAutoToast(AutoExportCoordinator.ActionOutcome out) {
+        try {
+            if (out.uploadedToCloud && out.primaryTarget != null) {
+                String name = out.primaryTarget.substring(out.primaryTarget.lastIndexOf('/') + 1);
+                HmgApi.toast(appContext, "Uploaded " + name);
+            } else if (out.wroteToUsb && out.primaryTarget != null) {
+                HmgApi.toast(appContext, "Auto-saved " + new File(out.primaryTarget).getName());
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -430,8 +734,10 @@ public final class BrakeEngine {
                 latestSnapshot = snap;
                 recorder.record(snap, System.currentTimeMillis());
 
+                boolean anyAutoEnabled = cfg.autoExportUsb
+                        || cloudStore.load().isReadyForAutoUpload(cfg);
                 final AutoExportCoordinator.Trigger dueTrigger = autoExport.pollDueTrigger(
-                        cfg.autoExportUsb,
+                        anyAutoEnabled,
                         snap.gearPark,
                         snap.speedKmh,
                         snap.moving,
@@ -444,10 +750,24 @@ public final class BrakeEngine {
                         @Override
                         public void run() {
                             try {
-                                performExport(dueTrigger, true);
+                                performCloudOrUsbExport(dueTrigger, false, true);
                             } catch (Throwable ignored) {
                             } finally {
                                 autoExportQueued.set(false);
+                            }
+                        }
+                    });
+                } else if (autoExport.pollQueueDrainDue(tickStartMono)
+                        && !exportInFlight.get()
+                        && queueDrainInFlight.compareAndSet(false, true)) {
+                    autoExportExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                performPendingQueueDrain(true);
+                            } catch (Throwable ignored) {
+                            } finally {
+                                queueDrainInFlight.set(false);
                             }
                         }
                     });

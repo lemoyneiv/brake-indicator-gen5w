@@ -12,21 +12,41 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.file.Files;
+import java.security.AlgorithmParameters;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.interfaces.ECPublicKey;
+import java.security.spec.ECGenParameterSpec;
+import java.security.spec.ECParameterSpec;
+import java.security.spec.ECPoint;
+import java.security.spec.ECPublicKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import javax.crypto.KeyAgreement;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
 
 /**
- * Host JVM unit tests for v0.7.14:
+ * Host JVM unit tests for v0.8.0:
  * - HmgVehiclePoller (fast <2ms LFD1 vehicle reads + resilient 90ms legacy KitKat Hub stall recovery)
  * - Elm327BrakeProtocol (IGMP 770->778 22BC06 multi-frame ISO-TP decoder with 0x01 pedal switch vs 0x2C regen,
  *   LNEX BVM02 exclusion, VIN/write safety)
@@ -48,6 +68,9 @@ import java.util.Map;
  * - HevRegenProbe (strict VIN/MAC/phone/mutator safety filter, 0xFA USM sentinel rejection, baseline diff)
  * - TelemetryRecorder, AutoExportCoordinator & UsbExporter (confusion matrix, Pedal vs Pure Regen recall,
  *   Auto/i-Pedal labels, atomic USB export, automatic Park & 95%-buffer export with USB check & post-write clear)
+ * - TlsHttpClient, PinnedRoots, TarGzArchive, CloudUploadConfig, PendingUploadQueue & GitHubUploader
+ *   (NIST SP 800-38D AES-128/256-GCM, FIPS 186-4 P-256/P-384 ECDHE, live loopback TLS 1.2 ECDSA/RSA handshakes,
+ *   .tar.gz compression & unpack, USB cloud-upload.json token scrubbing, offline RAM queue & LTE/USB orchestration)
  */
 public final class TestMain {
 
@@ -71,6 +94,10 @@ public final class TestMain {
         testV0712IpedalCrawlCurveHighwayFeatherAndSharpTurn();
         testV0713ColdStartIpedalForwardCrawlAndUrbanGrade();
         testV0714AutoUsbExportParkNearFullAndClear();
+        testV080AesGcmNistVectorsAndTamperRejection();
+        testV080EcCurveP256AndP384CrossCheck();
+        testV080PinnedRootsAndLoopbackTls12Handshakes();
+        testV080TarGzUsbProvisioningAndCloudOrchestration();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1044,8 +1071,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.7.14",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.7.14 Calibration Summary")));
+        eq("Summary banner is v0.8.0",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.8.0 Calibration Summary")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
                         && summary.contains("Pedal Switch Rec.   : 100.0% (1/1 ticks)")
@@ -3104,6 +3131,862 @@ public final class TestMain {
             eq("no temporary .part files left behind", Boolean.FALSE, Boolean.valueOf(anyPart));
         } finally {
             deleteRecursive(tmpRoot);
+        }
+    }
+
+    private static void testV080AesGcmNistVectorsAndTamperRejection() throws Exception {
+        // Official NIST SP 800-38D Appendix B Test Case 4 (AES-128-GCM, 60B pt, 20B non-aligned AAD)
+        byte[] k128 = hexBytes("feffe9928665731c6d6a8f9467308308");
+        byte[] iv12 = hexBytes("cafebabefacedbaddecaf888");
+        byte[] pt60 = hexBytes(
+                "d9313225f88406e5a55909c5aff5269a"
+                + "86a7a9531534f7da2e4c303d8a318a72"
+                + "1c3c0c95956809532fcf0e2449a6b525"
+                + "b16aedf5aa0de657ba637b39");
+        byte[] aad20 = hexBytes("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        String want128 =
+                "42831ec2217774244b7221b784d0d49c"
+                + "e3aa212f2c02a4e035c17e2329aca12e"
+                + "21d514b25466931c7d8f6a5aac84aa05"
+                + "1ba30b396a0aac973d58e091"
+                + "5bc94fbc3221a5db94fae95ae7121a47";
+
+        TlsHttpClient.AesGcm gcm128 = new TlsHttpClient.AesGcm(k128);
+        byte[] sealed128 = gcm128.seal(iv12, aad20, pt60, 0, pt60.length);
+        eq("v0.8.0 NIST SP 800-38D Test Case 4 (AES-128-GCM) exact ciphertext+tag",
+                want128, toHex(sealed128));
+        byte[] opened128 = gcm128.open(iv12, aad20, sealed128, 0, sealed128.length);
+        eq("v0.8.0 AES-128-GCM round-trip recovers exact 60B plaintext",
+                Boolean.TRUE, Boolean.valueOf(Arrays.equals(pt60, opened128)));
+
+        // Official NIST SP 800-38D Appendix B Test Case 16 (AES-256-GCM, 60B pt, 20B AAD)
+        byte[] k256 = hexBytes(
+                "feffe9928665731c6d6a8f9467308308"
+                + "feffe9928665731c6d6a8f9467308308");
+        String want256 =
+                "522dc1f099567d07f47f37a32a84427d"
+                + "643a8cdcbfe5c0c97598a2bd2555d1aa"
+                + "8cb08e48590dbb3da7b08b1056828838"
+                + "c5f61e6393ba7a0abcc9f662"
+                + "76fc6ece0f4e1768cddf8853bb2d551b";
+        TlsHttpClient.AesGcm gcm256 = new TlsHttpClient.AesGcm(k256);
+        byte[] sealed256 = gcm256.seal(iv12, aad20, pt60, 0, pt60.length);
+        eq("v0.8.0 NIST SP 800-38D Test Case 16 (AES-256-GCM) exact ciphertext+tag",
+                want256, toHex(sealed256));
+
+        // Tamper rejection: ciphertext flip, AAD flip, and tag flip must all fail authentication
+        byte[] badCt = Arrays.copyOf(sealed128, sealed128.length);
+        badCt[17] ^= 0x01;
+        boolean ctRejected = false;
+        try {
+            gcm128.open(iv12, aad20, badCt, 0, badCt.length);
+        } catch (IOException expected) {
+            ctRejected = true;
+        }
+        eq("v0.8.0 AES-GCM rejects 1-bit ciphertext tamper", Boolean.TRUE, Boolean.valueOf(ctRejected));
+
+        byte[] badAad = Arrays.copyOf(aad20, aad20.length);
+        badAad[3] ^= 0x80;
+        boolean aadRejected = false;
+        try {
+            gcm128.open(iv12, badAad, sealed128, 0, sealed128.length);
+        } catch (IOException expected) {
+            aadRejected = true;
+        }
+        eq("v0.8.0 AES-GCM rejects 1-bit AAD tamper", Boolean.TRUE, Boolean.valueOf(aadRejected));
+
+        byte[] badTag = Arrays.copyOf(sealed128, sealed128.length);
+        badTag[badTag.length - 1] ^= 0x01;
+        boolean tagRejected = false;
+        try {
+            gcm128.open(iv12, aad20, badTag, 0, badTag.length);
+        } catch (IOException expected) {
+            tagRejected = true;
+        }
+        eq("v0.8.0 AES-GCM rejects 1-bit auth tag tamper", Boolean.TRUE, Boolean.valueOf(tagRejected));
+    }
+
+    private static void testV080EcCurveP256AndP384CrossCheck() throws Exception {
+        TlsHttpClient.EcCurve[] curves = {
+            TlsHttpClient.EcCurve.SECP256R1,
+            TlsHttpClient.EcCurve.SECP384R1
+        };
+        String[] jcaNames = {"secp256r1", "secp384r1"};
+        SecureRandom rng = new SecureRandom();
+
+        for (int idx = 0; idx < curves.length; idx++) {
+            TlsHttpClient.EcCurve c = curves[idx];
+            String curveName = jcaNames[idx];
+            eq("v0.8.0 " + curveName + " generator G lies on curve",
+                    Boolean.TRUE, Boolean.valueOf(c.isOnCurve(c.gx, c.gy)));
+            eq("v0.8.0 " + curveName + " n * G == Infinity",
+                    null, c.scalarMulAffine(c.n, c.gx, c.gy));
+            BigInteger[] negG = c.scalarMulAffine(c.n.subtract(BigInteger.ONE), c.gx, c.gy);
+            eq("v0.8.0 " + curveName + " (n-1)*G == (Gx, p - Gy)",
+                    Boolean.TRUE,
+                    Boolean.valueOf(negG != null
+                            && c.gx.equals(negG[0])
+                            && c.p.subtract(c.gy).equals(negG[1])));
+
+            // Cross-check ECDHE shared secret Z byte-for-byte against OpenJDK JCA KeyAgreement("ECDH")
+            KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
+            kpg.initialize(new ECGenParameterSpec(curveName), rng);
+            KeyPair serverKp = kpg.generateKeyPair();
+            ECPublicKey serverPub = (ECPublicKey) serverKp.getPublic();
+            byte[] serverUncompressed = encodeUncompressedPoint(serverPub.getW(), c.coordLen);
+
+            TlsHttpClient.EcdhResult clientRes = c.computeEcdh(serverUncompressed, rng);
+            eq("v0.8.0 " + curveName + " client uncompressed point length",
+                    Integer.valueOf(1 + 2 * c.coordLen),
+                    Integer.valueOf(clientRes.clientPointUncompressed.length));
+
+            BigInteger cx = new BigInteger(
+                    1, Arrays.copyOfRange(clientRes.clientPointUncompressed, 1, 1 + c.coordLen));
+            BigInteger cy = new BigInteger(
+                    1, Arrays.copyOfRange(clientRes.clientPointUncompressed, 1 + c.coordLen, 1 + 2 * c.coordLen));
+            AlgorithmParameters params = AlgorithmParameters.getInstance("EC");
+            params.init(new ECGenParameterSpec(curveName));
+            ECParameterSpec ecSpec = params.getParameterSpec(ECParameterSpec.class);
+            ECPublicKey clientJcaPub = (ECPublicKey) KeyFactory.getInstance("EC")
+                    .generatePublic(new ECPublicKeySpec(new ECPoint(cx, cy), ecSpec));
+
+            KeyAgreement ka = KeyAgreement.getInstance("ECDH");
+            ka.init(serverKp.getPrivate());
+            ka.doPhase(clientJcaPub, true);
+            byte[] jcaSecretZ = ka.generateSecret();
+
+            eq("v0.8.0 " + curveName + " pure-Java ECDHE shared secret Z matches OpenJDK JCA byte-for-byte",
+                    toHex(jcaSecretZ), toHex(clientRes.sharedSecretZ));
+        }
+    }
+
+    private static void testV080PinnedRootsAndLoopbackTls12Handshakes() throws Exception {
+        List<X509Certificate> roots = PinnedRoots.embeddedRoots();
+        eq("v0.8.0 PinnedRoots loads all 17 embedded modern root CAs",
+                Integer.valueOf(17), Integer.valueOf(roots.size()));
+        eq("v0.8.0 PinnedRoots.trustedRoots() unions embedded + system CAs",
+                Boolean.TRUE, Boolean.valueOf(PinnedRoots.trustedRoots().size() >= 17));
+        boolean hasUserTrustEcc = false;
+        boolean hasDigiCertG2 = false;
+        boolean hasIsrgX1 = false;
+        for (int i = 0; i < roots.size(); i++) {
+            String dn = roots.get(i).getSubjectX500Principal().getName();
+            if (dn.contains("USERTrust ECC Certification Authority")) hasUserTrustEcc = true;
+            if (dn.contains("DigiCert Global Root G2")) hasDigiCertG2 = true;
+            if (dn.contains("ISRG Root X1")) hasIsrgX1 = true;
+        }
+        eq("v0.8.0 PinnedRoots includes USERTrust ECC (GitHub CA), DigiCert G2, and ISRG Root X1",
+                Boolean.TRUE, Boolean.valueOf(hasUserTrustEcc && hasDigiCertG2 && hasIsrgX1));
+
+        // Wildcard SAN matching rules (RFC 6125)
+        eq("v0.8.0 SAN matches api.github.com against *.github.com",
+                Boolean.TRUE, Boolean.valueOf(TlsHttpClient.matchesDnsPattern("api.github.com", "*.github.com")));
+        eq("v0.8.0 SAN rejects multi-level sub.api.github.com against *.github.com",
+                Boolean.FALSE, Boolean.valueOf(TlsHttpClient.matchesDnsPattern("sub.api.github.com", "*.github.com")));
+        eq("v0.8.0 SAN rejects top-level wildcard *.com",
+                Boolean.FALSE, Boolean.valueOf(TlsHttpClient.matchesDnsPattern("github.com", "*.com")));
+
+        File tmpDir = Files.createTempDirectory("brake-tls12-v080").toFile();
+        try {
+            // 1. ECDSA P-256 server certificate (SAN=dns:api.github.test) -> 0xC02B & 0xC02C
+            File ecP12 = new File(tmpDir, "ecdsa-server.p12");
+            X509Certificate ecCert = generateTestKeystore(
+                    ecP12, "EC", "256", "SHA256withECDSA", "CN=api.github.test", "dns:api.github.test");
+            SSLContext ecSslCtx = createServerSslContext(ecP12);
+
+            // Chunked HTTP response over TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            LoopbackHttpsServer ec128Srv = startOneShotHttpsServer(
+                    ecSslCtx,
+                    new String[]{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
+                    true,
+                    200,
+                    "{\"ok\":true,\"cipher\":\"ecdsa128\"}");
+            try {
+                TlsHttpClient client = new TlsHttpClient(
+                        5000, 5000, Collections.singletonList(ecCert), false);
+                TlsHttpClient.HttpResponse resp = client.execute(
+                        "GET", "127.0.0.1", ec128Srv.port, "api.github.test", "/rate_limit", null, null);
+                eq("v0.8.0 live TLS 1.2 ECDHE-ECDSA-AES128-GCM handshake HTTP 200",
+                        Integer.valueOf(200), Integer.valueOf(resp.statusCode));
+                eq("v0.8.0 negotiated cipher is TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", resp.negotiatedCipher);
+                eq("v0.8.0 chunked HTTP/1.1 body decoded cleanly over TLS 1.2",
+                        "{\"ok\":true,\"cipher\":\"ecdsa128\"}", resp.bodyUtf8());
+            } finally {
+                ec128Srv.close();
+            }
+
+            // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 (SHA-384 PRF + AES-256-GCM)
+            LoopbackHttpsServer ec256Srv = startOneShotHttpsServer(
+                    ecSslCtx,
+                    new String[]{"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"},
+                    false,
+                    200,
+                    "{\"cipher\":\"ecdsa256\"}");
+            try {
+                TlsHttpClient client = new TlsHttpClient(
+                        5000, 5000, Collections.singletonList(ecCert), false);
+                TlsHttpClient.HttpResponse resp = client.execute(
+                        "GET", "127.0.0.1", ec256Srv.port, "api.github.test", "/status", null, null);
+                eq("v0.8.0 live TLS 1.2 ECDHE-ECDSA-AES256-GCM-SHA384 handshake HTTP 200",
+                        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", resp.negotiatedCipher);
+            } finally {
+                ec256Srv.close();
+            }
+
+            // 2. RSA-2048 server certificate with wildcard SAN=dns:*.github.test + 160 KB multi-record PUT
+            File rsaP12 = new File(tmpDir, "rsa-server.p12");
+            X509Certificate rsaCert = generateTestKeystore(
+                    rsaP12, "RSA", "2048", "SHA256withRSA", "CN=wildcard.github.test", "dns:*.github.test");
+            SSLContext rsaSslCtx = createServerSslContext(rsaP12);
+
+            byte[] largePayload = new byte[160 * 1024];
+            for (int i = 0; i < largePayload.length; i++) {
+                largePayload[i] = (byte) ('A' + (i % 26));
+            }
+            LoopbackHttpsServer rsaSrv = startOneShotHttpsServer(
+                    rsaSslCtx,
+                    new String[]{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+                    false,
+                    201,
+                    "{\"commit\":{\"sha\":\"abcdef1234567890\"}}");
+            try {
+                TlsHttpClient client = new TlsHttpClient(
+                        5000, 10000, Collections.singletonList(rsaCert), false);
+                TlsHttpClient.HttpResponse resp = client.execute(
+                        "PUT", "127.0.0.1", rsaSrv.port, "api.github.test",
+                        "/repos/lemoyneiv/brake-indicator-logs/contents/test.bin",
+                        null, largePayload);
+                eq("v0.8.0 live TLS 1.2 ECDHE-RSA-AES128-GCM + wildcard SAN HTTP 201",
+                        Integer.valueOf(201), Integer.valueOf(resp.statusCode));
+                eq("v0.8.0 server received exact 160 KB multi-record TLS PUT payload",
+                        Boolean.TRUE, Boolean.valueOf(Arrays.equals(largePayload, rsaSrv.receivedBody)));
+            } finally {
+                rsaSrv.close();
+            }
+
+            // 3. Untrusted CA must be rejected before sending application data
+            LoopbackHttpsServer untrustedSrv = startOneShotHttpsServer(
+                    ecSslCtx,
+                    new String[]{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
+                    false,
+                    200,
+                    "{}");
+            try {
+                TlsHttpClient emptyTrustClient = new TlsHttpClient(
+                        5000, 5000, Collections.<X509Certificate>emptyList(), false);
+                boolean rejectedUntrusted = false;
+                try {
+                    emptyTrustClient.execute(
+                            "GET", "127.0.0.1", untrustedSrv.port, "api.github.test", "/", null, null);
+                } catch (IOException expected) {
+                    rejectedUntrusted = expected.getMessage() != null
+                            && expected.getMessage().contains("Untrusted certificate issuer");
+                }
+                eq("v0.8.0 TlsHttpClient rejects untrusted server certificate chain",
+                        Boolean.TRUE, Boolean.valueOf(rejectedUntrusted));
+            } finally {
+                untrustedSrv.close();
+            }
+
+            // 4. Hostname mismatch must be rejected
+            LoopbackHttpsServer wrongHostSrv = startOneShotHttpsServer(
+                    ecSslCtx,
+                    new String[]{"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
+                    false,
+                    200,
+                    "{}");
+            try {
+                TlsHttpClient client = new TlsHttpClient(
+                        5000, 5000, Collections.singletonList(ecCert), false);
+                boolean rejectedHost = false;
+                try {
+                    client.execute(
+                            "GET", "127.0.0.1", wrongHostSrv.port, "evil.example.org", "/", null, null);
+                } catch (IOException expected) {
+                    rejectedHost = expected.getMessage() != null
+                            && expected.getMessage().contains("Certificate hostname mismatch");
+                }
+                eq("v0.8.0 TlsHttpClient rejects SAN hostname mismatch",
+                        Boolean.TRUE, Boolean.valueOf(rejectedHost));
+            } finally {
+                wrongHostSrv.close();
+            }
+        } finally {
+            deleteRecursive(tmpDir);
+        }
+    }
+
+    private static void testV080TarGzUsbProvisioningAndCloudOrchestration() throws Exception {
+        // 1. TarGzArchive compression ratio & byte-exact extraction
+        StringBuilder csvBuilder = new StringBuilder(220000);
+        csvBuilder.append("elapsed_ms,wall_time_iso,speed_kmh,decel_mps2,brake_pressure,pedal_accel\n");
+        for (int i = 0; i < 2000; i++) {
+            csvBuilder.append(i * 50)
+                    .append(",2026-11-18T15:00:00.000Z,64.20,1.450,0.00,0.00\n");
+        }
+        String bigCsv = csvBuilder.toString();
+        String summaryTxt = "=== Brake Light Indicator v0.8.0 Calibration Summary ===\nScored OBD Ticks : 2000\n";
+        byte[] gzBytes = TarGzArchive.buildDatasetArchive("20261118-150000", bigCsv, summaryTxt, 1763478000000L);
+        eq("v0.8.0 TarGzArchive compresses >100 KB repetitive 20 Hz CSV by >6x",
+                Boolean.TRUE, Boolean.valueOf(gzBytes.length > 100 && gzBytes.length < bigCsv.length() / 6));
+        Map<String, byte[]> extracted = TarGzArchive.extractEntries(gzBytes);
+        eq("v0.8.0 TarGzArchive round-trip recovers exact CSV & summary entries",
+                Boolean.TRUE,
+                Boolean.valueOf(bigCsv.equals(new String(extracted.get("brake-dataset-20261118-150000.csv"), "UTF-8"))
+                        && summaryTxt.equals(new String(extracted.get("brake-summary-20261118-150000.txt"), "UTF-8"))));
+
+        // 2. /proc/net/route default route detection (CarPlay wlan0 AP + rmnet_data0 LTE default route)
+        String procRoute =
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+                + "wlan0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+                + "rmnet_data0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+        AutoExportCoordinator.TransportInfo parsedNet = AutoExportCoordinator.parseProcNetRoute(procRoute);
+        eq("v0.8.0 parseProcNetRoute detects LTE (rmnet_data0) even while wlan0 hotspot subnet is up",
+                AutoExportCoordinator.TransportKind.CELLULAR, parsedNet.kind);
+        eq("v0.8.0 parseProcNetRoute label includes rmnet_data0",
+                "LTE (rmnet_data0)", parsedNet.label);
+
+        // 3. PendingUploadQueue item & byte bounds
+        PendingUploadQueue smallQ = new PendingUploadQueue(2, 1500);
+        PendingUploadQueue.QueuedDrive q1 = new PendingUploadQueue.QueuedDrive(
+                "s1", "2026-11-18", "d1.tar.gz", new byte[600],
+                AutoExportCoordinator.Trigger.SHIFT_TO_PARK, 10, "m1", 1000L);
+        PendingUploadQueue.QueuedDrive q2 = new PendingUploadQueue.QueuedDrive(
+                "s2", "2026-11-18", "d2.tar.gz", new byte[600],
+                AutoExportCoordinator.Trigger.SHIFT_TO_PARK, 10, "m2", 2000L);
+        PendingUploadQueue.QueuedDrive q3 = new PendingUploadQueue.QueuedDrive(
+                "s3", "2026-11-18", "d3.tar.gz", new byte[600],
+                AutoExportCoordinator.Trigger.SHIFT_TO_PARK, 10, "m3", 3000L);
+        smallQ.enqueue(q1);
+        smallQ.enqueue(q2);
+        smallQ.enqueue(q3);
+        eq("v0.8.0 PendingUploadQueue evicts oldest when exceeding maxItems / maxTotalBytes",
+                "d2.tar.gz", smallQ.peekOldest().archiveFileName);
+        eq("v0.8.0 PendingUploadQueue size stays capped at 2",
+                Integer.valueOf(2), Integer.valueOf(smallQ.size()));
+
+        // 4. DailyByteBudget cap & UTC day rollover
+        CloudUploadConfig.DailyByteBudget budget = new CloudUploadConfig.DailyByteBudget();
+        long day1Ms = 1763424000000L; // UTC day N
+        budget.recordSpent(400 * 1024L, day1Ms);
+        eq("v0.8.0 DailyByteBudget blocks upload exceeding 500 KB cap on same UTC day",
+                Boolean.FALSE, Boolean.valueOf(budget.canSpend(150 * 1024L, 500, day1Ms + 3600000L)));
+        eq("v0.8.0 DailyByteBudget resets automatically on next UTC day",
+                Boolean.TRUE, Boolean.valueOf(budget.canSpend(150 * 1024L, 500, day1Ms + 86400000L)));
+
+        // 5. USB cloud-upload.json import + atomic token scrubbing + end-to-end HTTPS GitHub upload & fallback
+        File tmpDir = Files.createTempDirectory("brake-cloud-e2e").toFile();
+        MockGitHubHttpsServer ghServer = null;
+        try {
+            File ecP12 = new File(tmpDir, "gh-mock.p12");
+            X509Certificate ghCert = generateTestKeystore(
+                    ecP12, "EC", "256", "SHA256withECDSA", "CN=api.github.com", "dns:api.github.com");
+            SSLContext ghSsl = createServerSslContext(ecP12);
+            ghServer = new MockGitHubHttpsServer(ghSsl, "github_pat_test1234567890abcdef");
+
+            File usbRoot = new File(tmpDir, "usb0");
+            File biDir = new File(usbRoot, "BrakeIndicator");
+            biDir.mkdirs();
+            File cfgFile = new File(biDir, "cloud-upload.json");
+
+            // Placeholder token rejected
+            Files.write(cfgFile.toPath(),
+                    "{\"repo\":\"lemoyneiv/brake-indicator-logs\",\"token\":\"github_pat_...\"}".getBytes("UTF-8"));
+            CloudUploadConfig.MemoryStore memStore = new CloudUploadConfig.MemoryStore();
+            CloudUploadConfig.UsbImportResult badImp = CloudUploadConfig.tryImportFromUsbRoots(
+                    Collections.singletonList(usbRoot.getAbsolutePath()), memStore);
+            eq("v0.8.0 CloudUploadConfig rejects placeholder github_pat_... token",
+                    Boolean.FALSE, Boolean.valueOf(badImp.imported));
+
+            // Valid config imported & plaintext token scrubbed on USB
+            String validJson = "{\n"
+                    + "  \"repo\": \"https://github.com/lemoyneiv/brake-indicator-logs.git\",\n"
+                    + "  \"branch\": \"main\",\n"
+                    + "  \"token\": \"github_pat_test1234567890abcdef\",\n"
+                    + "  \"allow_lte\": true,\n"
+                    + "  \"daily_limit_kb\": 5120,\n"
+                    + "  \"api_host\": \"127.0.0.1\",\n"
+                    + "  \"api_port\": " + ghServer.port + "\n"
+                    + "}\n";
+            Files.write(cfgFile.toPath(), validJson.getBytes("UTF-8"));
+            CloudUploadConfig.UsbImportResult okImp = CloudUploadConfig.tryImportFromUsbRoots(
+                    Collections.singletonList(usbRoot.getAbsolutePath()), memStore);
+            eq("v0.8.0 CloudUploadConfig imports valid USB config and normalizes repo slug",
+                    Boolean.TRUE,
+                    Boolean.valueOf(okImp.imported
+                            && okImp.scrubbedTokenOnUsb
+                            && "lemoyneiv/brake-indicator-logs".equals(memStore.load().repo)));
+            String scrubbedDisk = new String(Files.readAllBytes(cfgFile.toPath()), "UTF-8");
+            eq("v0.8.0 USB cloud-upload.json has token scrubbed and token_imported_at recorded",
+                    Boolean.TRUE,
+                    Boolean.valueOf(!scrubbedDisk.contains("github_pat_test1234567890abcdef")
+                            && scrubbedDisk.contains("\"token_imported_at\"")));
+
+            // Re-importing scrubbed USB file preserves existing credentials in store
+            CloudUploadConfig.UsbImportResult reImp = CloudUploadConfig.tryImportFromUsbRoots(
+                    Collections.singletonList(usbRoot.getAbsolutePath()), memStore);
+            eq("v0.8.0 re-scanning scrubbed USB file keeps stored credentials intact",
+                    Boolean.TRUE, Boolean.valueOf(!reImp.imported && memStore.load().hasCredentials()));
+
+            TlsHttpClient trustedClient = new TlsHttpClient(
+                    5000, 10000, Collections.singletonList(ghCert), false);
+            final GitHubUploader uploader = new GitHubUploader(trustedClient, "api.github.com");
+
+            // Probe GitHub connectivity + write permission verification
+            String probeReady = uploader.probeGitHubConnectivity(memStore.load(), "LTE (rmnet0)");
+            eq("v0.8.0 GitHubUploader.probeGitHubConnectivity verifies TLS 1.2 + repo write permission",
+                    Boolean.TRUE,
+                    Boolean.valueOf(probeReady.contains("Net LTE (rmnet0)")
+                            && probeReady.contains("READY (write verified)")));
+
+            // End-to-end AutoExportCoordinator:
+            // Drive 1: Park in underground garage (Offline, no USB) -> queued in RAM & buffer cleared!
+            TelemetryRecorder rec = new TelemetryRecorder();
+            AutoExportCoordinator coord = new AutoExportCoordinator();
+            IndicatorConfig cfg = IndicatorConfig.defaults();
+            long t = 1000L;
+            for (int i = 0; i < 12; i++) {
+                BrakeEvaluator.Snapshot s = makeScoredSnapshot(t, true, "REGEN_DECEL", 44, true, false, 4, -1);
+                rec.record(s, 1763478000000L + t);
+                coord.pollDueTrigger(true, s.gearPark, s.speedKmh, s.moving, rec.bufferedRows(), t);
+                t += 50L;
+            }
+            BrakeEvaluator.Snapshot parkSnap = new BrakeEvaluator.Snapshot(
+                    t, false, "OBD_OFF", false, "OFF",
+                    Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                    Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(72.0f),
+                    new BrakeEvaluator.ObdSample(true, "BLE", t - 10L, 0, false, false),
+                    true, false, 4, -1);
+            rec.record(parkSnap, 1763478000000L + t);
+
+            final AutoExportCoordinator.TransportInfo[] activeNet = {
+                new AutoExportCoordinator.TransportInfo(AutoExportCoordinator.TransportKind.NONE, "Offline")
+            };
+            final List<String> activeUsbRoots = new ArrayList<String>();
+            AutoExportCoordinator.UsbRootLocator usbLocator = new AutoExportCoordinator.UsbRootLocator() {
+                @Override
+                public List<String> findMountedUsbRoots() {
+                    return new ArrayList<String>(activeUsbRoots);
+                }
+            };
+            AutoExportCoordinator.NetworkCheck netCheck = new AutoExportCoordinator.NetworkCheck() {
+                @Override
+                public AutoExportCoordinator.TransportInfo activeTransport() {
+                    return activeNet[0];
+                }
+            };
+            AutoExportCoordinator.CloudUploader uploaderBridge = new AutoExportCoordinator.CloudUploader() {
+                @Override
+                public GitHubUploader.UploadResult upload(
+                        CloudUploadConfig cCfg, PendingUploadQueue.QueuedDrive drive) {
+                    return uploader.uploadDrive(cCfg, drive);
+                }
+            };
+            AutoExportCoordinator.OutOfParkCheck parkedCheck = new AutoExportCoordinator.OutOfParkCheck() {
+                @Override
+                public boolean isCurrentlyOutOfPark() {
+                    return false;
+                }
+            };
+
+            AutoExportCoordinator.Trigger due1 = coord.pollDueTrigger(
+                    true, parkSnap.gearPark, parkSnap.speedKmh, parkSnap.moving, rec.bufferedRows(), t);
+            eq("v0.8.0 Drive 1 shift to Park triggers SHIFT_TO_PARK",
+                    AutoExportCoordinator.Trigger.SHIFT_TO_PARK, due1);
+
+            AutoExportCoordinator.ActionOutcome outOffline = coord.executeCloudOrUsb(
+                    due1, false, rec, cfg, memStore, "BLE OK", "OK (20Hz)",
+                    usbLocator, AutoExportCoordinator.DEFAULT_USB_WRITER,
+                    netCheck, uploaderBridge, parkedCheck, t, 1763478000000L + t);
+            eq("v0.8.0 Underground garage Park queues compressed .tar.gz in RAM",
+                    Boolean.TRUE, Boolean.valueOf(outOffline.queuedInRam && coord.getPendingQueue().size() == 1));
+            eq("v0.8.0 TelemetryRecorder cleared to 0 rows immediately after packaging into RAM queue",
+                    Integer.valueOf(0), Integer.valueOf(rec.bufferedRows()));
+
+            // Car drives out of garage -> LTE connects -> drainPendingQueue uploads over TLS 1.2!
+            activeNet[0] = new AutoExportCoordinator.TransportInfo(
+                    AutoExportCoordinator.TransportKind.CELLULAR, "LTE (rmnet0)");
+            AutoExportCoordinator.ActionOutcome outDrained = coord.drainPendingQueue(
+                    false, rec, cfg, memStore.load(), activeUsbRoots,
+                    AutoExportCoordinator.DEFAULT_USB_WRITER, netCheck, uploaderBridge,
+                    t + 20000L, 1763478020000L);
+            eq("v0.8.0 LTE recovery drains queued .tar.gz to GitHub over TLS 1.2",
+                    Boolean.TRUE,
+                    Boolean.valueOf(outDrained.ok
+                            && outDrained.uploadedToCloud
+                            && coord.getPendingQueue().isEmpty()
+                            && coord.statusSnapshot(1763478020000L).cloudUploadCount == 1));
+            eq("v0.8.0 Mock GitHub server received valid .tar.gz containing 13-row CSV + summary",
+                    Boolean.TRUE, Boolean.valueOf(ghServer.putCount == 1 && ghServer.lastDecodedCsvRowCount == 13));
+
+            // 422 same-second collision retry -> automatically retries with _1.tar.gz suffix!
+            ghServer.forceNext422Once = true;
+            PendingUploadQueue.QueuedDrive dupDrive = new PendingUploadQueue.QueuedDrive(
+                    "20261118-150000", "2026-11-18", "brake-drive-20261118-150000-manual.tar.gz",
+                    gzBytes, AutoExportCoordinator.Trigger.MANUAL, 2000, "manual test", 1763478030000L);
+            GitHubUploader.UploadResult retryRes = uploader.uploadDrive(memStore.load(), dupDrive);
+            eq("v0.8.0 HTTP 422 filename collision retries cleanly with _1.tar.gz suffix",
+                    Boolean.TRUE,
+                    Boolean.valueOf(retryRes.ok
+                            && retryRes.remotePath != null
+                            && retryRes.remotePath.endsWith("_1.tar.gz")));
+
+            // Drive 2: Offline + USB stick attached -> automatically unpacks .tar.gz to plain USB .csv+.txt!
+            activeNet[0] = new AutoExportCoordinator.TransportInfo(
+                    AutoExportCoordinator.TransportKind.NONE, "Offline");
+            activeUsbRoots.add(usbRoot.getAbsolutePath());
+            t += 30000L;
+            for (int i = 0; i < 8; i++) {
+                BrakeEvaluator.Snapshot s = makeScoredSnapshot(t, false, "OFF", 0, false, false, 3, -1);
+                rec.record(s, 1763478000000L + t);
+                coord.pollDueTrigger(true, s.gearPark, s.speedKmh, s.moving, rec.bufferedRows(), t);
+                t += 50L;
+            }
+            BrakeEvaluator.Snapshot parkSnap2 = new BrakeEvaluator.Snapshot(
+                    t, false, "OBD_OFF", false, "OFF",
+                    Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                    Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(71.0f),
+                    new BrakeEvaluator.ObdSample(true, "BLE", t - 10L, 0, false, false),
+                    true, false, 3, -1);
+            rec.record(parkSnap2, 1763478000000L + t);
+            AutoExportCoordinator.Trigger due2 = coord.pollDueTrigger(
+                    true, parkSnap2.gearPark, parkSnap2.speedKmh, parkSnap2.moving, rec.bufferedRows(), t);
+            AutoExportCoordinator.ActionOutcome outUsbFallback = coord.executeCloudOrUsb(
+                    due2, false, rec, cfg, memStore, "BLE OK", "OK (20Hz)",
+                    usbLocator, AutoExportCoordinator.DEFAULT_USB_WRITER,
+                    netCheck, uploaderBridge, parkedCheck, t, 1763478000000L + t);
+            eq("v0.8.0 Offline Park with USB attached unpacks queued archive directly to USB CSV+summary",
+                    Boolean.TRUE,
+                    Boolean.valueOf(outUsbFallback.ok
+                            && outUsbFallback.wroteToUsb
+                            && coord.getPendingQueue().isEmpty()
+                            && outUsbFallback.primaryTarget != null
+                            && new File(outUsbFallback.primaryTarget).isFile()));
+        } finally {
+            if (ghServer != null) ghServer.close();
+            deleteRecursive(tmpDir);
+        }
+    }
+
+    private static byte[] hexBytes(String hex) {
+        int len = hex.length() / 2;
+        byte[] out = new byte[len];
+        for (int i = 0; i < len; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    private static String toHex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (int i = 0; i < b.length; i++) {
+            sb.append(String.format(java.util.Locale.US, "%02x", Integer.valueOf(b[i] & 0xFF)));
+        }
+        return sb.toString();
+    }
+
+    private static byte[] encodeUncompressedPoint(ECPoint pt, int coordLen) {
+        byte[] out = new byte[1 + 2 * coordLen];
+        out[0] = 0x04;
+        copyBigIntUnsigned(pt.getAffineX(), out, 1, coordLen);
+        copyBigIntUnsigned(pt.getAffineY(), out, 1 + coordLen, coordLen);
+        return out;
+    }
+
+    private static void copyBigIntUnsigned(BigInteger v, byte[] dst, int off, int len) {
+        byte[] raw = v.toByteArray();
+        int srcOff = (raw.length > 1 && raw[0] == 0) ? 1 : 0;
+        int copyLen = Math.min(len, raw.length - srcOff);
+        System.arraycopy(raw, raw.length - copyLen, dst, off + len - copyLen, copyLen);
+    }
+
+    private static X509Certificate generateTestKeystore(
+            File p12File,
+            String keyAlg,
+            String keySize,
+            String sigAlg,
+            String dname,
+            String sanSpec) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "keytool", "-genkeypair",
+                "-keystore", p12File.getAbsolutePath(),
+                "-storetype", "PKCS12",
+                "-storepass", "testpass",
+                "-keypass", "testpass",
+                "-alias", "srv",
+                "-keyalg", keyAlg,
+                "-keysize", keySize,
+                "-sigalg", sigAlg,
+                "-validity", "30",
+                "-dname", dname,
+                "-ext", "SAN=" + sanSpec);
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        ByteArrayOutputStream log = new ByteArrayOutputStream();
+        byte[] buf = new byte[512];
+        int n;
+        while ((n = p.getInputStream().read(buf)) >= 0) log.write(buf, 0, n);
+        if (p.waitFor() != 0) {
+            throw new IOException("keytool failed: " + log.toString("UTF-8"));
+        }
+        KeyStore ks = KeyStore.getInstance("PKCS12");
+        InputStream fis = Files.newInputStream(p12File.toPath());
+        try {
+            ks.load(fis, "testpass".toCharArray());
+        } finally {
+            fis.close();
+        }
+        return (X509Certificate) ks.getCertificate("srv");
+    }
+
+    private static SSLContext createServerSslContext(File p12File) throws Exception {
+        KeyStore ks = KeyStore.getInstance("PKCS12");
+        InputStream fis = Files.newInputStream(p12File.toPath());
+        try {
+            ks.load(fis, "testpass".toCharArray());
+        } finally {
+            fis.close();
+        }
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, "testpass".toCharArray());
+        SSLContext ctx = SSLContext.getInstance("TLSv1.2");
+        ctx.init(kmf.getKeyManagers(), null, new SecureRandom());
+        return ctx;
+    }
+
+    private static final class LoopbackHttpsServer implements Closeable {
+        final SSLServerSocket serverSocket;
+        final int port;
+        final Thread worker;
+        volatile byte[] receivedBody = new byte[0];
+
+        LoopbackHttpsServer(SSLServerSocket serverSocket, Thread worker) {
+            this.serverSocket = serverSocket;
+            this.port = serverSocket.getLocalPort();
+            this.worker = worker;
+        }
+
+        @Override
+        public void close() {
+            try { serverSocket.close(); } catch (Throwable ignored) {}
+            try { worker.join(2000L); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static LoopbackHttpsServer startOneShotHttpsServer(
+            SSLContext ctx,
+            final String[] enabledCiphers,
+            final boolean chunkedResponse,
+            final int statusCode,
+            final String responseJson) throws Exception {
+        final SSLServerSocket srv = (SSLServerSocket) ctx.getServerSocketFactory()
+                .createServerSocket(0, 4, InetAddress.getByName("127.0.0.1"));
+        srv.setEnabledProtocols(new String[]{"TLSv1.2"});
+        if (enabledCiphers != null && enabledCiphers.length > 0) {
+            srv.setEnabledCipherSuites(enabledCiphers);
+        }
+        final LoopbackHttpsServer holder = new LoopbackHttpsServer(srv, new Thread("OneShotHttps") {
+            @Override
+            public void run() {
+                SSLSocket sock = null;
+                try {
+                    sock = (SSLSocket) srv.accept();
+                    sock.setSoTimeout(5000);
+                    InputStream in = sock.getInputStream();
+                    OutputStream out = sock.getOutputStream();
+                    int contentLen = 0;
+                    while (true) {
+                        String line = readHttpHeaderLine(in);
+                        if (line == null || line.isEmpty()) break;
+                        if (line.toLowerCase(java.util.Locale.US).startsWith("content-length:")) {
+                            contentLen = Integer.parseInt(line.substring(15).trim());
+                        }
+                    }
+                    if (contentLen > 0) {
+                        byte[] body = new byte[contentLen];
+                        int pos = 0;
+                        while (pos < contentLen) {
+                            int r = in.read(body, pos, contentLen - pos);
+                            if (r < 0) break;
+                            pos += r;
+                        }
+                        setHolderBody(body);
+                    }
+                    byte[] respBytes = responseJson.getBytes("UTF-8");
+                    if (chunkedResponse) {
+                        int half = Math.max(1, respBytes.length / 2);
+                        String head = "HTTP/1.1 " + statusCode + " OK\r\n"
+                                + "Content-Type: application/json\r\n"
+                                + "Transfer-Encoding: chunked\r\n"
+                                + "Connection: close\r\n\r\n";
+                        out.write(head.getBytes("US-ASCII"));
+                        out.write((Integer.toHexString(half) + "\r\n").getBytes("US-ASCII"));
+                        out.write(respBytes, 0, half);
+                        out.write("\r\n".getBytes("US-ASCII"));
+                        int rem = respBytes.length - half;
+                        if (rem > 0) {
+                            out.write((Integer.toHexString(rem) + "\r\n").getBytes("US-ASCII"));
+                            out.write(respBytes, half, rem);
+                            out.write("\r\n".getBytes("US-ASCII"));
+                        }
+                        out.write("0\r\n\r\n".getBytes("US-ASCII"));
+                    } else {
+                        String head = "HTTP/1.1 " + statusCode + " OK\r\n"
+                                + "Content-Type: application/json\r\n"
+                                + "Content-Length: " + respBytes.length + "\r\n"
+                                + "Connection: close\r\n\r\n";
+                        out.write(head.getBytes("US-ASCII"));
+                        out.write(respBytes);
+                    }
+                    out.flush();
+                } catch (Throwable ignored) {
+                } finally {
+                    if (sock != null) {
+                        try { sock.close(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+
+            private void setHolderBody(byte[] b) {
+                // Assigned on enclosing holder
+                holderRef[0].receivedBody = b;
+            }
+        });
+        // Wire holder reference before starting worker
+        return startHolder(holder);
+    }
+
+    private static final LoopbackHttpsServer[] holderRef = new LoopbackHttpsServer[1];
+
+    private static LoopbackHttpsServer startHolder(LoopbackHttpsServer h) {
+        holderRef[0] = h;
+        h.worker.setDaemon(true);
+        h.worker.start();
+        return h;
+    }
+
+    private static String readHttpHeaderLine(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(128);
+        while (true) {
+            int b = in.read();
+            if (b < 0) return out.size() == 0 ? null : out.toString("US-ASCII");
+            if (b == '\n') break;
+            if (b != '\r') out.write(b);
+        }
+        return out.toString("US-ASCII");
+    }
+
+    private static final class MockGitHubHttpsServer implements Closeable {
+        final SSLServerSocket srv;
+        final int port;
+        final Thread thread;
+        final String expectedToken;
+        volatile boolean forceNext422Once;
+        volatile int putCount;
+        volatile int lastDecodedCsvRowCount;
+
+        MockGitHubHttpsServer(SSLContext sslCtx, final String expectedToken) throws Exception {
+            this.expectedToken = expectedToken;
+            this.srv = (SSLServerSocket) sslCtx.getServerSocketFactory()
+                    .createServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+            this.srv.setEnabledProtocols(new String[]{"TLSv1.2"});
+            this.port = srv.getLocalPort();
+            this.thread = new Thread("MockGitHubHttps") {
+                @Override
+                public void run() {
+                    while (!srv.isClosed()) {
+                        SSLSocket sock = null;
+                        try {
+                            sock = (SSLSocket) srv.accept();
+                            sock.setSoTimeout(5000);
+                            handleClient(sock);
+                        } catch (Throwable ignored) {
+                            if (srv.isClosed()) break;
+                        } finally {
+                            if (sock != null) {
+                                try { sock.close(); } catch (Throwable ignored) {}
+                            }
+                        }
+                    }
+                }
+            };
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
+
+        private void handleClient(SSLSocket sock) throws Exception {
+            InputStream in = sock.getInputStream();
+            OutputStream out = sock.getOutputStream();
+            String reqLine = readHttpHeaderLine(in);
+            if (reqLine == null) return;
+            String auth = "";
+            int contentLen = 0;
+            while (true) {
+                String h = readHttpHeaderLine(in);
+                if (h == null || h.isEmpty()) break;
+                String lower = h.toLowerCase(java.util.Locale.US);
+                if (lower.startsWith("authorization:")) {
+                    auth = h.substring(14).trim();
+                } else if (lower.startsWith("content-length:")) {
+                    contentLen = Integer.parseInt(h.substring(15).trim());
+                }
+            }
+            byte[] body = new byte[contentLen];
+            int pos = 0;
+            while (pos < contentLen) {
+                int r = in.read(body, pos, contentLen - pos);
+                if (r < 0) break;
+                pos += r;
+            }
+
+            if (!("Bearer " + expectedToken).equals(auth)) {
+                writeJsonResp(out, 401, "{\"message\":\"Bad credentials\"}");
+                return;
+            }
+            if (reqLine.startsWith("GET /repos/lemoyneiv/brake-indicator-logs ")) {
+                writeJsonResp(out, 200,
+                        "{\"full_name\":\"lemoyneiv/brake-indicator-logs\",\"permissions\":{\"push\":true}}");
+                return;
+            }
+            if (reqLine.startsWith("PUT /repos/lemoyneiv/brake-indicator-logs/contents/")) {
+                if (forceNext422Once) {
+                    forceNext422Once = false;
+                    writeJsonResp(out, 422, "{\"message\":\"Invalid request.\\n\\\"sha\\\" wasn't supplied.\"}");
+                    return;
+                }
+                org.json.JSONObject json = new org.json.JSONObject(new String(body, "UTF-8"));
+                String b64 = json.optString("content", "");
+                byte[] tarGz = Base64.getDecoder().decode(b64);
+                Map<String, byte[]> files = TarGzArchive.extractEntries(tarGz);
+                for (Map.Entry<String, byte[]> e : files.entrySet()) {
+                    if (e.getKey().endsWith(".csv")) {
+                        String csv = new String(e.getValue(), "UTF-8").trim();
+                        lastDecodedCsvRowCount = csv.split("\n").length - 1;
+                    }
+                }
+                putCount++;
+                writeJsonResp(out, 201, "{\"commit\":{\"sha\":\"9f8e7d6c5b4a3210\"}}");
+                return;
+            }
+            writeJsonResp(out, 404, "{\"message\":\"Not Found\"}");
+        }
+
+        private static void writeJsonResp(OutputStream out, int code, String bodyStr) throws IOException {
+            byte[] b = bodyStr.getBytes("UTF-8");
+            String head = "HTTP/1.1 " + code + " OK\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + b.length + "\r\n"
+                    + "Connection: close\r\n\r\n";
+            out.write(head.getBytes("US-ASCII"));
+            out.write(b);
+            out.flush();
+        }
+
+        @Override
+        public void close() {
+            try { srv.close(); } catch (Throwable ignored) {}
+            try { thread.join(2000L); } catch (Throwable ignored) {}
         }
     }
 

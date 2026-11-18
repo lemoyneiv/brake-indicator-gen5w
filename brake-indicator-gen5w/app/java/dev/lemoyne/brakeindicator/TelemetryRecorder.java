@@ -743,7 +743,7 @@ public final class TelemetryRecorder {
             String exportTriggerLabel) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2304);
-        sb.append("=== Brake Light Indicator v0.7.14 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.8.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
@@ -756,7 +756,8 @@ public final class TelemetryRecorder {
             sb.append("Thresholds          : pressure=").append(cfg.pressureThreshold)
               .append(", decel=").append(cfg.decelThresholdMps2).append(" m/s^2")
               .append(", standstillHold=").append(cfg.standstillHold)
-              .append(", autoExportUsb=").append(cfg.autoExportUsb).append('\n');
+              .append(", autoExportUsb=").append(cfg.autoExportUsb)
+              .append(", autoUploadCloud=").append(cfg.autoUploadCloud).append('\n');
         }
         if (hmgStatusSummary != null) {
             sb.append("HMG-API Session     : ").append(hmgStatusSummary).append('\n');

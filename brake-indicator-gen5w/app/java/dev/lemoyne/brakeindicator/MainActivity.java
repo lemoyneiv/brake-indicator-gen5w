@@ -28,10 +28,10 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.7.14 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.8.0 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
- *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Scan BLE`, `Reconnect`,
- *    `Clear`, `Unpair`, and `Close`), and inline action feedback right beside the driver.
+ *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Upload Cloud`, `Test Cloud`,
+ *    `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close`), and inline action feedback.
  *  - Center Status Monitor Card: Full-vertical-height, high-contrast driving-legible rows
  *    (`Real OBD (22BC06)` through `RAM Dataset Buffer`) with semantic M3 tonal status pills.
  *  - Right OBD-II & Transition Log Card: `@hmgapi-ble` scanner discovery list and full-height
@@ -331,12 +331,12 @@ public final class MainActivity extends Activity
                     }
                 });
         LinearLayout.LayoutParams modeLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 48 : 42);
-        modeLp.topMargin = 8;
+                ViewGroup.LayoutParams.MATCH_PARENT, widescreen ? 46 : 40);
+        modeLp.topMargin = 7;
         sidebar.addView(modeToggleBtn, modeLp);
 
-        int pairRowHeight = widescreen ? 46 : 42;
-        float pairBtnFont = widescreen ? 15.5f : 13.5f;
+        int pairRowHeight = widescreen ? 44 : 40;
+        float pairBtnFont = widescreen ? 15.0f : 13.0f;
 
         // 2-column row 1: Test (3s) | Export USB
         Button testBtn = m3Button(
@@ -371,7 +371,38 @@ public final class MainActivity extends Activity
                 });
         sidebar.addView(twoButtonRow(testBtn, exportBtn, pairRowHeight), rowPairLayoutParams());
 
-        // 2-column row 2: Scan BLE | Reconnect
+        // 2-column row 2: Upload Cloud | Test Cloud
+        Button uploadCloudBtn = m3Button(
+                "Upload Cloud",
+                pairBtnFont,
+                M3_PRIMARY_CONTAINER,
+                M3_PRIMARY_CONTAINER_PRESSED,
+                M3_ON_PRIMARY_CONTAINER,
+                1,
+                M3_PRIMARY_BORDER,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        uploadDatasetToCloud();
+                    }
+                });
+        Button testCloudBtn = m3Button(
+                "Test Cloud",
+                pairBtnFont,
+                M3_SECONDARY_CONTAINER,
+                M3_SECONDARY_CONTAINER_PRESSED,
+                M3_ON_SECONDARY_CONTAINER,
+                1,
+                M3_SECONDARY_BORDER,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        testCloudConnectivity();
+                    }
+                });
+        sidebar.addView(twoButtonRow(uploadCloudBtn, testCloudBtn, pairRowHeight), rowPairLayoutParams());
+
+        // 2-column row 3: Scan BLE | Reconnect
         scanBleBtn = m3Button(
                 "Scan BLE",
                 pairBtnFont,
@@ -411,7 +442,7 @@ public final class MainActivity extends Activity
                 });
         sidebar.addView(twoButtonRow(scanBleBtn, reconnBtn, pairRowHeight), rowPairLayoutParams());
 
-        // 2-column row 3: Clear | Unpair
+        // 2-column row 4: Clear | Unpair
         Button clearBtn = m3Button(
                 "Clear",
                 pairBtnFont,
@@ -449,15 +480,22 @@ public final class MainActivity extends Activity
         LinearLayout sidebarFooterInfo = new LinearLayout(this);
         sidebarFooterInfo.setOrientation(LinearLayout.VERTICAL);
         sidebarFooterInfo.setGravity(Gravity.BOTTOM);
-        sidebarFooterInfo.setPadding(4, 8, 4, 2);
+        sidebarFooterInfo.setPadding(4, 6, 4, 2);
 
         actionNoticeText = new TextView(this);
         actionNoticeText.setTextColor(M3_PRIMARY);
-        actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 14.5f : 13.0f);
+        actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 14.0f : 12.5f);
         actionNoticeText.setLineSpacing(2.0f, 1.0f);
         actionNoticeText.setMaxLines(3);
         actionNoticeText.setEllipsize(TextUtils.TruncateAt.END);
-        actionNoticeText.setText("Auto-exports CSV + summary to <usb>/BrakeIndicator/ on Park or 95% buffer.");
+        CloudUploadConfig initialCloud = engine.getCloudUploadConfig();
+        if (initialCloud.hasCredentials()) {
+            actionNoticeText.setText("Cloud ready (" + initialCloud.repo
+                    + ") \u2014 auto-uploads .tar.gz on Park or 95% buffer.");
+        } else {
+            actionNoticeText.setText("Auto-exports to USB on Park/95% (add BrakeIndicator/"
+                    + CloudUploadConfig.USB_CONFIG_FILE + " + Test Cloud for LTE GitHub upload).");
+        }
         sidebarFooterInfo.addView(actionNoticeText);
 
         configSummaryText = new TextView(this);
@@ -466,7 +504,7 @@ public final class MainActivity extends Activity
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("Brake Indicator v0.7.14");
+        configSummaryText.setText("Brake Indicator v0.8.0");
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
@@ -656,7 +694,7 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.7.14 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
+                "v0.8.0 \u00B7 " + cfg.iconSizePx + "px \u00B7 HMG-API: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
 
         // 1. Real OBD (770 / 22BC06)
@@ -743,10 +781,20 @@ public final class MainActivity extends Activity
             rowAccuracy.updateValue("Awaiting live OBD 22BC06 samples", M3_ON_SURFACE_VARIANT);
         }
 
-        // 8. RAM Dataset Buffer & Auto-Export Status
+        // 8. RAM Dataset Buffer & Cloud / USB Auto-Export Status
         AutoExportCoordinator.StatusSnapshot autoSnap = engine.getAutoExportStatus();
+        CloudUploadConfig cloudCfg = engine.getCloudUploadConfig();
+        boolean cloudReady = cloudCfg.isReadyForAutoUpload(cfg);
         if (engine.isExportInFlight()) {
-            rowBuffer.updateBadge(BADGE_PRIMARY, "WRITING USB");
+            rowBuffer.updateBadge(BADGE_PRIMARY, cloudReady ? "SYNCING" : "WRITING USB");
+        } else if (autoSnap.queuedCloudCount > 0) {
+            rowBuffer.updateBadge(BADGE_OFF, "QUEUED \u00B7 " + autoSnap.queuedCloudCount);
+        } else if (cloudReady) {
+            rowBuffer.updateBadge(
+                    BADGE_PRIMARY,
+                    autoSnap.cloudUploadCount > 0
+                            ? ("CLOUD \u00B7 " + autoSnap.cloudUploadCount)
+                            : "AUTO CLOUD");
         } else if (!cfg.autoExportUsb) {
             rowBuffer.updateBadge(BADGE_OFF, "MANUAL");
         } else if (autoSnap.waitingForUsb) {
@@ -758,7 +806,16 @@ public final class MainActivity extends Activity
         }
 
         String shortSaved = autoSnap.shortLastSavedLabel();
-        if (autoSnap.waitingForUsb && autoSnap.waitingReason != null) {
+        if (autoSnap.queuedCloudCount > 0) {
+            int qKb = Math.max(1, (autoSnap.queuedCloudBytes + 512) / 1024);
+            rowBuffer.updateValue(
+                    String.format(Locale.US, "%,d / %,d rows  \u00B7  %d queued (%d KB gz)",
+                            Integer.valueOf(sc.bufferedRows),
+                            Integer.valueOf(TelemetryRecorder.CAPACITY),
+                            Integer.valueOf(autoSnap.queuedCloudCount),
+                            Integer.valueOf(qKb)),
+                    M3_WARNING_AMBER);
+        } else if (autoSnap.waitingForUsb && autoSnap.waitingReason != null) {
             rowBuffer.updateValue(
                     String.format(Locale.US, "%,d / %,d rows  \u00B7  Insert USB (%s)",
                             Integer.valueOf(sc.bufferedRows),
@@ -911,6 +968,50 @@ public final class MainActivity extends Activity
         worker.start();
     }
 
+    private void uploadDatasetToCloud() {
+        actionNoticeText.setText("Compressing & uploading .tar.gz to GitHub over LTE/Wi-Fi...");
+        Thread worker = new Thread("BrakeCloudUpload") {
+            @Override
+            public void run() {
+                final AutoExportCoordinator.ActionOutcome out = engine.uploadDatasetToCloud();
+                if (out.ok && out.uploadedToCloud && out.primaryTarget != null) {
+                    try {
+                        String name = out.primaryTarget.substring(out.primaryTarget.lastIndexOf('/') + 1);
+                        HmgApi.toast(MainActivity.this, "Uploaded " + name);
+                    } catch (Exception ignored) {}
+                }
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        actionNoticeText.setText(out.message);
+                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void testCloudConnectivity() {
+        actionNoticeText.setText("Checking USB cloud-upload.json + TLS 1.2 -> api.github.com...");
+        Thread worker = new Thread("BrakeCloudProbe") {
+            @Override
+            public void run() {
+                final String msg = engine.testCloudAndImportFromUsb();
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        actionNoticeText.setText(msg);
+                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                    }
+                });
+            }
+        };
+        worker.setDaemon(true);
+        worker.start();
+    }
+
     private static String sidebarModeLabel(IndicatorConfig.ObdMode mode) {
         if (mode == IndicatorConfig.ObdMode.MODEL_ONLY_ICON) {
             return "Mode: Model Icon (Score OBD)";
@@ -943,7 +1044,7 @@ public final class MainActivity extends Activity
     private static LinearLayout.LayoutParams rowPairLayoutParams() {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = 8;
+        lp.topMargin = 7;
         return lp;
     }
 

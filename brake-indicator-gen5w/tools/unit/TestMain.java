@@ -105,6 +105,7 @@ public final class TestMain {
         testV081L3VsIpedalDiscriminationFeatheredL3AndAutoL1Base();
         testV090OtaModelSigningVerificationHotSwapAndWatchdog();
         testV0100DriverGroundTruthCaptureAgingInvalidationAndCsv();
+        testModel202611182SccPreservationUphillGuardAndFootHold();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -4245,13 +4246,14 @@ public final class TestMain {
         String trustedPubB64 = ModelBundleVerifier.encodeBase64(trustedPub);
 
         File workDir = Files.createTempDirectory("v090-ota-test").toFile();
+        String expectedBuiltInBadge = BrakeEvaluator.BUILTIN_MODEL_VERSION + " (builtin)";
         try {
             // Dynamically compile 3 isolated dev.lemoyne.brakeindicator.model.* plugins
             byte[] jarV2 = compileAndSignTestModelJar(
                     workDir,
                     "TestOtaModelV2",
-                    "2026.11.18.2",
-                    2026111802L,
+                    "2026.11.99.2",
+                    2026119902L,
                     1,
                     1,
                     "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 40.0f"
@@ -4267,8 +4269,8 @@ public final class TestMain {
             byte[] jarV3Usb = compileAndSignTestModelJar(
                     workDir,
                     "TestOtaModelV3Usb",
-                    "2026.11.18.3",
-                    2026111803L,
+                    "2026.11.99.3",
+                    2026119903L,
                     1,
                     1,
                     "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 40.0f"
@@ -4285,8 +4287,8 @@ public final class TestMain {
             byte[] jarFaultyV4 = compileAndSignTestModelJar(
                     workDir,
                     "TestFaultyModelV4",
-                    "2026.11.18.4",
-                    2026111804L,
+                    "2026.11.99.4",
+                    2026119904L,
                     1,
                     1,
                     "if (in != null && in.speedKmh != null && in.speedKmh.floatValue() >= 110.0f) {\n"
@@ -4299,8 +4301,8 @@ public final class TestMain {
                     jarV2, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
             eq("v0.9.0 valid ECDSA-signed OTA jar verifies cleanly",
                     Boolean.TRUE,
-                    Boolean.valueOf(okVer.ok && "2026.11.18.2".equals(okVer.modelVersion)
-                            && okVer.modelSeq == 2026111802L));
+                    Boolean.valueOf(okVer.ok && "2026.11.99.2".equals(okVer.modelVersion)
+                            && okVer.modelSeq == 2026119902L));
 
             // Wrong author keypair -> rejected
             ModelBundleVerifier.VerifiedBundle wrongKeyVer = ModelBundleVerifier.verifyBundle(
@@ -4322,7 +4324,7 @@ public final class TestMain {
 
             // Tampered manifest.json -> ECDSA signature verification fails
             byte[] tamperedManJar = replaceZipEntryText(
-                    jarV2, ModelBundleVerifier.MANIFEST_ENTRY, "2026111802", "2026111899");
+                    jarV2, ModelBundleVerifier.MANIFEST_ENTRY, "2026119902", "2026119999");
             ModelBundleVerifier.VerifiedBundle badSigVer = ModelBundleVerifier.verifyBundle(
                     tamperedManJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
             eq("v0.9.0 modified manifest.json rejected by ECDSA P-256 signature",
@@ -4350,7 +4352,7 @@ public final class TestMain {
             Map<String, byte[]> dummyPayload = new LinkedHashMap<String, byte[]>();
             dummyPayload.put("classes.dex", makeValidDexStub());
             byte[] badPkgJar = ModelBundleVerifier.buildSignedModelJar(
-                    dummyPayload, "2026.11.18.9", 2026111809L, 1, 1,
+                    dummyPayload, "2026.11.99.9", 2026119909L, 1, 1,
                     "dev.lemoyne.brakeindicator.BrakeEvaluator", trustedPriv, trustedPub);
             ModelBundleVerifier.VerifiedBundle badPkgVer = ModelBundleVerifier.verifyBundle(
                     badPkgJar, BrakeModel.HOST_MODEL_API_VERSION, trustedUuid, trustedPubB64);
@@ -4366,7 +4368,7 @@ public final class TestMain {
             TlsHttpClient tlsClient = new TlsHttpClient(5000, 10000, Collections.singletonList(srvCert), false);
 
             MockOtaHttpsServer otaSrv = new MockOtaHttpsServer(sslCtx);
-            otaSrv.setPublishedModel("2026.11.18.2", 2026111802L, "\"etag-v2\"", jarV2);
+            otaSrv.setPublishedModel("2026.11.99.2", 2026119902L, "\"etag-v2\"", jarV2);
 
             try {
                 File appFiles = new File(workDir, "app-files");
@@ -4384,7 +4386,7 @@ public final class TestMain {
                         trustedPubB64);
                 mgr.initFromDisk(rec, 1000L);
                 eq("v0.9.0 starts on built-in model when cache empty",
-                        "2026.11.18.1 (builtin)", mgr.getActiveModelBadge());
+                        expectedBuiltInBadge, mgr.getActiveModelBadge());
 
                 IndicatorConfig cfg = IndicatorConfig.defaults();
                 AutoExportCoordinator.TransportInfo lteNet = new AutoExportCoordinator.TransportInfo(
@@ -4393,14 +4395,14 @@ public final class TestMain {
                 // Automatic Park check downloads, verifies ECDSA, self-tests, and hot-swaps to v2
                 ModelManager.UpdateOutcome up1 = mgr.checkForUpdate(
                         false, cfg, lteNet, Collections.<String>emptyList(), rec, 10_000L);
-                eq("v0.9.0 auto Park check hot-swaps to signed OTA 2026.11.18.2 over TLS 1.2",
+                eq("v0.9.0 auto Park check hot-swaps to signed OTA 2026.11.99.2 over TLS 1.2",
                         Boolean.TRUE,
                         Boolean.valueOf(up1.ok && up1.updated && up1.activeIsOta
-                                && "2026.11.18.2".equals(up1.activeVersion)));
+                                && "2026.11.99.2".equals(up1.activeVersion)));
                 eq("v0.9.0 public ota fetch sends zero Authorization token",
                         "", otaSrv.lastAuthHeader);
-                eq("v0.9.0 badge updates to 2026.11.18.2 (OTA)",
-                        "2026.11.18.2 (OTA)", mgr.getActiveModelBadge());
+                eq("v0.9.0 badge updates to 2026.11.99.2 (OTA)",
+                        "2026.11.99.2 (OTA)", mgr.getActiveModelBadge());
 
                 // Verify live 50ms tick executes the hot-swapped OTA plugin bytecode
                 BrakeEvaluator.Snapshot snapV2 = mgr.evaluateTick(
@@ -4419,16 +4421,16 @@ public final class TestMain {
                 // Verify summary & cloud commit message stamp the active OTA model version
                 TelemetryRecorder.ExportPayload exp = rec.snapshotForExport(
                         cfg, "Standby", "OK (20Hz)", null, "SHIFT_TO_PARK");
-                eq("v0.9.0 ExportPayload records activeModelTag=2026.11.18.2-ota",
-                        "2026.11.18.2-ota", exp.activeModelTag);
+                eq("v0.9.0 ExportPayload records activeModelTag=2026.11.99.2-ota",
+                        "2026.11.99.2-ota", exp.activeModelTag);
                 eq("v0.9.0 summary stamps Active Brake Model (OTA + seq + sha256)",
                         Boolean.TRUE,
-                        Boolean.valueOf(exp.summary.contains("Active Brake Model  : 2026.11.18.2 (OTA, seq=2026111802, sha256=")));
+                        Boolean.valueOf(exp.summary.contains("Active Brake Model  : 2026.11.99.2 (OTA, seq=2026119902, sha256=")));
                 PendingUploadQueue.QueuedDrive qd = PendingUploadQueue.packageDrive(
                         exp, rec.scoreSnapshot(), AutoExportCoordinator.Trigger.SHIFT_TO_PARK, 1700000000000L);
-                eq("v0.9.0 cloud upload commitMessage includes model=2026.11.18.2-ota",
+                eq("v0.9.0 cloud upload commitMessage includes model=2026.11.99.2-ota",
                         Boolean.TRUE,
-                        Boolean.valueOf(qd.commitMessage.contains("model=2026.11.18.2-ota")));
+                        Boolean.valueOf(qd.commitMessage.contains("model=2026.11.99.2-ota")));
 
                 // Second automatic Park check 60s later is throttled in RAM with zero HTTP traffic
                 int reqBeforeCooldown = otaSrv.latestGetCount;
@@ -4462,40 +4464,40 @@ public final class TestMain {
                         trustedPubB64);
                 rebootedMgr.initFromDisk(rec, 82_000L);
                 eq("v0.9.0 rebooted ModelManager reloads verified OTA model from disk",
-                        "2026.11.18.2 (OTA)", rebootedMgr.getActiveModelBadge());
+                        "2026.11.99.2 (OTA)", rebootedMgr.getActiveModelBadge());
 
                 // 4. Offline signed USB .jar import + manual long-press resetToBuiltIn
                 File usbRoot = new File(workDir, "usb0");
                 File usbBiDir = new File(usbRoot, UsbExporter.SUBFOLDER);
                 usbBiDir.mkdirs();
-                Files.write(new File(usbBiDir, "brake-model-2026.11.18.3.jar").toPath(), jarV3Usb);
+                Files.write(new File(usbBiDir, "brake-model-2026.11.99.3.jar").toPath(), jarV3Usb);
 
                 AutoExportCoordinator.TransportInfo offlineNet = new AutoExportCoordinator.TransportInfo(
                         AutoExportCoordinator.TransportKind.NONE, "Offline");
                 ModelManager.UpdateOutcome usbUp = mgr.checkForUpdate(
                         true, cfg, offlineNet, Collections.singletonList(usbRoot.getAbsolutePath()), rec, 90_000L);
-                eq("v0.9.0 offline manual Update Model imports signed USB brake-model-2026.11.18.3.jar",
+                eq("v0.9.0 offline manual Update Model imports signed USB brake-model-2026.11.99.3.jar",
                         Boolean.TRUE,
-                        Boolean.valueOf(usbUp.ok && usbUp.updated && "2026.11.18.3".equals(usbUp.activeVersion)));
+                        Boolean.valueOf(usbUp.ok && usbUp.updated && "2026.11.99.3".equals(usbUp.activeVersion)));
                 File modelsFolder = new File(appFiles, "models");
                 eq("v0.9.0 older cached v2 jar pruned after v3 activation",
                         Boolean.FALSE,
-                        Boolean.valueOf(new File(modelsFolder, "brake-model-2026111802.jar").exists()));
+                        Boolean.valueOf(new File(modelsFolder, "brake-model-2026119902.jar").exists()));
 
                 ModelManager.UpdateOutcome resetOut = mgr.resetToBuiltIn(rec, 95_000L);
-                eq("v0.9.0 long-press resetToBuiltIn restores built-in 2026.11.18.1 and clears models dir",
+                eq("v0.9.0 long-press resetToBuiltIn restores built-in model and clears models dir",
                         Boolean.TRUE,
                         Boolean.valueOf(resetOut.ok && resetOut.updated && !mgr.isActiveOta()
-                                && "2026.11.18.1 (builtin)".equals(mgr.getActiveModelBadge())
-                                && !new File(modelsFolder, "brake-model-2026111803.jar").exists()));
+                                && expectedBuiltInBadge.equals(mgr.getActiveModelBadge())
+                                && !new File(modelsFolder, "brake-model-2026119903.jar").exists()));
 
                 // 5. Runtime watchdog: catches mid-drive exception on the exact same tick, reverts, & quarantines
-                otaSrv.setPublishedModel("2026.11.18.4", 2026111804L, "\"etag-v4\"", jarFaultyV4);
+                otaSrv.setPublishedModel("2026.11.99.4", 2026119904L, "\"etag-v4\"", jarFaultyV4);
                 ModelManager.UpdateOutcome upFaulty = mgr.checkForUpdate(
                         true, cfg, lteNet, Collections.<String>emptyList(), rec, 100_000L);
                 eq("v0.9.0 TestFaultyModelV4 passes 6-tick self-test (<100 km/h) and activates",
                         Boolean.TRUE,
-                        Boolean.valueOf(upFaulty.ok && upFaulty.updated && "2026.11.18.4".equals(upFaulty.activeVersion)));
+                        Boolean.valueOf(upFaulty.ok && upFaulty.updated && "2026.11.99.4".equals(upFaulty.activeVersion)));
 
                 // Trigger 115 km/h + 14 bar foot brake -> faulty model throws, watchdog falls back on same tick!
                 BrakeEvaluator.Snapshot rescuedSnap = mgr.evaluateTick(
@@ -4515,8 +4517,8 @@ public final class TestMain {
                 eq("v0.9.0 runtime watchdog reverts activeModel to built-in and deletes faulty jar",
                         Boolean.TRUE,
                         Boolean.valueOf(!mgr.isActiveOta()
-                                && "2026.11.18.1 (builtin)".equals(mgr.getActiveModelBadge())
-                                && !new File(modelsFolder, "brake-model-2026111804.jar").exists()));
+                                && expectedBuiltInBadge.equals(mgr.getActiveModelBadge())
+                                && !new File(modelsFolder, "brake-model-2026119904.jar").exists()));
 
                 ModelManager.UpdateOutcome retryQuarantined = mgr.checkForUpdate(
                         true, cfg, lteNet, Collections.<String>emptyList(), rec, 110_000L);
@@ -4527,7 +4529,7 @@ public final class TestMain {
 
                 // 6. Automatic cached OTA retirement when a newer full APK (seq=2026120101) is installed
                 modelsFolder.mkdirs();
-                File staleCachedJar = new File(modelsFolder, "brake-model-2026111802.jar");
+                File staleCachedJar = new File(modelsFolder, "brake-model-2026119902.jar");
                 Files.write(staleCachedJar.toPath(), jarV2);
                 BrakeModel newerBuiltIn = new BrakeModel() {
                     private final BrakeEvaluator delegate = new BrakeEvaluator();
@@ -4750,6 +4752,135 @@ public final class TestMain {
                 Boolean.FALSE, Boolean.valueOf(postParkGt.hasRegenConfirmation()));
         eq("v0.10.0 shifting into Park retains console Auto-Hold ON within boot",
                 Integer.valueOf(TelemetryRecorder.AUTOHOLD_ON), Integer.valueOf(postParkGt.autoHold));
+    }
+
+    private static void testModel202611182SccPreservationUphillGuardAndFootHold() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        eq("model 2026.11.18.2 version and seq constants",
+                "2026.11.18.2/2026111802",
+                ev.modelVersion() + "/" + ev.modelSeq());
+
+        long t = 10_000L;
+        // 1. Establish settled fixed L3 (!autoRegenActive) on a 20 Hz (50 ms) Hub via 3 L3 coasts:
+        float spd = 92.0f;
+        BrakeEvaluator.Snapshot snap = null;
+        for (int c = 0; c < 3; c++) {
+            spd = 92.0f;
+            for (int i = 0; i < 42; i++) {
+                t += 50L;
+                spd -= 0.30f; // ~1.67 m/s^2 total (~1.47 m/s^2 motor decel -> L3)
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, Float.valueOf(0.0f), Float.valueOf(spd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            }
+            for (int i = 0; i < 16; i++) {
+                t += 50L;
+                spd += 0.35f;
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, Float.valueOf(0.0f), Float.valueOf(spd), Float.valueOf(22.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            }
+        }
+        eq("2026.11.18.2 establishes fixed L3 (!autoRegenActive) prior to SCC",
+                "3/false", snap.inferredRegenLevel + "/" + snap.autoRegenActive);
+
+        // 2. Engage SCC at 90.0 km/h (0% pedal): initial 1.3s gentle settle dip (-0.32 m/s^2 -> L0 chord)
+        //    followed by 3.9s flat 88.5 km/h SCC cruise (< 9.0s L0 guard, >= 3.6s L3 SCC chord):
+        spd = 90.0f;
+        for (int i = 0; i < 26; i++) {
+            t += 50L;
+            spd -= 0.058f; // ~0.32 m/s^2 total (~0.12 m/s^2 above aero -> transient L0 chord before SCC latches)
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(spd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 78; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(spd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.18.2 SCC latch restores pre-SCC L3 and !autoRegenActive without L0 delay",
+                "true/3/false", snap.sccActive + "/" + snap.inferredRegenLevel + "/" + snap.autoRegenActive);
+
+        // 3. 20 Hz highway SCC active follow-braking chord (2.4 km/h quantized 0.8 km/h drops over 1.8s at ~88 km/h,
+        //    total decel ~0.34 m/s^2 where motorDecelMps2 < 0.28 m/s^2):
+        float rawSccSpd = Math.round(spd / 0.8f) * 0.8f;
+        for (int i = 0; i < 40; i++) {
+            t += 50L;
+            rawSccSpd -= 0.062f; // ~1.24 km/h/s = 0.34 m/s^2 (~0.19 m/s^2 motorDecel < 0.28 m/s^2)
+            spd = Math.round(rawSccSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(spd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.18.2 20 Hz highway SCC 2.0 km/h / 1.9s chord illuminates brake lamp",
+                Boolean.TRUE, Boolean.valueOf(snap.sccActive && snap.modelIlluminated));
+
+        // 4. Cancel SCC via brief foot brake, verify sub-i-Pedal highway cruise (14.5% at 78 km/h),
+        //    then climb steep grade at 33.0% throttle holding 82.0 km/h for 3.2s -> must stay L3 (not 4):
+        for (int i = 0; i < 8; i++) {
+            t += 50L;
+            spd = 78.0f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(2.4f), Float.valueOf(spd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        // Settle > 1.4s post-brake, then hold 14.5% pedal at 78.0 km/h for 1.5s:
+        for (int i = 0; i < 60; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(78.0f), Float.valueOf(14.5f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        // Transition to 82.0 km/h steep climb holding 33.0% pedal flat (decel ~ 0) for 3.2s (> 2450 ms):
+        for (int i = 0; i < 20; i++) {
+            t += 50L;
+            float climbSpd = 78.0f + 0.20f * (i + 1);
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(climbSpd), Float.valueOf(36.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 66; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(82.0f), Float.valueOf(33.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.18.2 steep uphill 33% throttle within 22s of 14.5% cruise stays L3 (not i-Pedal)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 5. Standstill continuous light foot-hold (0.24 bar at 0.0 km/h after 1.30 bar stop):
+        BrakeEvaluator stopEv = new BrakeEvaluator();
+        long ts = 50_000L;
+        for (int i = 0; i < 20; i++) {
+            ts += 50L;
+            float s = Math.max(0.0f, 8.0f - i * 0.45f);
+            float p = s > 1.0f ? 1.30f : 0.35f;
+            snap = stopEv.evaluate(cfg, new BrakeEvaluator.Input(
+                    ts, Float.valueOf(p), Float.valueOf(s), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(s > 0.0f), Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ts));
+        }
+        for (int i = 0; i < 40; i++) {
+            ts += 50L;
+            snap = stopEv.evaluate(cfg, new BrakeEvaluator.Input(
+                    ts, Float.valueOf(0.24f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, Float.valueOf(76.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ts));
+        }
+        eq("2026.11.18.2 standstill 0.24 bar light foot-hold after 1.30 bar stop stays BRAKE_PRESSURE",
+                "true/BRAKE_PRESSURE", snap.modelIlluminated + "/" + snap.modelSource);
     }
 
     private static byte[] makeValidDexStub() {

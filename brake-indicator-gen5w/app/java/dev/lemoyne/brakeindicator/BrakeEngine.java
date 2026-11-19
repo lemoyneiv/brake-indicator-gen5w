@@ -337,21 +337,52 @@ public final class BrakeEngine {
     }
 
     public String markDriveEvent() {
+        long nowMono = obdClient.monotonicMs();
         int n = markSeq.incrementAndGet();
         BrakeEvaluator.Snapshot snap = latestSnapshot;
+        TelemetryRecorder.DriverGroundTruth gt = recorder.getDriverGroundTruth(nowMono);
         String reg = snap != null
                 ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive)
                 : "?";
         String spd = (snap != null && snap.speedKmh != null)
                 ? String.format(java.util.Locale.US, "%.1f km/h", snap.speedKmh)
                 : "- km/h";
-        String msg = "MARK #" + n + " (regen=" + reg + ", speed=" + spd + ")";
-        recorder.recordExternalEvent(obdClient.monotonicMs(), msg);
+        String gtPart = gt.hasRegenConfirmation() ? (", gt=" + gt.formatRegenLabel()) : "";
+        String msg = "MARK #" + n + " (regen=" + reg + gtPart + ", speed=" + spd + ")";
+        recorder.recordExternalEvent(nowMono, msg);
         return msg;
     }
 
     public String markRegenBaseline() {
         return markDriveEvent();
+    }
+
+    public void setUiFocused(boolean focused) {
+        recorder.setUiFocused(focused, obdClient.monotonicMs());
+    }
+
+    public TelemetryRecorder.DriverGroundTruth confirmDriverRegenLevel(int level) {
+        return recorder.confirmDriverRegenLevel(level, obdClient.monotonicMs(), latestSnapshot);
+    }
+
+    public TelemetryRecorder.DriverGroundTruth toggleDriverAutoRegen() {
+        return recorder.toggleDriverAutoRegen(obdClient.monotonicMs(), latestSnapshot);
+    }
+
+    public TelemetryRecorder.DriverGroundTruth toggleDriverScc() {
+        return recorder.toggleDriverScc(obdClient.monotonicMs(), latestSnapshot);
+    }
+
+    public TelemetryRecorder.DriverGroundTruth setDriverAutoHold(int state) {
+        return recorder.setDriverAutoHold(state, obdClient.monotonicMs());
+    }
+
+    public TelemetryRecorder.DriverGroundTruth clearDriverGroundTruth() {
+        return recorder.clearDriverGroundTruth(obdClient.monotonicMs());
+    }
+
+    public TelemetryRecorder.DriverGroundTruth getDriverGroundTruth() {
+        return recorder.getDriverGroundTruth(obdClient.monotonicMs());
     }
 
     public void triggerManualTest(long durationMs) {

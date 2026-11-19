@@ -104,6 +104,7 @@ public final class TestMain {
         testV080TarGzUsbProvisioningAndCloudOrchestration();
         testV081L3VsIpedalDiscriminationFeatheredL3AndAutoL1Base();
         testV090OtaModelSigningVerificationHotSwapAndWatchdog();
+        testV0100DriverGroundTruthCaptureAgingInvalidationAndCsv();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -1068,17 +1069,25 @@ public final class TestMain {
         String csv = rec.toCsvString();
         String[] lines = csv.trim().split("\n");
         eq("CSV has header + 6 data rows", Integer.valueOf(7), Integer.valueOf(lines.length));
-        eq("CSV header includes inferred_regen_level,hev_regen_raw",
-                Boolean.TRUE, Boolean.valueOf(lines[0].endsWith("inferred_regen_level,hev_regen_raw")));
-        eq("CSV row 3 records REGEN_DECEL, raw 44, pedal=0, i-Pedal(4)",
-                Boolean.TRUE, Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,") && lines[3].endsWith(",44,1,0,4,")));
-        eq("CSV row 4 records BRAKE_PRESSURE, raw 45, pedal=1, i-Pedal(4)",
-                Boolean.TRUE, Boolean.valueOf(lines[4].contains(",1,BRAKE_PRESSURE,1,1,BLE,") && lines[4].endsWith(",45,1,1,4,")));
+        eq("CSV header includes inferred_regen_level through driver_gt_age_s,ui_focused",
+                Boolean.TRUE,
+                Boolean.valueOf(lines[0].endsWith(
+                        "inferred_regen_level,hev_regen_raw,inferred_auto_regen,inferred_scc,"
+                                + "driver_regen_level,driver_auto_regen,driver_scc,driver_autohold,"
+                                + "driver_gt_age_s,ui_focused")));
+        eq("CSV row 3 records REGEN_DECEL, raw 44, pedal=0, i-Pedal(4), unlabeled GT",
+                Boolean.TRUE,
+                Boolean.valueOf(lines[3].contains(",1,REGEN_DECEL,1,1,BLE,")
+                        && lines[3].endsWith(",44,1,0,4,,0,0,,,,,,0")));
+        eq("CSV row 4 records BRAKE_PRESSURE, raw 45, pedal=1, i-Pedal(4), unlabeled GT",
+                Boolean.TRUE,
+                Boolean.valueOf(lines[4].contains(",1,BRAKE_PRESSURE,1,1,BLE,")
+                        && lines[4].endsWith(",45,1,1,4,,0,0,,,,,,0")));
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.9.0 with Active Brake Model",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.9.0 Calibration Summary")
+        eq("Summary banner is v0.10.0 with Active Brake Model",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.0 Calibration Summary")
                         && summary.contains("Active Brake Model  :")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
@@ -4555,6 +4564,192 @@ public final class TestMain {
         } finally {
             deleteRecursive(workDir);
         }
+    }
+
+    private static void testV0100DriverGroundTruthCaptureAgingInvalidationAndCsv() {
+        TelemetryRecorder rec = new TelemetryRecorder();
+        long wall = 1763500000000L;
+
+        // 1. Default unlabeled state
+        TelemetryRecorder.DriverGroundTruth initGt = rec.getDriverGroundTruth(1000L);
+        eq("v0.10.0 default GT is UNSET", Boolean.FALSE, Boolean.valueOf(initGt.hasRegenConfirmation()));
+        eq("v0.10.0 default Auto-Hold GT is UNSET (-1)",
+                Integer.valueOf(TelemetryRecorder.AUTOHOLD_UNSET), Integer.valueOf(initGt.autoHold));
+
+        // 2. Driver opens MainActivity while Parked BEFORE departing and taps L3 + Auto-Hold ON:
+        //    Must NOT auto-clear while sitting in Park before shifting out of Park!
+        rec.setUiFocused(true, 1000L);
+        BrakeEvaluator.Snapshot parkedSnap = new BrakeEvaluator.Snapshot(
+                1000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(80.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 990L, 0, false, false),
+                true, false, -1, -1, false, false);
+        rec.confirmDriverRegenLevel(BrakeEvaluator.REGEN_LEVEL_3, 1000L, parkedSnap);
+        rec.setDriverAutoHold(TelemetryRecorder.AUTOHOLD_ON, 1000L);
+        rec.record(parkedSnap, wall);
+
+        BrakeEvaluator.Snapshot parkedSnap2 = new BrakeEvaluator.Snapshot(
+                2000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(80.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 1990L, 0, false, false),
+                true, false, -1, -1, false, false);
+        rec.record(parkedSnap2, wall + 1000L);
+        TelemetryRecorder.DriverGroundTruth preDriveGt = rec.getDriverGroundTruth(2000L);
+        eq("v0.10.0 pre-Drive Park tap stays latched in Park before shifting to Drive",
+                Integer.valueOf(3), Integer.valueOf(preDriveGt.regenLevel));
+        eq("v0.10.0 pre-Drive Park rows do not inflate active driving GT tick counts",
+                Long.valueOf(0L), Long.valueOf(rec.scoreSnapshot().gtHighConfTicks));
+
+        // 3. Shift to Drive (gearPark=false) while focused:
+        //    - Tick A (t=5000, age=4s): Model still learning (-1) -> high-conf tick=1, eval=0
+        BrakeEvaluator.Snapshot driveLearning = new BrakeEvaluator.Snapshot(
+                5000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(18.0f), Float.valueOf(12.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(80.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 4990L, 0, false, false),
+                true, false, -1, -1, false, false);
+        rec.record(driveLearning, wall + 4000L);
+
+        //    - Tick B (t=13000, age=12s): Model misclassifies L3 as i-Pedal (4) -> high-conf eval=1, matched=0
+        BrakeEvaluator.Snapshot driveMismatch = new BrakeEvaluator.Snapshot(
+                13000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(58.0f), Float.valueOf(21.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(80.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 12990L, 0, false, false),
+                true, false, 4, -1, false, false);
+        rec.record(driveMismatch, wall + 12000L);
+        eq("v0.10.0 doesModelMatchDriverGt flags L3 vs i-Pedal mismatch",
+                Boolean.FALSE,
+                Boolean.valueOf(TelemetryRecorder.doesModelMatchDriverGt(
+                        driveMismatch, rec.getDriverGroundTruth(13000L))));
+
+        //    - Tick C (t=16000, age=15s): Model predicts L3 (3) -> high-conf eval=2, matched=1 (50.0%)
+        BrakeEvaluator.Snapshot driveMatch = new BrakeEvaluator.Snapshot(
+                16000L, true, "OBD_REGEN[44]", true, "REGEN_DECEL",
+                Float.valueOf(0.0f), Float.valueOf(52.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 1.42f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(80.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 15990L, 44, true, false),
+                true, false, 3, -1, false, false);
+        rec.record(driveMatch, wall + 15000L);
+
+        TelemetryRecorder.ScoreSnapshot sc1 = rec.scoreSnapshot();
+        eq("v0.10.0 high-conf ticks=3 (1 learning + 2 eval), eval=2, matched=1",
+                "3/2/1", sc1.gtHighConfTicks + "/" + sc1.gtHighConfEvalSamples + "/" + sc1.gtHighConfMatchedSamples);
+        eq("v0.10.0 Auto-Hold ON driving ticks=3",
+                Long.valueOf(3L), Long.valueOf(sc1.gtAutoHoldOnTicks));
+
+        // 4. Driver switches to CarPlay (setUiFocused(false)) and later reopens MainActivity (setUiFocused(true))
+        //    WITHOUT tapping a button: age MUST NOT reset, and carryForward MUST stay true!
+        rec.setUiFocused(false, 20000L);
+        BrakeEvaluator.Snapshot bgSnap = new BrakeEvaluator.Snapshot(
+                25000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(60.0f), Float.valueOf(18.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(79.5f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 24990L, 0, false, false),
+                true, false, 3, -1, false, false);
+        rec.record(bgSnap, wall + 24000L);
+
+        // Reopen app at t=45000L (44s after original tap) WITHOUT tapping any GT button:
+        rec.setUiFocused(true, 45000L);
+        TelemetryRecorder.DriverGroundTruth reopenedGt = rec.getDriverGroundTruth(45000L);
+        eq("v0.10.0 reopening UI without tap preserves true 44s tap age",
+                Integer.valueOf(44), Integer.valueOf(reopenedGt.ageSeconds));
+        eq("v0.10.0 reopening UI without tap stays in carryForward tier",
+                Boolean.TRUE, Boolean.valueOf(reopenedGt.carryForward));
+
+        BrakeEvaluator.Snapshot reopenedSnap = new BrakeEvaluator.Snapshot(
+                46000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(62.0f), Float.valueOf(18.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(79.5f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 45990L, 0, false, false),
+                true, false, 3, -1, false, false);
+        rec.record(reopenedSnap, wall + 45000L);
+        eq("v0.10.0 post-backgrounding ticks score in Carry-Fwd (2/2) without polluting High-Conf (2)",
+                "2:2/2",
+                rec.scoreSnapshot().gtHighConfEvalSamples + ":"
+                        + rec.scoreSnapshot().gtCarryMatchedSamples + "/"
+                        + rec.scoreSnapshot().gtCarryEvalSamples);
+
+        // 5. Re-confirming active L3 button resets age -> 0s and restores High-Confidence tier;
+        //    aging past > 90s while focused transitions to Carry-Forward!
+        TelemetryRecorder.DriverGroundTruth reconfirmed =
+                rec.confirmDriverRegenLevel(BrakeEvaluator.REGEN_LEVEL_3, 50000L, reopenedSnap);
+        eq("v0.10.0 re-tapping active L3 resets age=0s and carryForward=false",
+                Boolean.TRUE, Boolean.valueOf(reconfirmed.ageSeconds == 0 && !reconfirmed.carryForward));
+        TelemetryRecorder.DriverGroundTruth aged95s = rec.getDriverGroundTruth(145000L);
+        eq("v0.10.0 >90s since tap transitions to carryForward=true even while UI focused",
+                Boolean.TRUE, Boolean.valueOf(aged95s.ageSeconds == 95 && aged95s.carryForward));
+
+        // 6. E-GMP hardware mutual exclusion (i-Pedal <-> Auto Regen) & foot-brake SCC auto-clear:
+        rec.confirmDriverRegenLevel(BrakeEvaluator.REGEN_LEVEL_IPEDAL, 150000L, reopenedSnap);
+        TelemetryRecorder.DriverGroundTruth autoFromIpedal = rec.toggleDriverAutoRegen(151000L, reopenedSnap);
+        eq("v0.10.0 toggling Auto Regen ON from i-Pedal steps base level to L3 + Auto",
+                "L3 + Auto", autoFromIpedal.formatRegenLabel());
+        TelemetryRecorder.DriverGroundTruth ipedalClearsAuto =
+                rec.confirmDriverRegenLevel(BrakeEvaluator.REGEN_LEVEL_IPEDAL, 152000L, reopenedSnap);
+        eq("v0.10.0 selecting i-Pedal clears Auto Regen mutual exclusion",
+                Boolean.TRUE, Boolean.valueOf(ipedalClearsAuto.regenLevel == 4 && !ipedalClearsAuto.autoRegen));
+
+        rec.confirmDriverRegenLevel(BrakeEvaluator.REGEN_LEVEL_2, 155000L, reopenedSnap);
+        TelemetryRecorder.DriverGroundTruth l2Scc = rec.toggleDriverScc(156000L, reopenedSnap);
+        eq("v0.10.0 L2 + SCC label formatted cleanly", "L2 + SCC", l2Scc.formatRegenLabel());
+
+        BrakeEvaluator.Snapshot sccTick = new BrakeEvaluator.Snapshot(
+                157000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(96.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(78.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 156990L, 0, false, false),
+                true, false, 2, -1, true, false);
+        rec.record(sccTick, wall + 156000L);
+
+        // Foot-brake press cancels SCC automatically while preserving L2:
+        BrakeEvaluator.Snapshot footBrakeSnap = new BrakeEvaluator.Snapshot(
+                158000L, true, "OBD_PEDAL[45]", true, "BRAKE_PRESSURE",
+                Float.valueOf(4.2f), Float.valueOf(88.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 1.80f,
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(78.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 157990L, 45, true, true),
+                true, false, 2, -1, false, false);
+        rec.record(footBrakeSnap, wall + 157000L);
+        TelemetryRecorder.DriverGroundTruth postBrakeGt = rec.getDriverGroundTruth(158000L);
+        eq("v0.10.0 foot brake auto-clears SCC while preserving underlying L2 paddle level",
+                Boolean.TRUE, Boolean.valueOf(!postBrakeGt.scc && postBrakeGt.regenLevel == 2));
+
+        // 7. Verify CSV formatting of inferred_auto_regen, inferred_scc, driver_*, age, & ui_focused
+        String csv = rec.toCsvString();
+        String[] lines = csv.trim().split("\n");
+        // Row for driveMatch (index 5 in lines: 2 parked + driveLearning + driveMismatch + driveMatch)
+        eq("v0.10.0 CSV driveMatch row encodes driver_regen=3, auto=0, scc=0, autohold=1, age=15, ui_focused=1",
+                Boolean.TRUE, Boolean.valueOf(lines[5].endsWith(",3,,0,0,3,0,0,1,15,1")));
+        // Row for bgSnap (index 6): ui_focused=0, age=24
+        eq("v0.10.0 CSV background row encodes ui_focused=0 and age=24",
+                Boolean.TRUE, Boolean.valueOf(lines[6].endsWith(",3,,0,0,3,0,0,1,24,0")));
+        // Row for sccTick (index 8): inferred_scc=1, driver_regen=2, driver_scc=1, age=1, ui_focused=1
+        eq("v0.10.0 CSV SCC row encodes inferred_scc=1, driver_regen=2, driver_scc=1",
+                Boolean.TRUE, Boolean.valueOf(lines[8].endsWith(",2,,0,1,2,0,1,1,1,1")));
+
+        String sum = rec.buildSummaryReport(IndicatorConfig.defaults(), "BLE OK", "OK (20Hz)", null);
+        eq("v0.10.0 summary reports separate High-Conf vs Carry-Fwd regen accuracy and Auto-Hold ticks",
+                Boolean.TRUE,
+                Boolean.valueOf(sum.contains("--- Model Regen Inference vs Driver Ground Truth ---")
+                        && sum.contains("High-Conf Regen Acc.: 75.0% (3/4 eval ticks; 5 fresh <=90s focused ticks)")
+                        && sum.contains("Carry-Fwd Regen Acc.: 100.0% (2/2 eval ticks; 2 background/>90s ticks)")
+                        && sum.contains("Auto-Hold GT Ticks  : ON=7, OFF=0 (current=ON)")));
+
+        // 8. Post-Drive shift into Park at rest (< 3 km/h) auto-clears regen GT while retaining Auto-Hold ON
+        BrakeEvaluator.Snapshot endParkSnap = new BrakeEvaluator.Snapshot(
+                165000L, false, "OBD_OFF", false, "OFF",
+                Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), 0.0f,
+                Boolean.TRUE, Boolean.TRUE, Boolean.FALSE, Float.valueOf(78.0f),
+                new BrakeEvaluator.ObdSample(true, "BLE", 164990L, 0, false, false),
+                true, false, 2, -1, false, false);
+        rec.record(endParkSnap, wall + 164000L);
+        TelemetryRecorder.DriverGroundTruth postParkGt = rec.getDriverGroundTruth(165000L);
+        eq("v0.10.0 shifting into Park after driving auto-clears regen GT to UNSET",
+                Boolean.FALSE, Boolean.valueOf(postParkGt.hasRegenConfirmation()));
+        eq("v0.10.0 shifting into Park retains console Auto-Hold ON within boot",
+                Integer.valueOf(TelemetryRecorder.AUTOHOLD_ON), Integer.valueOf(postParkGt.autoHold));
     }
 
     private static byte[] makeValidDexStub() {

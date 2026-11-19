@@ -17,6 +17,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -28,14 +29,17 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.9.0 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.10.0 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
  *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Upload Cloud`, `Test Cloud`,
- *    `Update Model`, `Scan BLE`, `Reconnect`, `Clear`, `Unpair`, and `Close`), and inline action feedback.
- *  - Center Status Monitor Card: Full-vertical-height, high-contrast driving-legible rows
- *    (`Real OBD (22BC06)` through `RAM Dataset Buffer`) with semantic M3 tonal status pills.
- *  - Right OBD-II & Transition Log Card: `@hmgapi-ble` scanner discovery list and full-height
- *    scrollable discrete transition log.
+ *    `Update Model`, `Clear`, `BLE & Log`, and `Close`), and inline action feedback.
+ *  - Center Regen Ground-Truth Training Card (driver-side): Large, zero-scroll Material 3 buttons
+ *    (`i-Pedal`, `L3`, `L2`, `L1`, `L0`, `Auto Regen`, `SCC Cruise`, `Unset`, and compact
+ *    `Auto-Hold: ON / OFF / ?` pills) with fresh (`<= 90s` focused) vs carry-forward visual states
+ *    and live `Driver vs Model` match feedback.
+ *  - Right Full-Height Slot: Full-vertical-height driving-legible Status Monitor Card by default,
+ *    plus a hidden toggleable OBD-II BLE & Transition Log panel (`Scan BLE`, `Reconnect`, `Unpair`,
+ *    discovered adapters, and scrollable transition log).
  */
 public final class MainActivity extends Activity
         implements BrakeEngine.StateListener, ObdBrakeClient.Listener {
@@ -81,6 +85,16 @@ public final class MainActivity extends Activity
     private static final int BADGE_LIT = 2;
     private static final int BADGE_PRIMARY = 3;
 
+    private static final int GT_STYLE_INACTIVE = 0;
+    private static final int GT_STYLE_CONFIRMED = 1;
+    private static final int GT_STYLE_CARRY_FWD = 2;
+    private static final int GT_STYLE_SUBTLE_ACTIVE = 3;
+
+    private static final int GT_BANNER_UNSET = 0;
+    private static final int GT_BANNER_CONFIRMED_OK = 1;
+    private static final int GT_BANNER_CONFIRMED_MISMATCH = 2;
+    private static final int GT_BANNER_CARRY_FWD = 3;
+
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private BrakeEngine engine;
 
@@ -96,10 +110,35 @@ public final class MainActivity extends Activity
     private TextView configSummaryText;
     private TextView actionNoticeText;
     private Button modeToggleBtn;
-    private Button scanBleBtn;
-    private boolean lastScanActiveState;
+    private Button toggleBleLogBtn;
+    private int lastBleToggleVisualState = -1;
 
-    // Center full-height Status Monitor rows
+    // Center Ground-Truth Training Card views & cached drawables
+    private LinearLayout gtBannerCard;
+    private TextView gtBannerTitle;
+    private TextView gtBannerSub;
+    private GradientDrawable gtBannerUnsetBg;
+    private GradientDrawable gtBannerOkBg;
+    private GradientDrawable gtBannerMismatchBg;
+    private GradientDrawable gtBannerCarryBg;
+    private int lastGtBannerState = -1;
+
+    private GtToggleButton gtBtnIpedal;
+    private GtToggleButton gtBtnL3;
+    private GtToggleButton gtBtnL2;
+    private GtToggleButton gtBtnL1;
+    private GtToggleButton gtBtnL0;
+    private GtToggleButton gtBtnAuto;
+    private GtToggleButton gtBtnScc;
+    private GtToggleButton gtBtnAhOn;
+    private GtToggleButton gtBtnAhOff;
+    private GtToggleButton gtBtnAhUnset;
+
+    // Right slot: Status Monitor Card (default) + Hidden OBD-II BLE & Log Card
+    private LinearLayout monitorCard;
+    private LinearLayout bleLogCard;
+    private boolean bleLogPanelVisible;
+
     private StatusRow rowRealObd;
     private StatusRow rowHmgModel;
     private StatusRow rowSpeedDecel;
@@ -109,13 +148,61 @@ public final class MainActivity extends Activity
     private StatusRow rowAccuracy;
     private StatusRow rowBuffer;
 
-    // Right OBD-II & Transition Log views
+    // Hidden OBD-II BLE & Transition Log views
+    private Button scanBleBtn;
+    private boolean lastScanActiveState;
     private TextView obdStatusLineText;
     private LinearLayout deviceListContainer;
     private TextView transitionLogText;
 
     private long lastRightRefreshMs;
     private int lastObservedAutoExportSeq = -1;
+
+    private static final class GtToggleButton {
+        final Button button;
+        final Drawable inactiveBg;
+        final Drawable confirmedBg;
+        final Drawable carryBg;
+        final Drawable subtleActiveBg;
+        int currentStyle = -1;
+
+        GtToggleButton(Button button, float cornerRadiusPx) {
+            this.button = button;
+            this.inactiveBg = m3RoundedStateDrawable(
+                    M3_SURFACE_CONTAINER_HIGH, M3_SURFACE_CONTAINER_HIGHEST, cornerRadiusPx, 1, M3_OUTLINE_VARIANT);
+            this.confirmedBg = m3RoundedStateDrawable(
+                    M3_PRIMARY_CONTAINER, M3_PRIMARY_CONTAINER_PRESSED, cornerRadiusPx, 3, M3_PRIMARY);
+            this.carryBg = m3RoundedStateDrawable(
+                    M3_WARNING_CONTAINER, M3_SURFACE_CONTAINER_HIGHEST, cornerRadiusPx, 2, M3_WARNING_AMBER);
+            this.subtleActiveBg = m3RoundedStateDrawable(
+                    M3_SECONDARY_CONTAINER, M3_SECONDARY_CONTAINER_PRESSED, cornerRadiusPx, 1, M3_SECONDARY_BORDER);
+            applyStyle(GT_STYLE_INACTIVE);
+        }
+
+        void applyStyle(int style) {
+            if (currentStyle == style) {
+                return;
+            }
+            currentStyle = style;
+            if (style == GT_STYLE_CONFIRMED) {
+                button.setBackground(confirmedBg);
+                button.setTextColor(M3_ON_PRIMARY_CONTAINER);
+            } else if (style == GT_STYLE_CARRY_FWD) {
+                button.setBackground(carryBg);
+                button.setTextColor(M3_WARNING_AMBER);
+            } else if (style == GT_STYLE_SUBTLE_ACTIVE) {
+                button.setBackground(subtleActiveBg);
+                button.setTextColor(M3_ON_SECONDARY_CONTAINER);
+            } else {
+                button.setBackground(inactiveBg);
+                button.setTextColor(M3_ON_SURFACE);
+            }
+        }
+
+        void setLabel(String text) {
+            setTextIfChanged(button, text);
+        }
+    }
 
     private static final class StatusRow {
         final LinearLayout container;
@@ -190,14 +277,17 @@ public final class MainActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        engine.setUiFocused(true);
         engine.addListener(this);
         engine.getObdClient().addListener(this);
         engine.requestSettingsReload();
+        refreshGroundTruthControls(engine.getLatestSnapshot());
         refreshObdPanel();
     }
 
     @Override
     protected void onPause() {
+        engine.setUiFocused(false);
         engine.removeListener(this);
         engine.getObdClient().removeListener(this);
         super.onPause();
@@ -251,7 +341,6 @@ public final class MainActivity extends Activity
                 sidebarWidth, ViewGroup.LayoutParams.MATCH_PARENT);
         sidebarLp.rightMargin = colGap;
 
-        // Top live brake-lamp + OBD status tonal card
         lampCardOffBg = roundedRect(M3_SURFACE_CONTAINER_HIGH, 18f, 1, M3_OUTLINE_VARIANT);
         lampCardLitBg = roundedRect(M3_BRAKE_LIT_CONTAINER, 18f, 2, M3_BRAKE_LIT_BORDER);
 
@@ -307,7 +396,9 @@ public final class MainActivity extends Activity
                     public void onClick(View v) {
                         String msg = engine.markDriveEvent();
                         actionNoticeText.setText("Bookmarked: " + msg);
-                        transitionLogText.setText(engine.getRecorder().recentTransitionsText(35));
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
                     }
                 });
         LinearLayout.LayoutParams markLp = new LinearLayout.LayoutParams(
@@ -402,80 +493,6 @@ public final class MainActivity extends Activity
                 });
         sidebar.addView(twoButtonRow(uploadCloudBtn, testCloudBtn, pairRowHeight), rowPairLayoutParams());
 
-        // 2-column row 3: Scan BLE | Reconnect
-        scanBleBtn = m3Button(
-                "Scan BLE",
-                pairBtnFont,
-                M3_SURFACE_CONTAINER_HIGH,
-                M3_SURFACE_CONTAINER_HIGHEST,
-                M3_ON_SURFACE,
-                1,
-                M3_OUTLINE_VARIANT,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        ObdBrakeClient obd = engine.getObdClient();
-                        if (obd.isBleScanning()) {
-                            obd.stopBleScan();
-                        } else {
-                            obd.startBleScan();
-                        }
-                    }
-                });
-        Button reconnBtn = m3Button(
-                "Reconnect",
-                pairBtnFont,
-                M3_SURFACE_CONTAINER_HIGH,
-                M3_SURFACE_CONTAINER_HIGHEST,
-                M3_ON_SURFACE,
-                1,
-                M3_OUTLINE_VARIANT,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        engine.getRecorder().recordExternalEvent(
-                                engine.getObdClient().monotonicMs(), "OBD Reconnect tapped");
-                        engine.getObdClient().requestReconnect();
-                        refreshObdPanel();
-                        actionNoticeText.setText("Retrying 127.0.0.1 bridge / @hmgapi-ble...");
-                    }
-                });
-        sidebar.addView(twoButtonRow(scanBleBtn, reconnBtn, pairRowHeight), rowPairLayoutParams());
-
-        // 2-column row 4: Clear | Unpair
-        Button clearBtn = m3Button(
-                "Clear",
-                pairBtnFont,
-                M3_SURFACE_CONTAINER_HIGH,
-                M3_SURFACE_CONTAINER_HIGHEST,
-                M3_ON_SURFACE_VARIANT,
-                1,
-                M3_OUTLINE_VARIANT,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        engine.clearDataset();
-                        refreshObdPanel();
-                        actionNoticeText.setText("Cleared in-RAM dataset and scorecard.");
-                    }
-                });
-        Button unpairBtn = m3Button(
-                "Unpair",
-                pairBtnFont,
-                M3_SURFACE_CONTAINER_HIGH,
-                M3_SURFACE_CONTAINER_HIGHEST,
-                M3_ON_SURFACE_VARIANT,
-                1,
-                M3_OUTLINE_VARIANT,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        engine.getObdClient().unpairAdapter();
-                        actionNoticeText.setText("Cleared paired BLE adapter (bridge still active).");
-                    }
-                });
-        sidebar.addView(twoButtonRow(clearBtn, unpairBtn, pairRowHeight), rowPairLayoutParams());
-
         // Full-width OTA Brake Model action: tap to fetch signed OTA model (or USB .jar), long-press to revert to built-in
         Button updateModelBtn = m3Button(
                 "Update Model",
@@ -503,6 +520,39 @@ public final class MainActivity extends Activity
         updateModelLp.topMargin = 6;
         sidebar.addView(updateModelBtn, updateModelLp);
 
+        // 2-column row 3: Clear | BLE & Log (toggles hidden OBD-II BLE & Transition Log panel)
+        Button clearBtn = m3Button(
+                "Clear",
+                pairBtnFont,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE_VARIANT,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        engine.clearDataset();
+                        refreshObdPanel();
+                        actionNoticeText.setText("Cleared in-RAM dataset and scorecard.");
+                    }
+                });
+        toggleBleLogBtn = m3Button(
+                "BLE & Log",
+                pairBtnFont,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        setBleLogPanelVisible(!bleLogPanelVisible);
+                    }
+                });
+        sidebar.addView(twoButtonRow(clearBtn, toggleBleLogBtn, pairRowHeight), rowPairLayoutParams());
+
         // Bottom-aligned feedback & app version/HMG-API caption
         LinearLayout sidebarFooterInfo = new LinearLayout(this);
         sidebarFooterInfo.setOrientation(LinearLayout.VERTICAL);
@@ -513,14 +563,14 @@ public final class MainActivity extends Activity
         actionNoticeText.setTextColor(M3_PRIMARY);
         actionNoticeText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 14.0f : 12.5f);
         actionNoticeText.setLineSpacing(2.0f, 1.0f);
-        actionNoticeText.setMaxLines(3);
+        actionNoticeText.setMaxLines(4);
         actionNoticeText.setEllipsize(TextUtils.TruncateAt.END);
         CloudUploadConfig initialCloud = engine.getCloudUploadConfig();
         if (initialCloud.hasCredentials()) {
             actionNoticeText.setText("Cloud ready (" + initialCloud.repo
                     + ") \u2014 Park auto-uploads log & checks OTA model.");
         } else {
-            actionNoticeText.setText("Auto-checks OTA model on Park (hold Update Model to reset to built-in).");
+            actionNoticeText.setText("Tap a regen button to log ground truth; Park auto-checks OTA model.");
         }
         sidebarFooterInfo.addView(actionNoticeText);
 
@@ -530,13 +580,12 @@ public final class MainActivity extends Activity
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("v0.9.0 \u00B7 Model " + engine.getActiveModelBadge());
+        configSummaryText.setText("v0.10.0 \u00B7 Model " + engine.getActiveModelBadge());
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f));
 
-        // Outlined Material 3 Close pill at bottom of sidebar
         Button closeBtn = m3Button(
                 "Close",
                 widescreen ? 16.0f : 14.0f,
@@ -558,11 +607,233 @@ public final class MainActivity extends Activity
 
         root.addView(sidebar, sidebarLp);
 
-        // ================= 2. CENTER FULL-HEIGHT STATUS MONITOR =================
-        LinearLayout monitorCard = surfaceCard(M3_SURFACE_CONTAINER, 24f, 22, 8, 22, 8);
-        LinearLayout.LayoutParams monitorLp = new LinearLayout.LayoutParams(
+        // ================= 2. CENTER REGEN GROUND-TRUTH TRAINING CARD =================
+        LinearLayout gtCard = surfaceCard(M3_SURFACE_CONTAINER_LOW, 24f, 18, 14, 18, 14);
+        LinearLayout.LayoutParams gtCardLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.38f);
+        gtCardLp.rightMargin = colGap;
+
+        LinearLayout gtHeaderRow = new LinearLayout(this);
+        gtHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
+        gtHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView gtTitle = new TextView(this);
+        gtTitle.setText("Regen Ground Truth");
+        gtTitle.setTextColor(M3_PRIMARY);
+        gtTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 20.5f : 17.0f);
+        gtTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        gtTitle.setSingleLine(true);
+        gtTitle.setEllipsize(TextUtils.TruncateAt.END);
+        gtHeaderRow.addView(gtTitle, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        Button unsetGtBtn = m3Button(
+                "Unset",
+                widescreen ? 15.0f : 13.0f,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE_VARIANT,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        engine.setUiFocused(true);
+                        engine.clearDriverGroundTruth();
+                        actionNoticeText.setText("Cleared driver ground-truth regen label.");
+                        refreshGroundTruthControls(engine.getLatestSnapshot());
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
+                    }
+                });
+        LinearLayout.LayoutParams unsetLp = new LinearLayout.LayoutParams(
+                widescreen ? 96 : 78, widescreen ? 36 : 32);
+        unsetLp.leftMargin = 8;
+        gtHeaderRow.addView(unsetGtBtn, unsetLp);
+        gtCard.addView(gtHeaderRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // Live Tonal Ground-Truth Status & Match Banner
+        gtBannerUnsetBg = roundedRect(M3_SURFACE_CONTAINER, 16f, 1, M3_OUTLINE_VARIANT);
+        gtBannerOkBg = roundedRect(M3_PRIMARY_CONTAINER, 16f, 2, M3_PRIMARY);
+        gtBannerMismatchBg = roundedRect(M3_BRAKE_LIT_CONTAINER, 16f, 2, M3_BRAKE_LIT_BORDER);
+        gtBannerCarryBg = roundedRect(M3_WARNING_CONTAINER, 16f, 2, M3_WARNING_AMBER);
+
+        gtBannerCard = new LinearLayout(this);
+        gtBannerCard.setOrientation(LinearLayout.VERTICAL);
+        gtBannerCard.setPadding(14, 8, 14, 8);
+        gtBannerCard.setBackground(gtBannerUnsetBg);
+        lastGtBannerState = GT_BANNER_UNSET;
+
+        gtBannerTitle = new TextView(this);
+        gtBannerTitle.setText("UNSET \u00B7 Unlabeled");
+        gtBannerTitle.setTextColor(M3_ON_SURFACE_VARIANT);
+        gtBannerTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 18.5f : 15.5f);
+        gtBannerTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        gtBannerTitle.setSingleLine(true);
+        gtBannerTitle.setEllipsize(TextUtils.TruncateAt.END);
+        gtBannerCard.addView(gtBannerTitle);
+
+        gtBannerSub = new TextView(this);
+        gtBannerSub.setText("Tap active regen mode whenever convenient");
+        gtBannerSub.setTextColor(M3_ON_SURFACE_MUTED);
+        gtBannerSub.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 14.5f : 12.5f);
+        gtBannerSub.setSingleLine(true);
+        gtBannerSub.setEllipsize(TextUtils.TruncateAt.END);
+        gtBannerSub.setPadding(0, 2, 0, 0);
+        gtBannerCard.addView(gtBannerSub);
+
+        LinearLayout.LayoutParams bannerLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bannerLp.topMargin = 8;
+        gtCard.addView(gtBannerCard, bannerLp);
+
+        float heroModeFont = widescreen ? 25.0f : 19.5f;
+        float paddleModeFont = widescreen ? 26.0f : 20.0f;
+        float modifierFont = widescreen ? 19.5f : 15.5f;
+        float gtTileRadius = widescreen ? 20f : 16f;
+        int gtRowGap = widescreen ? 8 : 6;
+
+        // Hero One-Pedal button: i-Pedal
+        gtBtnIpedal = createGtButton(
+                "i-Pedal  \u00B7  One-Pedal",
+                heroModeFont,
+                gtTileRadius,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        onConfirmRegenLevelTapped(BrakeEvaluator.REGEN_LEVEL_IPEDAL);
+                    }
+                });
+        LinearLayout.LayoutParams ipedalLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.05f);
+        ipedalLp.topMargin = gtRowGap + 2;
+        gtCard.addView(gtBtnIpedal.button, ipedalLp);
+
+        // Paddle Row 1 (stronger left -> weaker right, matching E-GMP steering paddles): L3 | L2
+        gtBtnL3 = createGtButton("L3", paddleModeFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onConfirmRegenLevelTapped(BrakeEvaluator.REGEN_LEVEL_3);
+            }
+        });
+        gtBtnL2 = createGtButton("L2", paddleModeFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onConfirmRegenLevelTapped(BrakeEvaluator.REGEN_LEVEL_2);
+            }
+        });
+        gtCard.addView(weightedTwoButtonRow(gtBtnL3.button, gtBtnL2.button, gtRowGap),
+                weightedRowParams(1.15f, gtRowGap));
+
+        // Paddle Row 2: L1 | L0
+        gtBtnL1 = createGtButton("L1", paddleModeFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onConfirmRegenLevelTapped(BrakeEvaluator.REGEN_LEVEL_1);
+            }
+        });
+        gtBtnL0 = createGtButton("L0", paddleModeFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onConfirmRegenLevelTapped(BrakeEvaluator.REGEN_LEVEL_0);
+            }
+        });
+        gtCard.addView(weightedTwoButtonRow(gtBtnL1.button, gtBtnL0.button, gtRowGap),
+                weightedRowParams(1.15f, gtRowGap));
+
+        // Dynamic Modifier Row: Auto Regen | SCC Cruise
+        gtBtnAuto = createGtButton("Auto Regen", modifierFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.setUiFocused(true);
+                TelemetryRecorder.DriverGroundTruth gt = engine.toggleDriverAutoRegen();
+                actionNoticeText.setText("Driver GT: " + gt.formatRegenLabel());
+                refreshGroundTruthControls(engine.getLatestSnapshot());
+                if (bleLogPanelVisible) {
+                    setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                }
+            }
+        });
+        gtBtnScc = createGtButton("SCC Cruise", modifierFont, gtTileRadius, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.setUiFocused(true);
+                TelemetryRecorder.DriverGroundTruth gt = engine.toggleDriverScc();
+                actionNoticeText.setText("Driver GT: " + gt.formatRegenLabel());
+                refreshGroundTruthControls(engine.getLatestSnapshot());
+                if (bleLogPanelVisible) {
+                    setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                }
+            }
+        });
+        gtCard.addView(weightedTwoButtonRow(gtBtnAuto.button, gtBtnScc.button, gtRowGap),
+                weightedRowParams(0.85f, gtRowGap));
+
+        // Compact Auto-Hold Ground-Truth Bar: Auto-Hold  [ ON ] [ OFF ] [ ? ]
+        LinearLayout autoHoldBar = new LinearLayout(this);
+        autoHoldBar.setOrientation(LinearLayout.HORIZONTAL);
+        autoHoldBar.setGravity(Gravity.CENTER_VERTICAL);
+        autoHoldBar.setPadding(12, 5, 8, 5);
+        autoHoldBar.setBackground(roundedRect(M3_SURFACE_CONTAINER, 16f, 1, M3_OUTLINE_VARIANT));
+
+        TextView ahLabel = new TextView(this);
+        ahLabel.setText("Auto-Hold");
+        ahLabel.setTextColor(M3_ON_SURFACE_VARIANT);
+        ahLabel.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 16.5f : 14.0f);
+        ahLabel.setTypeface(Typeface.DEFAULT_BOLD);
+        ahLabel.setSingleLine(true);
+        autoHoldBar.addView(ahLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        float ahFont = widescreen ? 15.5f : 13.5f;
+        int ahPillH = widescreen ? 34 : 30;
+        int ahPillW = widescreen ? 78 : 60;
+
+        gtBtnAhOn = createGtButton("ON", ahFont, 999f, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onAutoHoldTapped(TelemetryRecorder.AUTOHOLD_ON);
+            }
+        });
+        gtBtnAhOff = createGtButton("OFF", ahFont, 999f, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onAutoHoldTapped(TelemetryRecorder.AUTOHOLD_OFF);
+            }
+        });
+        gtBtnAhUnset = createGtButton("?", ahFont, 999f, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onAutoHoldTapped(TelemetryRecorder.AUTOHOLD_UNSET);
+            }
+        });
+
+        LinearLayout.LayoutParams ahOnLp = new LinearLayout.LayoutParams(ahPillW, ahPillH);
+        ahOnLp.rightMargin = 6;
+        LinearLayout.LayoutParams ahOffLp = new LinearLayout.LayoutParams(ahPillW, ahPillH);
+        ahOffLp.rightMargin = 6;
+        LinearLayout.LayoutParams ahUnsetLp = new LinearLayout.LayoutParams(
+                widescreen ? 56 : 46, ahPillH);
+        autoHoldBar.addView(gtBtnAhOn.button, ahOnLp);
+        autoHoldBar.addView(gtBtnAhOff.button, ahOffLp);
+        autoHoldBar.addView(gtBtnAhUnset.button, ahUnsetLp);
+
+        LinearLayout.LayoutParams ahBarLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ahBarLp.topMargin = gtRowGap + 2;
+        gtCard.addView(autoHoldBar, ahBarLp);
+
+        root.addView(gtCard, gtCardLp);
+
+        // ================= 3. RIGHT FULL-HEIGHT SLOT (MONITOR + HIDDEN BLE/LOG) =================
+        FrameLayout rightSlot = new FrameLayout(this);
+        LinearLayout.LayoutParams rightSlotLp = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.MATCH_PARENT, 0.62f);
-        monitorLp.rightMargin = colGap;
+
+        // 3A. Default Visible: Full-Height Status Monitor Card
+        monitorCard = surfaceCard(M3_SURFACE_CONTAINER, 24f, 22, 8, 22, 8);
 
         rowRealObd = createStatusRow("Real OBD (22BC06)", "Starting...", labelColWidth, labelFontPx, badgeFontPx, valueFontPx);
         rowHmgModel = createStatusRow("HMG-API Model", "Starting...", labelColWidth, labelFontPx, badgeFontPx, valueFontPx);
@@ -593,34 +864,116 @@ public final class MainActivity extends Activity
                         ViewGroup.LayoutParams.MATCH_PARENT, 1));
             }
         }
+        rightSlot.addView(monitorCard, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        root.addView(monitorCard, monitorLp);
+        // 3B. Hidden Panel: OBD-II BLE & Transition Log Card (toggled via sidebar `BLE & Log`)
+        bleLogCard = surfaceCard(M3_SURFACE_CONTAINER_LOW, 24f, 18, 14, 18, 14);
+        bleLogCard.setVisibility(View.GONE);
 
-        // ================= 3. RIGHT FULL-HEIGHT OBD & TRANSITION LOG =================
-        LinearLayout rightCard = surfaceCard(M3_SURFACE_CONTAINER_LOW, 24f, 18, 14, 18, 14);
-        LinearLayout.LayoutParams rightLp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.MATCH_PARENT, 0.38f);
+        LinearLayout bleHeaderRow = new LinearLayout(this);
+        bleHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
+        bleHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView obdTitle = new TextView(this);
-        obdTitle.setText("OBD-II & Transition Log");
+        obdTitle.setText("OBD-II BLE & Transition Log");
         obdTitle.setTextColor(M3_PRIMARY);
-        obdTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 19.5f : 16.5f);
+        obdTitle.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 19.5f : 16.0f);
         obdTitle.setTypeface(Typeface.DEFAULT_BOLD);
         obdTitle.setSingleLine(true);
-        rightCard.addView(obdTitle);
+        obdTitle.setEllipsize(TextUtils.TruncateAt.END);
+        bleHeaderRow.addView(obdTitle, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        int bleBtnH = widescreen ? 36 : 32;
+        float bleBtnFont = widescreen ? 14.5f : 12.5f;
+
+        scanBleBtn = m3Button(
+                "Scan BLE",
+                bleBtnFont,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        ObdBrakeClient obd = engine.getObdClient();
+                        if (obd.isBleScanning()) {
+                            obd.stopBleScan();
+                        } else {
+                            obd.startBleScan();
+                        }
+                    }
+                });
+        Button reconnBtn = m3Button(
+                "Reconnect",
+                bleBtnFont,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        engine.getRecorder().recordExternalEvent(
+                                engine.getObdClient().monotonicMs(), "OBD Reconnect tapped");
+                        engine.getObdClient().requestReconnect();
+                        refreshObdPanel();
+                        actionNoticeText.setText("Retrying 127.0.0.1 bridge / @hmgapi-ble...");
+                    }
+                });
+        Button unpairBtn = m3Button(
+                "Unpair",
+                bleBtnFont,
+                M3_SURFACE_CONTAINER_HIGH,
+                M3_SURFACE_CONTAINER_HIGHEST,
+                M3_ON_SURFACE_VARIANT,
+                1,
+                M3_OUTLINE_VARIANT,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        engine.getObdClient().unpairAdapter();
+                        actionNoticeText.setText("Cleared paired BLE adapter (bridge still active).");
+                    }
+                });
+        Button hideBleBtn = m3Button(
+                "Hide",
+                bleBtnFont,
+                M3_SECONDARY_CONTAINER,
+                M3_SECONDARY_CONTAINER_PRESSED,
+                M3_ON_SECONDARY_CONTAINER,
+                1,
+                M3_SECONDARY_BORDER,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        setBleLogPanelVisible(false);
+                    }
+                });
+
+        bleHeaderRow.addView(scanBleBtn, headerPillParams(bleBtnH));
+        bleHeaderRow.addView(reconnBtn, headerPillParams(bleBtnH));
+        bleHeaderRow.addView(unpairBtn, headerPillParams(bleBtnH));
+        bleHeaderRow.addView(hideBleBtn, headerPillParams(bleBtnH));
+        bleLogCard.addView(bleHeaderRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         obdStatusLineText = new TextView(this);
         obdStatusLineText.setTextColor(M3_ON_SURFACE_VARIANT);
         obdStatusLineText.setTextSize(TypedValue.COMPLEX_UNIT_PX, widescreen ? 15.0f : 13.5f);
-        obdStatusLineText.setPadding(0, 4, 0, 8);
+        obdStatusLineText.setPadding(0, 6, 0, 8);
         obdStatusLineText.setMaxLines(2);
         obdStatusLineText.setEllipsize(TextUtils.TruncateAt.END);
         obdStatusLineText.setText("127.0.0.1:35000 bridge coexistence + @hmgapi-ble direct BLE");
-        rightCard.addView(obdStatusLineText);
+        bleLogCard.addView(obdStatusLineText);
 
         deviceListContainer = new LinearLayout(this);
         deviceListContainer.setOrientation(LinearLayout.VERTICAL);
-        rightCard.addView(deviceListContainer, new LinearLayout.LayoutParams(
+        bleLogCard.addView(deviceListContainer, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         ScrollView scroll = new ScrollView(this);
@@ -637,10 +990,166 @@ public final class MainActivity extends Activity
         transitionLogText.setLineSpacing(5.0f, 1.0f);
         transitionLogText.setText("No brake-lamp, regen-level, or HMG-API transitions recorded yet.");
         scroll.addView(transitionLogText);
-        rightCard.addView(scroll, scrollLp);
+        bleLogCard.addView(scroll, scrollLp);
 
-        root.addView(rightCard, rightLp);
+        rightSlot.addView(bleLogCard, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        root.addView(rightSlot, rightSlotLp);
         return root;
+    }
+
+    private void onConfirmRegenLevelTapped(int level) {
+        engine.setUiFocused(true);
+        TelemetryRecorder.DriverGroundTruth gt = engine.confirmDriverRegenLevel(level);
+        actionNoticeText.setText("Confirmed ground truth: " + gt.formatRegenLabel());
+        refreshGroundTruthControls(engine.getLatestSnapshot());
+        if (bleLogPanelVisible) {
+            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        }
+    }
+
+    private void onAutoHoldTapped(int state) {
+        engine.setUiFocused(true);
+        engine.setDriverAutoHold(state);
+        actionNoticeText.setText("Auto-Hold ground truth: "
+                + TelemetryRecorder.DriverGroundTruth.formatAutoHoldLabel(state));
+        refreshGroundTruthControls(engine.getLatestSnapshot());
+        if (bleLogPanelVisible) {
+            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        }
+    }
+
+    private void setBleLogPanelVisible(boolean visible) {
+        bleLogPanelVisible = visible;
+        monitorCard.setVisibility(visible ? View.GONE : View.VISIBLE);
+        bleLogCard.setVisibility(visible ? View.VISIBLE : View.GONE);
+        updateBleToggleButtonVisual();
+        if (visible) {
+            refreshObdPanel();
+            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        }
+    }
+
+    private void updateBleToggleButtonVisual() {
+        boolean scanning = engine.getObdClient().isBleScanning();
+        int nextState = bleLogPanelVisible ? 2 : (scanning ? 1 : 0);
+        if (nextState == 2) {
+            setTextIfChanged(toggleBleLogBtn, "Hide BLE/Log");
+        } else if (nextState == 1) {
+            setTextIfChanged(toggleBleLogBtn, "BLE Scan \u25CF");
+        } else {
+            setTextIfChanged(toggleBleLogBtn, "BLE & Log");
+        }
+        if (lastBleToggleVisualState != nextState) {
+            lastBleToggleVisualState = nextState;
+            if (nextState > 0) {
+                toggleBleLogBtn.setBackground(m3PillDrawable(
+                        M3_PRIMARY_CONTAINER, M3_PRIMARY_CONTAINER_PRESSED, 1, M3_PRIMARY));
+                toggleBleLogBtn.setTextColor(M3_ON_PRIMARY_CONTAINER);
+            } else {
+                toggleBleLogBtn.setBackground(m3PillDrawable(
+                        M3_SURFACE_CONTAINER_HIGH, M3_SURFACE_CONTAINER_HIGHEST, 1, M3_OUTLINE_VARIANT));
+                toggleBleLogBtn.setTextColor(M3_ON_SURFACE);
+            }
+        }
+    }
+
+    private void refreshGroundTruthControls(BrakeEvaluator.Snapshot snap) {
+        TelemetryRecorder.DriverGroundTruth gt = engine.getDriverGroundTruth();
+        int activeStyle = gt.carryForward ? GT_STYLE_CARRY_FWD : GT_STYLE_CONFIRMED;
+
+        gtBtnIpedal.applyStyle(
+                gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnL3.applyStyle(
+                gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_3 ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnL2.applyStyle(
+                gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_2 ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnL1.applyStyle(
+                gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_1 ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnL0.applyStyle(
+                gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_0 ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnAuto.applyStyle(gt.autoRegen ? activeStyle : GT_STYLE_INACTIVE);
+        gtBtnScc.applyStyle(gt.scc ? activeStyle : GT_STYLE_INACTIVE);
+
+        gtBtnL3.setLabel(gt.autoRegen && gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_3 ? "L3 \u00B7 AUTO" : "L3");
+        gtBtnL2.setLabel(gt.autoRegen && gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_2 ? "L2 \u00B7 AUTO" : "L2");
+        gtBtnL1.setLabel(gt.autoRegen && gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_1 ? "L1 \u00B7 AUTO" : "L1");
+        gtBtnL0.setLabel(gt.autoRegen && gt.regenLevel == BrakeEvaluator.REGEN_LEVEL_0 ? "L0 \u00B7 AUTO" : "L0");
+
+        gtBtnAhOn.applyStyle(
+                gt.autoHold == TelemetryRecorder.AUTOHOLD_ON ? GT_STYLE_CONFIRMED : GT_STYLE_INACTIVE);
+        gtBtnAhOff.applyStyle(
+                gt.autoHold == TelemetryRecorder.AUTOHOLD_OFF ? GT_STYLE_CONFIRMED : GT_STYLE_INACTIVE);
+        gtBtnAhUnset.applyStyle(
+                gt.autoHold == TelemetryRecorder.AUTOHOLD_UNSET ? GT_STYLE_SUBTLE_ACTIVE : GT_STYLE_INACTIVE);
+
+        if (!gt.hasRegenConfirmation()) {
+            applyGtBannerStyle(GT_BANNER_UNSET);
+            setTextIfChanged(gtBannerTitle, "UNSET \u00B7 Unlabeled");
+            setTextIfChanged(gtBannerSub, "Tap active regen mode whenever convenient");
+            return;
+        }
+
+        boolean inPark = snap != null && Boolean.TRUE.equals(snap.gearPark);
+        boolean modelKnown = snap != null
+                && (snap.inferredRegenLevel >= 0 || snap.sccActive || snap.autoRegenActive);
+        String modelLbl = modelKnown
+                ? BrakeEvaluator.regenLevelLabel(snap.inferredRegenLevel, snap.sccActive, snap.autoRegenActive)
+                : "Learning...";
+        boolean matched = modelKnown && TelemetryRecorder.doesModelMatchDriverGt(snap, gt);
+        String ageText = fmtAgeSeconds(gt.ageSeconds);
+
+        if (gt.carryForward) {
+            applyGtBannerStyle(GT_BANNER_CARRY_FWD);
+            setTextIfChanged(gtBannerTitle,
+                    "CARRY-FWD \u00B7 " + gt.formatRegenLabel() + " (" + ageText + ")");
+            String sub = modelKnown
+                    ? ("Tap button to re-confirm \u00B7 Model: " + modelLbl + (matched ? " \u2713" : " \u2717"))
+                    : "Tap active button to re-confirm fresh age";
+            setTextIfChanged(gtBannerSub, sub);
+        } else if (modelKnown && !inPark && !matched) {
+            applyGtBannerStyle(GT_BANNER_CONFIRMED_MISMATCH);
+            setTextIfChanged(gtBannerTitle, "CONFIRMED \u00B7 " + gt.formatRegenLabel());
+            setTextIfChanged(gtBannerSub,
+                    "Fresh (" + ageText + ") \u00B7 Model: " + modelLbl + " \u2717 Mismatch");
+        } else {
+            applyGtBannerStyle(GT_BANNER_CONFIRMED_OK);
+            setTextIfChanged(gtBannerTitle, "CONFIRMED \u00B7 " + gt.formatRegenLabel());
+            String sub;
+            if (inPark) {
+                sub = "Latched in Park (" + ageText + ") \u00B7 clears after next drive";
+            } else if (modelKnown) {
+                sub = "Fresh (" + ageText + ") \u00B7 Model: " + modelLbl + " \u2713 Match";
+            } else {
+                sub = "Fresh (" + ageText + ") \u00B7 Model: Learning...";
+            }
+            setTextIfChanged(gtBannerSub, sub);
+        }
+    }
+
+    private void applyGtBannerStyle(int bannerState) {
+        if (lastGtBannerState == bannerState) {
+            return;
+        }
+        lastGtBannerState = bannerState;
+        if (bannerState == GT_BANNER_CONFIRMED_OK) {
+            gtBannerCard.setBackground(gtBannerOkBg);
+            gtBannerTitle.setTextColor(M3_ON_PRIMARY_CONTAINER);
+            gtBannerSub.setTextColor(M3_ON_PRIMARY_CONTAINER);
+        } else if (bannerState == GT_BANNER_CONFIRMED_MISMATCH) {
+            gtBannerCard.setBackground(gtBannerMismatchBg);
+            gtBannerTitle.setTextColor(M3_ON_BRAKE_LIT);
+            gtBannerSub.setTextColor(M3_ON_BRAKE_LIT);
+        } else if (bannerState == GT_BANNER_CARRY_FWD) {
+            gtBannerCard.setBackground(gtBannerCarryBg);
+            gtBannerTitle.setTextColor(M3_WARNING_AMBER);
+            gtBannerSub.setTextColor(M3_ON_SURFACE_VARIANT);
+        } else {
+            gtBannerCard.setBackground(gtBannerUnsetBg);
+            gtBannerTitle.setTextColor(M3_ON_SURFACE_VARIANT);
+            gtBannerSub.setTextColor(M3_ON_SURFACE_MUTED);
+        }
     }
 
     private StatusRow createStatusRow(
@@ -720,9 +1229,13 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
+
+        // Update Center Ground-Truth card live age & match banner
+        refreshGroundTruthControls(snap);
+        TelemetryRecorder.DriverGroundTruth gt = engine.getDriverGroundTruth();
 
         // 1. Real OBD (770 / 22BC06)
         if (snap.obdFresh) {
@@ -769,7 +1282,7 @@ public final class MainActivity extends Activity
                         + fmtObjFloat(snap.accelPedal, "%.1f") + " %",
                 M3_ON_SURFACE);
 
-        // 5. Detected Regen Mode
+        // 5. Detected Regen Mode (+ live Driver GT comparison if confirmed)
         boolean regenLearned = snap.inferredRegenLevel >= 0 || snap.sccActive || snap.autoRegenActive;
         if (regenLearned) {
             rowRegenMode.updateBadge(
@@ -779,7 +1292,16 @@ public final class MainActivity extends Activity
                     : (snap.autoRegenActive ? "Smart Recuperation"
                     : (snap.inferredRegenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL
                             ? "One-Pedal Driving" : "Manual Paddle"));
-            rowRegenMode.updateValue(modeDesc, M3_ON_SURFACE_VARIANT);
+            if (gt.hasRegenConfirmation() && !Boolean.TRUE.equals(snap.gearPark)) {
+                boolean match = TelemetryRecorder.doesModelMatchDriverGt(snap, gt);
+                rowRegenMode.updateValue(
+                        modeDesc + (match
+                                ? "  \u00B7  GT \u2713"
+                                : ("  \u00B7  GT=" + gt.formatRegenLabel() + " \u2717")),
+                        match ? M3_ON_SURFACE_VARIANT : M3_WARNING_AMBER);
+            } else {
+                rowRegenMode.updateValue(modeDesc, M3_ON_SURFACE_VARIANT);
+            }
         } else {
             rowRegenMode.updateBadge(BADGE_OFF, "LEARNING");
             rowRegenMode.updateValue("Coast \u2265 21 km/h off pedals", M3_ON_SURFACE_VARIANT);
@@ -793,16 +1315,27 @@ public final class MainActivity extends Activity
                         + "   \u00B7   SOC " + fmtObjFloat(snap.hvSocPct, "%.1f") + "%",
                 M3_ON_SURFACE);
 
-        // 7. Model vs OBD Accuracy
+        // 7. Model vs OBD & Driver Ground-Truth Accuracy
         TelemetryRecorder.ScoreSnapshot sc = engine.getRecorder().scoreSnapshot();
         rowAccuracy.updateBadge(BADGE_NONE, "");
         if (sc.scoredSamples > 0L) {
+            String gtSuffix = !Float.isNaN(sc.gtHighConfAccuracyPct())
+                    ? String.format(Locale.US, "  \u00B7  GT %.0f%%", Float.valueOf(sc.gtHighConfAccuracyPct()))
+                    : "";
             rowAccuracy.updateValue(
-                    String.format(Locale.US, "%.1f%% agree  \u00B7  Regen %s  \u00B7  Lag %s",
+                    String.format(Locale.US, "%.1f%% agree  \u00B7  Regen %s  \u00B7  Lag %s%s",
                             Float.valueOf(sc.agreementPct()),
                             Float.isNaN(sc.regenRecallPct()) ? "n/a"
                                     : String.format(Locale.US, "%.1f%%", Float.valueOf(sc.regenRecallPct())),
-                            sc.onsetCount > 0 ? (sc.meanOnsetLagMs + " ms") : "n/a"),
+                            sc.onsetCount > 0 ? (sc.meanOnsetLagMs + " ms") : "n/a",
+                            gtSuffix),
+                    M3_ON_SURFACE);
+        } else if (sc.gtHighConfEvalSamples > 0L) {
+            rowAccuracy.updateValue(
+                    String.format(Locale.US, "Regen GT %.1f%% (%d/%d ticks)  \u00B7  No OBD",
+                            Float.valueOf(sc.gtHighConfAccuracyPct()),
+                            Long.valueOf(sc.gtHighConfMatchedSamples),
+                            Long.valueOf(sc.gtHighConfEvalSamples)),
                     M3_ON_SURFACE);
         } else {
             rowAccuracy.updateValue("Awaiting live OBD 22BC06 samples", M3_ON_SURFACE_VARIANT);
@@ -878,16 +1411,19 @@ public final class MainActivity extends Activity
             }
         }
 
-        long now = System.currentTimeMillis();
-        if (now - lastRightRefreshMs >= 450L) {
-            lastRightRefreshMs = now;
-            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        if (bleLogPanelVisible) {
+            long now = System.currentTimeMillis();
+            if (now - lastRightRefreshMs >= 450L) {
+                lastRightRefreshMs = now;
+                setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+            }
         }
     }
 
     private void refreshObdPanel() {
         ObdBrakeClient obd = engine.getObdClient();
         boolean scanning = obd.isBleScanning();
+        updateBleToggleButtonVisual();
         setTextIfChanged(scanBleBtn, scanning ? "Stop Scan" : "Scan BLE");
         if (scanning != lastScanActiveState) {
             lastScanActiveState = scanning;
@@ -946,7 +1482,9 @@ public final class MainActivity extends Activity
             deviceListContainer.addView(rowBtn, lp);
         }
 
-        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        if (bleLogPanelVisible) {
+            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+        }
     }
 
     private void cycleObdMode() {
@@ -983,7 +1521,9 @@ public final class MainActivity extends Activity
                     public void run() {
                         if (res.ok) {
                             actionNoticeText.setText("Saved & cleared buffer: " + res.csvPath);
-                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                            if (bleLogPanelVisible) {
+                                setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                            }
                         } else {
                             actionNoticeText.setText(res.errorMessage);
                         }
@@ -1011,7 +1551,9 @@ public final class MainActivity extends Activity
                     @Override
                     public void run() {
                         actionNoticeText.setText(out.message);
-                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
                     }
                 });
             }
@@ -1030,7 +1572,9 @@ public final class MainActivity extends Activity
                     @Override
                     public void run() {
                         actionNoticeText.setText(msg);
-                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
                     }
                 });
             }
@@ -1058,9 +1602,11 @@ public final class MainActivity extends Activity
                                 : "";
                         actionNoticeText.setText(out.message + suffix);
                         setTextIfChanged(configSummaryText,
-                                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
                                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
-                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
                     }
                 });
             }
@@ -1079,9 +1625,11 @@ public final class MainActivity extends Activity
                     public void run() {
                         actionNoticeText.setText(out.message);
                         setTextIfChanged(configSummaryText,
-                                "v0.9.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
                                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
-                        setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        if (bleLogPanelVisible) {
+                            setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
+                        }
                     }
                 });
             }
@@ -1098,6 +1646,55 @@ public final class MainActivity extends Activity
             return "Mode: HMG-API Only (No OBD)";
         }
         return "Mode: Real OBD \u2192 Model";
+    }
+
+    private GtToggleButton createGtButton(
+            String label,
+            float textSizePx,
+            float cornerRadiusPx,
+            View.OnClickListener listener) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setSingleLine(true);
+        b.setEllipsize(TextUtils.TruncateAt.END);
+        b.setGravity(Gravity.CENTER);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setPadding(12, 0, 12, 0);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_PX, textSizePx);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setOnClickListener(listener);
+        return new GtToggleButton(b, cornerRadiusPx);
+    }
+
+    private LinearLayout weightedTwoButtonRow(Button left, Button right, int gapPx) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams lpLeft = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f);
+        lpLeft.rightMargin = gapPx;
+        LinearLayout.LayoutParams lpRight = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f);
+        row.addView(left, lpLeft);
+        row.addView(right, lpRight);
+        return row;
+    }
+
+    private static LinearLayout.LayoutParams weightedRowParams(float weight, int topMarginPx) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, weight);
+        lp.topMargin = topMarginPx;
+        return lp;
+    }
+
+    private static LinearLayout.LayoutParams headerPillParams(int heightPx) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, heightPx);
+        lp.leftMargin = 6;
+        return lp;
     }
 
     private LinearLayout surfaceCard(int bgColor, float radiusPx, int padL, int padT, int padR, int padB) {
@@ -1155,16 +1752,25 @@ public final class MainActivity extends Activity
     }
 
     private static Drawable m3PillDrawable(int normalFill, int pressedFill, int strokeWidth, int strokeColor) {
+        return m3RoundedStateDrawable(normalFill, pressedFill, 999f, strokeWidth, strokeColor);
+    }
+
+    private static Drawable m3RoundedStateDrawable(
+            int normalFill,
+            int pressedFill,
+            float radiusPx,
+            int strokeWidth,
+            int strokeColor) {
         StateListDrawable sld = new StateListDrawable();
         sld.addState(
                 new int[]{android.R.attr.state_pressed},
-                roundedRect(pressedFill, 999f, strokeWidth, strokeColor));
+                roundedRect(pressedFill, radiusPx, strokeWidth, strokeColor));
         sld.addState(
                 new int[]{android.R.attr.state_focused},
-                roundedRect(pressedFill, 999f, strokeWidth, strokeColor));
+                roundedRect(pressedFill, radiusPx, strokeWidth, strokeColor));
         sld.addState(
                 new int[0],
-                roundedRect(normalFill, 999f, strokeWidth, strokeColor));
+                roundedRect(normalFill, radiusPx, strokeWidth, strokeColor));
         return sld;
     }
 
@@ -1184,6 +1790,23 @@ public final class MainActivity extends Activity
         if (cur == null || !safe.contentEquals(cur)) {
             tv.setText(safe);
         }
+    }
+
+    private static String fmtAgeSeconds(int ageSec) {
+        if (ageSec < 0) {
+            return "0s";
+        }
+        if (ageSec < 60) {
+            return ageSec + "s";
+        }
+        int mins = ageSec / 60;
+        int secs = ageSec % 60;
+        if (mins < 60) {
+            return secs > 0 ? (mins + "m " + secs + "s") : (mins + "m");
+        }
+        int hrs = mins / 60;
+        int remM = mins % 60;
+        return hrs + "h " + remM + "m";
     }
 
     private static String fmtObjFloat(Float v, String fmt) {

@@ -20,6 +20,11 @@ public final class TelemetryRecorder {
     private static final long MAX_SCORING_OBD_AGE_MS = 450L;
     private static final long IDLE_PARK_DOWNSAMPLE_MS = 1000L;
     private static final long EDGE_MATCH_WINDOW_MS = 1400L;
+    public static final long HIGH_CONFIDENCE_GT_MAX_AGE_MS = 90000L;
+
+    public static final int AUTOHOLD_UNSET = -1;
+    public static final int AUTOHOLD_OFF   = 0;
+    public static final int AUTOHOLD_ON    = 1;
 
     // Bitflags packed into flags[idx]
     private static final int FLAG_GEAR_PARK     = 1 << 0;
@@ -31,6 +36,19 @@ public final class TelemetryRecorder {
     private static final int FLAG_OBD_LIT       = 1 << 6;
     private static final int FLAG_OBD_PEDAL     = 1 << 7;
 
+    // Bitfields packed into driverGtMeta[idx] (13 of 16 bits used)
+    private static final int GT_REGEN_CODE_MASK       = 0x0007; // 0=unset, 1..5 = L0..i-Pedal
+    private static final int GT_META_HAS_REGEN_GT     = 1 << 3;
+    private static final int GT_META_DRIVER_AUTO      = 1 << 4;
+    private static final int GT_META_DRIVER_SCC       = 1 << 5;
+    private static final int GT_AUTOHOLD_SHIFT        = 6;      // 2 bits: 0=unset, 1=OFF, 2=ON
+    private static final int GT_AUTOHOLD_MASK         = 0x03 << GT_AUTOHOLD_SHIFT;
+    private static final int GT_META_UI_FOCUSED       = 1 << 8;
+    private static final int GT_META_CARRY_FORWARD    = 1 << 9;
+    private static final int GT_META_INF_AUTO_REGEN   = 1 << 10;
+    private static final int GT_META_INF_SCC          = 1 << 11;
+    private static final int GT_META_MANUAL_TEST      = 1 << 12;
+
     // Compact enum codes for modelSource
     private static final byte SRC_OFF             = 0;
     private static final byte SRC_BRAKE_PRESSURE  = 1;
@@ -41,6 +59,102 @@ public final class TelemetryRecorder {
     private static final byte TRANS_NONE   = 0;
     private static final byte TRANS_BLE    = 1;
     private static final byte TRANS_BRIDGE = 2;
+
+    /**
+     * Immutable snapshot of driver-confirmed ground-truth regen mode and console Auto-Hold state.
+     * Never fed into {@link BrakeModel#evaluate} so live model predictions remain uncontaminated.
+     */
+    public static final class DriverGroundTruth {
+        public final int regenLevel; // -1 unset, 0..3 = L0..L3, 4 = i-Pedal
+        public final boolean autoRegen;
+        public final boolean scc;
+        public final int autoHold;   // -1 unset, 0 = OFF, 1 = ON
+        public final int ageSeconds; // -1 when no regen confirmation active, else >= 0
+        public final boolean uiFocused;
+        public final boolean carryForward;
+
+        public DriverGroundTruth(
+                int regenLevel,
+                boolean autoRegen,
+                boolean scc,
+                int autoHold,
+                int ageSeconds,
+                boolean uiFocused,
+                boolean carryForward) {
+            this.regenLevel = regenLevel;
+            this.autoRegen = autoRegen;
+            this.scc = scc;
+            this.autoHold = autoHold;
+            this.ageSeconds = ageSeconds;
+            this.uiFocused = uiFocused;
+            this.carryForward = carryForward;
+        }
+
+        public boolean hasRegenConfirmation() {
+            return regenLevel >= 0 || autoRegen || scc;
+        }
+
+        public String formatRegenLabel() {
+            return formatRegenLabel(regenLevel, autoRegen, scc);
+        }
+
+        public static String formatRegenLabel(int regenLevel, boolean autoRegen, boolean scc) {
+            if (regenLevel < 0 && !autoRegen && !scc) {
+                return "UNSET";
+            }
+            String base = regenLevel >= 0 ? BrakeEvaluator.regenLevelLabel(regenLevel) : "";
+            if (autoRegen && regenLevel != BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+                base = base.isEmpty() ? "Auto" : (base + " + Auto");
+            }
+            if (scc) {
+                base = base.isEmpty() ? "SCC" : (base + " + SCC");
+            }
+            return base.isEmpty() ? "UNSET" : base;
+        }
+
+        public static String formatAutoHoldLabel(int state) {
+            if (state == AUTOHOLD_ON) return "ON";
+            if (state == AUTOHOLD_OFF) return "OFF";
+            return "?";
+        }
+    }
+
+    public static boolean doesModelMatchDriverGt(BrakeEvaluator.Snapshot snap, DriverGroundTruth gt) {
+        if (snap == null || gt == null || !gt.hasRegenConfirmation()) {
+            return false;
+        }
+        return doesModelMatchDriverGt(
+                snap.inferredRegenLevel,
+                snap.autoRegenActive,
+                snap.sccActive,
+                gt.regenLevel,
+                gt.autoRegen,
+                gt.scc);
+    }
+
+    public static boolean doesModelMatchDriverGt(
+            int inferredRegenLevel,
+            boolean inferredAutoRegen,
+            boolean inferredScc,
+            int gtRegenLevel,
+            boolean gtAutoRegen,
+            boolean gtScc) {
+        boolean hasGt = gtRegenLevel >= 0 || gtAutoRegen || gtScc;
+        if (!hasGt) {
+            return false;
+        }
+        boolean modelHasEst = inferredRegenLevel >= 0 || inferredAutoRegen || inferredScc;
+        if (!modelHasEst) {
+            return false;
+        }
+        if (gtScc) {
+            return inferredScc;
+        }
+        if (gtAutoRegen) {
+            return inferredAutoRegen && !inferredScc;
+        }
+        return !inferredScc && !inferredAutoRegen && inferredRegenLevel == gtRegenLevel;
+    }
 
     public static final class ScoreSnapshot {
         public final int bufferedRows;
@@ -58,6 +172,14 @@ public final class TelemetryRecorder {
         public final long meanOnsetLagMs;
         public final int releaseCount;
         public final long meanReleaseLagMs;
+        public final long gtHighConfTicks;
+        public final long gtHighConfEvalSamples;
+        public final long gtHighConfMatchedSamples;
+        public final long gtCarryTicks;
+        public final long gtCarryEvalSamples;
+        public final long gtCarryMatchedSamples;
+        public final long gtAutoHoldOnTicks;
+        public final long gtAutoHoldOffTicks;
 
         public ScoreSnapshot(
                 int bufferedRows,
@@ -75,7 +197,8 @@ public final class TelemetryRecorder {
                 long meanReleaseLagMs) {
             this(bufferedRows, totalRecordedRows, scoredSamples, tp, fp, tn, fn,
                     0L, 0L, regenObdOnSamples, regenModelMatchedSamples,
-                    onsetCount, meanOnsetLagMs, releaseCount, meanReleaseLagMs);
+                    onsetCount, meanOnsetLagMs, releaseCount, meanReleaseLagMs,
+                    0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
         }
 
         public ScoreSnapshot(
@@ -94,6 +217,36 @@ public final class TelemetryRecorder {
                 long meanOnsetLagMs,
                 int releaseCount,
                 long meanReleaseLagMs) {
+            this(bufferedRows, totalRecordedRows, scoredSamples, tp, fp, tn, fn,
+                    pedalObdOnSamples, pedalModelMatchedSamples, regenObdOnSamples, regenModelMatchedSamples,
+                    onsetCount, meanOnsetLagMs, releaseCount, meanReleaseLagMs,
+                    0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        }
+
+        public ScoreSnapshot(
+                int bufferedRows,
+                long totalRecordedRows,
+                long scoredSamples,
+                long tp,
+                long fp,
+                long tn,
+                long fn,
+                long pedalObdOnSamples,
+                long pedalModelMatchedSamples,
+                long regenObdOnSamples,
+                long regenModelMatchedSamples,
+                int onsetCount,
+                long meanOnsetLagMs,
+                int releaseCount,
+                long meanReleaseLagMs,
+                long gtHighConfTicks,
+                long gtHighConfEvalSamples,
+                long gtHighConfMatchedSamples,
+                long gtCarryTicks,
+                long gtCarryEvalSamples,
+                long gtCarryMatchedSamples,
+                long gtAutoHoldOnTicks,
+                long gtAutoHoldOffTicks) {
             this.bufferedRows = bufferedRows;
             this.totalRecordedRows = totalRecordedRows;
             this.scoredSamples = scoredSamples;
@@ -108,7 +261,19 @@ public final class TelemetryRecorder {
             this.onsetCount = onsetCount;
             this.meanOnsetLagMs = meanOnsetLagMs;
             this.releaseCount = releaseCount;
-            this.meanReleaseLagMs = meanReleaseLagMs;
+            this.meanReleaseLagMs = releaseLagMsSafe(meanReleaseLagMs);
+            this.gtHighConfTicks = gtHighConfTicks;
+            this.gtHighConfEvalSamples = gtHighConfEvalSamples;
+            this.gtHighConfMatchedSamples = gtHighConfMatchedSamples;
+            this.gtCarryTicks = gtCarryTicks;
+            this.gtCarryEvalSamples = gtCarryEvalSamples;
+            this.gtCarryMatchedSamples = gtCarryMatchedSamples;
+            this.gtAutoHoldOnTicks = gtAutoHoldOnTicks;
+            this.gtAutoHoldOffTicks = gtAutoHoldOffTicks;
+        }
+
+        private static long releaseLagMsSafe(long v) {
+            return v;
         }
 
         public float agreementPct() {
@@ -137,6 +302,16 @@ public final class TelemetryRecorder {
             if (regenObdOnSamples <= 0L) return Float.NaN;
             return (regenModelMatchedSamples * 100.0f) / (float) regenObdOnSamples;
         }
+
+        public float gtHighConfAccuracyPct() {
+            if (gtHighConfEvalSamples <= 0L) return Float.NaN;
+            return (gtHighConfMatchedSamples * 100.0f) / (float) gtHighConfEvalSamples;
+        }
+
+        public float gtCarryAccuracyPct() {
+            if (gtCarryEvalSamples <= 0L) return Float.NaN;
+            return (gtCarryMatchedSamples * 100.0f) / (float) gtCarryEvalSamples;
+        }
     }
 
     private final long[] elapsedMs = new long[CAPACITY];
@@ -155,6 +330,8 @@ public final class TelemetryRecorder {
     private final short[] obdLampRaw = new short[CAPACITY];
     private final byte[] inferredRegen = new byte[CAPACITY];
     private final short[] hevRegenRaw = new short[CAPACITY];
+    private final short[] driverGtMeta = new short[CAPACITY];
+    private final short[] driverGtAgeSec = new short[CAPACITY];
 
     private int head;
     private int size;
@@ -163,7 +340,17 @@ public final class TelemetryRecorder {
     private long lastStoredElapsedMs = -1L;
     private long idleParkedSinceMs = -1L;
 
-    // Confusion matrix & lag tracking
+    // Live driver-confirmed ground-truth state (persists across backgrounding until Park or Unset)
+    private int driverRegenLevel = -1;
+    private boolean driverAutoRegen;
+    private boolean driverScc;
+    private int driverAutoHold = AUTOHOLD_UNSET;
+    private long driverRegenTapMonoMs = -1L;
+    private boolean uiFocused;
+    private boolean driverRegenLeftForeground;
+    private boolean sawOutOfParkSinceRegenTap;
+
+    // Confusion matrix, lag, & driver ground-truth accuracy tracking
     private long scoredSamples;
     private long tp;
     private long fp;
@@ -173,6 +360,14 @@ public final class TelemetryRecorder {
     private long pedalModelMatchedSamples;
     private long regenObdOnSamples;
     private long regenModelMatchedSamples;
+    private long gtHighConfTicks;
+    private long gtHighConfEvalSamples;
+    private long gtHighConfMatchedSamples;
+    private long gtCarryTicks;
+    private long gtCarryEvalSamples;
+    private long gtCarryMatchedSamples;
+    private long gtAutoHoldOnTicks;
+    private long gtAutoHoldOffTicks;
 
     private boolean prevStateValid;
     private boolean prevModelLit;
@@ -264,6 +459,7 @@ public final class TelemetryRecorder {
         pedalModelMatchedSamples = 0L;
         regenObdOnSamples = 0L;
         regenModelMatchedSamples = 0L;
+        resetGtScores();
         prevStateValid = false;
         prevModelLit = false;
         prevModelSource = "OFF";
@@ -284,6 +480,197 @@ public final class TelemetryRecorder {
         rawCodeCounts.clear();
         transitionHead = 0;
         transitionSize = 0;
+    }
+
+    private void resetGtScores() {
+        gtHighConfTicks = 0L;
+        gtHighConfEvalSamples = 0L;
+        gtHighConfMatchedSamples = 0L;
+        gtCarryTicks = 0L;
+        gtCarryEvalSamples = 0L;
+        gtCarryMatchedSamples = 0L;
+        gtAutoHoldOnTicks = 0L;
+        gtAutoHoldOffTicks = 0L;
+    }
+
+    private boolean hasActiveRegenGt() {
+        return driverRegenLevel >= 0 || driverAutoRegen || driverScc;
+    }
+
+    /**
+     * Tracks whether {@link MainActivity} is currently visible in the foreground.
+     * Leaving the foreground transitions an active regen confirmation to carry-forward tier;
+     * returning to the foreground NEVER resets {@code driverRegenTapMonoMs}.
+     */
+    public synchronized void setUiFocused(boolean focused, long nowMonoMs) {
+        if (this.uiFocused && !focused && hasActiveRegenGt()) {
+            this.driverRegenLeftForeground = true;
+        }
+        this.uiFocused = focused;
+    }
+
+    /**
+     * Confirms or re-confirms base paddle regen level ({@code 0..3} = {@code L0..L3},
+     * {@code 4} = {@code i-Pedal}). Tapping an already-selected level resets {@code age -> 0s}
+     * and restores high-confidence status. Selecting {@code i-Pedal} clears {@code Auto Regen}
+     * and {@code SCC} to match E-GMP hardware mutual exclusion.
+     */
+    public synchronized DriverGroundTruth confirmDriverRegenLevel(
+            int level,
+            long nowMonoMs,
+            BrakeEvaluator.Snapshot latest) {
+        if (level < BrakeEvaluator.REGEN_LEVEL_0 || level > BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+            return getDriverGroundTruth(nowMonoMs);
+        }
+        driverRegenLevel = level;
+        if (level == BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+            driverAutoRegen = false;
+            driverScc = false;
+        }
+        driverRegenTapMonoMs = Math.max(0L, nowMonoMs);
+        driverRegenLeftForeground = false;
+        sawOutOfParkSinceRegenTap = (latest != null && Boolean.FALSE.equals(latest.gearPark));
+        logDriverGtTransition(nowMonoMs, latest,
+                DriverGroundTruth.formatRegenLabel(driverRegenLevel, driverAutoRegen, driverScc));
+        return getDriverGroundTruth(nowMonoMs);
+    }
+
+    /**
+     * Toggles E-GMP {@code Auto Regen} ({@code Smart Recuperation}) ground truth and refreshes
+     * confirmation age. Turning {@code Auto} ON while {@code i-Pedal} is selected steps the base
+     * paddle level to {@code L3} ({@code L3 + Auto}), matching physical E-GMP paddle behavior.
+     */
+    public synchronized DriverGroundTruth toggleDriverAutoRegen(
+            long nowMonoMs,
+            BrakeEvaluator.Snapshot latest) {
+        driverAutoRegen = !driverAutoRegen;
+        if (driverAutoRegen && driverRegenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+            driverRegenLevel = BrakeEvaluator.REGEN_LEVEL_3;
+        }
+        if (hasActiveRegenGt()) {
+            driverRegenTapMonoMs = Math.max(0L, nowMonoMs);
+            driverRegenLeftForeground = false;
+            sawOutOfParkSinceRegenTap = (latest != null && Boolean.FALSE.equals(latest.gearPark));
+            logDriverGtTransition(nowMonoMs, latest,
+                    DriverGroundTruth.formatRegenLabel(driverRegenLevel, driverAutoRegen, driverScc));
+        } else {
+            driverRegenTapMonoMs = -1L;
+            driverRegenLeftForeground = false;
+            sawOutOfParkSinceRegenTap = false;
+            logDriverGtTransition(nowMonoMs, null, "Unset (Auto OFF)");
+        }
+        return getDriverGroundTruth(nowMonoMs);
+    }
+
+    /**
+     * Toggles Smart Cruise Control ({@code SCC / HDA}) ground truth and refreshes confirmation age.
+     * Turning {@code SCC} ON while {@code i-Pedal} was selected steps base paddle level to {@code L3}.
+     */
+    public synchronized DriverGroundTruth toggleDriverScc(
+            long nowMonoMs,
+            BrakeEvaluator.Snapshot latest) {
+        driverScc = !driverScc;
+        if (driverScc && driverRegenLevel == BrakeEvaluator.REGEN_LEVEL_IPEDAL) {
+            driverRegenLevel = BrakeEvaluator.REGEN_LEVEL_3;
+        }
+        if (hasActiveRegenGt()) {
+            driverRegenTapMonoMs = Math.max(0L, nowMonoMs);
+            driverRegenLeftForeground = false;
+            sawOutOfParkSinceRegenTap = (latest != null && Boolean.FALSE.equals(latest.gearPark));
+            logDriverGtTransition(nowMonoMs, latest,
+                    DriverGroundTruth.formatRegenLabel(driverRegenLevel, driverAutoRegen, driverScc));
+        } else {
+            driverRegenTapMonoMs = -1L;
+            driverRegenLeftForeground = false;
+            sawOutOfParkSinceRegenTap = false;
+            logDriverGtTransition(nowMonoMs, null, "Unset (SCC OFF)");
+        }
+        return getDriverGroundTruth(nowMonoMs);
+    }
+
+    /**
+     * Sets console {@code AUTO HOLD} ground truth ({@link #AUTOHOLD_ON}, {@link #AUTOHOLD_OFF},
+     * or {@link #AUTOHOLD_UNSET}). Persists across Park within the boot, matching E-GMP hardware.
+     */
+    public synchronized DriverGroundTruth setDriverAutoHold(int state, long nowMonoMs) {
+        int clamped = (state == AUTOHOLD_ON) ? AUTOHOLD_ON
+                : ((state == AUTOHOLD_OFF) ? AUTOHOLD_OFF : AUTOHOLD_UNSET);
+        if (this.driverAutoHold != clamped) {
+            this.driverAutoHold = clamped;
+            if (startElapsedMs < 0L && nowMonoMs > 0L) {
+                startElapsedMs = nowMonoMs;
+            }
+            long relMs = (startElapsedMs >= 0L && nowMonoMs >= startElapsedMs)
+                    ? (nowMonoMs - startElapsedMs)
+                    : Math.max(0L, lastStoredElapsedMs);
+            pushTransitionLine(String.format(Locale.US, "[%7.2fs] DriverGT: Auto-Hold=%s",
+                    Float.valueOf(relMs / 1000.0f), DriverGroundTruth.formatAutoHoldLabel(clamped)));
+        }
+        return getDriverGroundTruth(nowMonoMs);
+    }
+
+    /**
+     * Explicitly clears active driver regen-mode ground truth back to {@code UNSET}.
+     */
+    public synchronized DriverGroundTruth clearDriverGroundTruth(long nowMonoMs) {
+        boolean hadAny = hasActiveRegenGt();
+        driverRegenLevel = -1;
+        driverAutoRegen = false;
+        driverScc = false;
+        driverRegenTapMonoMs = -1L;
+        driverRegenLeftForeground = false;
+        sawOutOfParkSinceRegenTap = false;
+        if (hadAny) {
+            logDriverGtTransition(nowMonoMs, null, "Cleared (UNSET)");
+        }
+        return getDriverGroundTruth(nowMonoMs);
+    }
+
+    public synchronized DriverGroundTruth getDriverGroundTruth(long nowMonoMs) {
+        boolean hasRegen = hasActiveRegenGt();
+        int ageSec = -1;
+        boolean carry = false;
+        if (hasRegen && driverRegenTapMonoMs >= 0L) {
+            long ageMs = Math.max(0L, nowMonoMs - driverRegenTapMonoMs);
+            ageSec = (int) Math.min(32767L, ageMs / 1000L);
+            carry = driverRegenLeftForeground || ageMs > HIGH_CONFIDENCE_GT_MAX_AGE_MS;
+        }
+        return new DriverGroundTruth(
+                driverRegenLevel,
+                driverAutoRegen,
+                driverScc,
+                driverAutoHold,
+                ageSec,
+                uiFocused,
+                carry);
+    }
+
+    private void logDriverGtTransition(
+            long nowMonoMs,
+            BrakeEvaluator.Snapshot latest,
+            String detail) {
+        if (startElapsedMs < 0L && nowMonoMs > 0L) {
+            startElapsedMs = nowMonoMs;
+        }
+        long relMs = (startElapsedMs >= 0L && nowMonoMs >= startElapsedMs)
+                ? (nowMonoMs - startElapsedMs)
+                : Math.max(0L, lastStoredElapsedMs);
+        String suffix = "";
+        if (latest != null && hasActiveRegenGt()) {
+            boolean modelKnown = latest.inferredRegenLevel >= 0 || latest.sccActive || latest.autoRegenActive;
+            if (!modelKnown) {
+                suffix = " (Model=Learning)";
+            } else {
+                String mLbl = BrakeEvaluator.regenLevelLabel(
+                        latest.inferredRegenLevel, latest.sccActive, latest.autoRegenActive);
+                boolean match = doesModelMatchDriverGt(
+                        latest.inferredRegenLevel, latest.autoRegenActive, latest.sccActive,
+                        driverRegenLevel, driverAutoRegen, driverScc);
+                suffix = " (Model=" + mLbl + (match ? " MATCH)" : " MISMATCH)");
+            }
+        }
+        pushTransitionLine(String.format(Locale.US, "[%7.2fs] DriverGT: %s%s",
+                Float.valueOf(relMs / 1000.0f), detail, suffix));
     }
 
     /**
@@ -327,6 +714,7 @@ public final class TelemetryRecorder {
         pedalModelMatchedSamples = 0L;
         regenObdOnSamples = 0L;
         regenModelMatchedSamples = 0L;
+        resetGtScores();
         prevStateValid = false;
         prevModelLit = false;
         prevModelSource = "OFF";
@@ -355,9 +743,11 @@ public final class TelemetryRecorder {
         for (int i = 0; i < keep; i++) {
             int idx = (head + i) % CAPACITY;
             int f = flags[idx] & 0xFF;
+            int k = flagKnownMask[idx] & 0xFF;
+            short meta = driverGtMeta[idx];
             short raw = obdLampRaw[idx];
             short age = obdAgeMs[idx];
-            if (raw >= 0 && age >= 0 && age <= MAX_SCORING_OBD_AGE_MS) {
+            if ((meta & GT_META_MANUAL_TEST) == 0 && raw >= 0 && age >= 0 && age <= MAX_SCORING_OBD_AGE_MS) {
                 boolean mLit = (f & FLAG_MODEL_LIT) != 0;
                 boolean oLit = (f & FLAG_OBD_LIT) != 0;
                 boolean oPed = (f & FLAG_OBD_PEDAL) != 0;
@@ -377,9 +767,11 @@ public final class TelemetryRecorder {
                 Long prev = rawCodeCounts.get(key);
                 rawCodeCounts.put(key, Long.valueOf(prev == null ? 1L : prev.longValue() + 1L));
             }
+            accumulateGtScoreForRow(f, k, meta, inferredRegen[idx]);
         }
         int lastIdx = (head + keep - 1) % CAPACITY;
         int lf = flags[lastIdx] & 0xFF;
+        int lmeta = driverGtMeta[lastIdx] & 0xFFFF;
         prevStateValid = true;
         prevModelLit = (lf & FLAG_MODEL_LIT) != 0;
         prevModelSource = decodeModelSource(modelSourceCode[lastIdx]);
@@ -387,6 +779,8 @@ public final class TelemetryRecorder {
         prevObdLit = (lf & FLAG_OBD_LIT) != 0;
         prevObdRaw = obdLampRaw[lastIdx];
         prevInferredRegen = inferredRegen[lastIdx];
+        prevAutoRegenActive = (lmeta & GT_META_INF_AUTO_REGEN) != 0;
+        prevSccActive = (lmeta & GT_META_INF_SCC) != 0;
         return keep;
     }
 
@@ -409,6 +803,47 @@ public final class TelemetryRecorder {
             startElapsedMs = now;
         }
         long relMs = Math.max(0L, now - startElapsedMs);
+
+        // 0. Hardware-grounded Driver Ground-Truth lifecycle rules:
+        //    - Preserve pre-Drive Park confirmations until the car shifts out of Park at least once.
+        //    - Auto-clear SCC on foot-brake pedal application while retaining paddle regen level.
+        //    - Auto-clear regen mode / Auto / SCC on shifting into Park at rest (< 3 km/h) after driving.
+        if (hasActiveRegenGt()) {
+            if (Boolean.FALSE.equals(snap.gearPark)) {
+                sawOutOfParkSinceRegenTap = true;
+            }
+            boolean footBrakeActive = !snap.manualTestActive
+                    && ("BRAKE_PRESSURE".equals(snap.modelSource)
+                            || (snap.brakePressure != null && snap.brakePressure.floatValue() >= 0.45f)
+                            || (snap.obdFresh && snap.obd.pedalBit));
+            if (driverScc && footBrakeActive) {
+                driverScc = false;
+                if (!hasActiveRegenGt()) {
+                    driverRegenTapMonoMs = -1L;
+                    driverRegenLeftForeground = false;
+                    sawOutOfParkSinceRegenTap = false;
+                }
+                pushTransitionLine(String.format(Locale.US,
+                        "[%7.2fs] DriverGT: SCC auto-cleared on foot brake (%s)",
+                        Float.valueOf(relMs / 1000.0f),
+                        hasActiveRegenGt()
+                                ? DriverGroundTruth.formatRegenLabel(driverRegenLevel, driverAutoRegen, false)
+                                : "UNSET"));
+            }
+            boolean parkedAtRest = Boolean.TRUE.equals(snap.gearPark)
+                    && (snap.speedKmh == null || snap.speedKmh.floatValue() < 3.0f);
+            if (sawOutOfParkSinceRegenTap && parkedAtRest) {
+                driverRegenLevel = -1;
+                driverAutoRegen = false;
+                driverScc = false;
+                driverRegenTapMonoMs = -1L;
+                driverRegenLeftForeground = false;
+                sawOutOfParkSinceRegenTap = false;
+                pushTransitionLine(String.format(Locale.US,
+                        "[%7.2fs] DriverGT: Auto-cleared on Park",
+                        Float.valueOf(relMs / 1000.0f)));
+            }
+        }
 
         BrakeEvaluator.ObdSample obd = snap.obd;
         long age = obd.ageMsAt(now);
@@ -480,13 +915,93 @@ public final class TelemetryRecorder {
         transportCode[idx] = encodeTransport(obd.transport);
         obdAgeMs[idx] = (short) (age < 0L ? -1 : Math.min(32000L, age));
         obdLampRaw[idx] = (short) (snap.obdFresh ? obd.rawCode : -1);
-        inferredRegen[idx] = (byte) (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel <= 10
+        byte infRegByte = (byte) (snap.inferredRegenLevel >= 0 && snap.inferredRegenLevel <= 10
                 ? snap.inferredRegenLevel : -1);
+        inferredRegen[idx] = infRegByte;
         hevRegenRaw[idx] = (short) (snap.hevRegenRaw >= 0
                 ? Math.min(32000, snap.hevRegenRaw) : -1);
 
+        boolean hasRegenGt = hasActiveRegenGt();
+        int meta = 0;
+        short gtAgeSecVal = -1;
+        if (hasRegenGt) {
+            meta |= GT_META_HAS_REGEN_GT;
+            if (driverRegenLevel >= 0 && driverRegenLevel <= 4) {
+                meta |= ((driverRegenLevel + 1) & GT_REGEN_CODE_MASK);
+            }
+            if (driverAutoRegen) meta |= GT_META_DRIVER_AUTO;
+            if (driverScc) meta |= GT_META_DRIVER_SCC;
+            long gtAgeMs = driverRegenTapMonoMs >= 0L ? Math.max(0L, now - driverRegenTapMonoMs) : 0L;
+            gtAgeSecVal = (short) Math.min(32767L, gtAgeMs / 1000L);
+            if (driverRegenLeftForeground || gtAgeMs > HIGH_CONFIDENCE_GT_MAX_AGE_MS) {
+                meta |= GT_META_CARRY_FORWARD;
+            }
+        }
+        if (driverAutoHold == AUTOHOLD_OFF) {
+            meta |= (1 << GT_AUTOHOLD_SHIFT);
+        } else if (driverAutoHold == AUTOHOLD_ON) {
+            meta |= (2 << GT_AUTOHOLD_SHIFT);
+        }
+        if (uiFocused) meta |= GT_META_UI_FOCUSED;
+        if (snap.autoRegenActive) meta |= GT_META_INF_AUTO_REGEN;
+        if (snap.sccActive) meta |= GT_META_INF_SCC;
+        if (snap.manualTestActive) meta |= GT_META_MANUAL_TEST;
+
+        short metaShort = (short) meta;
+        driverGtMeta[idx] = metaShort;
+        driverGtAgeSec[idx] = gtAgeSecVal;
+        accumulateGtScoreForRow(f, known, metaShort, infRegByte);
+
         lastStoredElapsedMs = relMs;
         totalRecordedRows++;
+    }
+
+    private void accumulateGtScoreForRow(int f, int known, short metaShort, byte infRegByte) {
+        int meta = metaShort & 0xFFFF;
+        if ((meta & GT_META_MANUAL_TEST) != 0) {
+            return;
+        }
+        boolean inPark = (known & FLAG_GEAR_PARK) != 0 && (f & FLAG_GEAR_PARK) != 0;
+        if (inPark) {
+            return;
+        }
+        int ahCode = (meta & GT_AUTOHOLD_MASK) >>> GT_AUTOHOLD_SHIFT;
+        if (ahCode == 2) {
+            gtAutoHoldOnTicks++;
+        } else if (ahCode == 1) {
+            gtAutoHoldOffTicks++;
+        }
+        if ((meta & GT_META_HAS_REGEN_GT) == 0) {
+            return;
+        }
+        int regCode = meta & GT_REGEN_CODE_MASK;
+        int gtReg = regCode == 0 ? -1 : (regCode - 1);
+        boolean gtAuto = (meta & GT_META_DRIVER_AUTO) != 0;
+        boolean gtScc = (meta & GT_META_DRIVER_SCC) != 0;
+        boolean carry = (meta & GT_META_CARRY_FORWARD) != 0;
+        boolean infAuto = (meta & GT_META_INF_AUTO_REGEN) != 0;
+        boolean infScc = (meta & GT_META_INF_SCC) != 0;
+        int infReg = infRegByte;
+        boolean hasModelEst = infReg >= 0 || infAuto || infScc;
+        boolean matched = hasModelEst
+                && doesModelMatchDriverGt(infReg, infAuto, infScc, gtReg, gtAuto, gtScc);
+        if (!carry) {
+            gtHighConfTicks++;
+            if (hasModelEst) {
+                gtHighConfEvalSamples++;
+                if (matched) {
+                    gtHighConfMatchedSamples++;
+                }
+            }
+        } else {
+            gtCarryTicks++;
+            if (hasModelEst) {
+                gtCarryEvalSamples++;
+                if (matched) {
+                    gtCarryMatchedSamples++;
+                }
+            }
+        }
     }
 
     private void updateScoringAndTransitions(
@@ -673,7 +1188,15 @@ public final class TelemetryRecorder {
                 onsetCount,
                 meanOnset,
                 releaseCount,
-                meanRelease);
+                meanRelease,
+                gtHighConfTicks,
+                gtHighConfEvalSamples,
+                gtHighConfMatchedSamples,
+                gtCarryTicks,
+                gtCarryEvalSamples,
+                gtCarryMatchedSamples,
+                gtAutoHoldOnTicks,
+                gtAutoHoldOffTicks);
     }
 
     public synchronized String recentTransitionsText(int maxLines) {
@@ -692,11 +1215,13 @@ public final class TelemetryRecorder {
     }
 
     public synchronized String toCsvString() {
-        StringBuilder sb = new StringBuilder(Math.max(256, size * 96));
+        StringBuilder sb = new StringBuilder(Math.max(320, size * 116));
         sb.append("elapsed_ms,wall_iso,hmg_speed_kmh,hmg_decel_mps2,hmg_brake_pressure,")
           .append("hmg_pedal_accel,hmg_steering_deg,hmg_gear_park,hmg_parking_brake,hmg_moving,")
           .append("hmg_hv_soc,model_lit,model_source,icon_lit,obd_connected,obd_transport,")
-          .append("obd_age_ms,obd_lamp_raw,obd_lamp_lit,obd_pedal_bit,inferred_regen_level,hev_regen_raw\n");
+          .append("obd_age_ms,obd_lamp_raw,obd_lamp_lit,obd_pedal_bit,inferred_regen_level,hev_regen_raw,")
+          .append("inferred_auto_regen,inferred_scc,driver_regen_level,driver_auto_regen,")
+          .append("driver_scc,driver_autohold,driver_gt_age_s,ui_focused\n");
 
         SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US);
         Date d = new Date();
@@ -709,6 +1234,11 @@ public final class TelemetryRecorder {
             boolean hasObdVal = raw >= 0;
             byte infReg = inferredRegen[idx];
             short hevRaw = hevRegenRaw[idx];
+            int meta = driverGtMeta[idx] & 0xFFFF;
+            short gtAgeSec = driverGtAgeSec[idx];
+            boolean hasRegenGt = (meta & GT_META_HAS_REGEN_GT) != 0;
+            int regCode = meta & GT_REGEN_CODE_MASK;
+            int ahCode = (meta & GT_AUTOHOLD_MASK) >>> GT_AUTOHOLD_SHIFT;
 
             d.setTime(wallTimeMs[idx]);
             sb.append(elapsedMs[idx]).append(',')
@@ -732,7 +1262,15 @@ public final class TelemetryRecorder {
               .append(hasObdVal ? ((f & FLAG_OBD_LIT) != 0 ? "1" : "0") : "").append(',')
               .append(hasObdVal ? ((f & FLAG_OBD_PEDAL) != 0 ? "1" : "0") : "").append(',')
               .append(infReg >= 0 ? Integer.toString(infReg) : "").append(',')
-              .append(hevRaw >= 0 ? Integer.toString(hevRaw) : "").append('\n');
+              .append(hevRaw >= 0 ? Integer.toString(hevRaw) : "").append(',')
+              .append((meta & GT_META_INF_AUTO_REGEN) != 0 ? '1' : '0').append(',')
+              .append((meta & GT_META_INF_SCC) != 0 ? '1' : '0').append(',')
+              .append(hasRegenGt && regCode > 0 ? Integer.toString(regCode - 1) : "").append(',')
+              .append(hasRegenGt ? ((meta & GT_META_DRIVER_AUTO) != 0 ? "1" : "0") : "").append(',')
+              .append(hasRegenGt ? ((meta & GT_META_DRIVER_SCC) != 0 ? "1" : "0") : "").append(',')
+              .append(ahCode == 2 ? "1" : (ahCode == 1 ? "0" : "")).append(',')
+              .append(hasRegenGt && gtAgeSec >= 0 ? Integer.toString(gtAgeSec) : "").append(',')
+              .append((meta & GT_META_UI_FOCUSED) != 0 ? '1' : '0').append('\n');
         }
         return sb.toString();
     }
@@ -770,8 +1308,8 @@ public final class TelemetryRecorder {
             String hevProbeCompactSummary,
             String exportTriggerLabel) {
         ScoreSnapshot sc = scoreSnapshot();
-        StringBuilder sb = new StringBuilder(2400);
-        sb.append("=== Brake Light Indicator v0.9.0 Calibration Summary ===\n");
+        StringBuilder sb = new StringBuilder(2800);
+        sb.append("=== Brake Light Indicator v0.10.0 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');
@@ -832,6 +1370,17 @@ public final class TelemetryRecorder {
             }
             sb.append('\n');
         }
+
+        sb.append("\n--- Model Regen Inference vs Driver Ground Truth ---\n");
+        sb.append("High-Conf Regen Acc.: ").append(fmtPct(sc.gtHighConfAccuracyPct()))
+          .append(" (").append(sc.gtHighConfMatchedSamples).append('/').append(sc.gtHighConfEvalSamples)
+          .append(" eval ticks; ").append(sc.gtHighConfTicks).append(" fresh <=90s focused ticks)\n");
+        sb.append("Carry-Fwd Regen Acc.: ").append(fmtPct(sc.gtCarryAccuracyPct()))
+          .append(" (").append(sc.gtCarryMatchedSamples).append('/').append(sc.gtCarryEvalSamples)
+          .append(" eval ticks; ").append(sc.gtCarryTicks).append(" background/>90s ticks)\n");
+        sb.append("Auto-Hold GT Ticks  : ON=").append(sc.gtAutoHoldOnTicks)
+          .append(", OFF=").append(sc.gtAutoHoldOffTicks)
+          .append(" (current=").append(DriverGroundTruth.formatAutoHoldLabel(driverAutoHold)).append(")\n");
 
         sb.append("\n--- Recent Transitions (newest first) ---\n");
         sb.append(recentTransitionsText(TRANSITION_LOG_CAP)).append('\n');

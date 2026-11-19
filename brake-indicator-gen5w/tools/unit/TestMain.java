@@ -106,6 +106,7 @@ public final class TestMain {
         testV090OtaModelSigningVerificationHotSwapAndWatchdog();
         testV0100DriverGroundTruthCaptureAgingInvalidationAndCsv();
         testModel202611182SccPreservationUphillGuardAndFootHold();
+        testModel202611191PostStopL3GuardAeroStepDownAndHwyRelease();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -3695,11 +3696,11 @@ public final class TestMain {
                 Boolean.valueOf(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(30.0f)) == 0.0f
                         && Math.abs(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(55.0f)) - 10.6f) < 0.01f
                         && Math.abs(BrakeEvaluator.l3OnsetPedalPct(Float.valueOf(88.0f)) - 14.0f) < 0.01f));
-        eq("v0.8.1 l3ReleasePedalPct scales 7.5% -> 11.8% -> 15.6% across 28..55..88 km/h",
+        eq("v0.8.1 l3ReleasePedalPct scales 7.5% -> 11.8% -> 18.2% across 28..55..88 km/h",
                 Boolean.TRUE,
                 Boolean.valueOf(Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(28.0f)) - 7.5f) < 0.01f
                         && Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(55.0f)) - 11.8f) < 0.01f
-                        && Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(88.0f)) - 15.6f) < 0.01f));
+                        && Math.abs(BrakeEvaluator.l3ReleasePedalPct(Float.valueOf(88.0f)) - 18.2f) < 0.01f));
 
         // 2. Manual L3 post-ignition coast -> highway neutral cruise (78 km/h @ 28.2% pedal)
         //    and unlit highway feathering (84 km/h @ 16.0% pedal, ~0.72 m/s^2 decel) MUST stay L3 (3), NOT i-Pedal (4):
@@ -4757,8 +4758,8 @@ public final class TestMain {
     private static void testModel202611182SccPreservationUphillGuardAndFootHold() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
         BrakeEvaluator ev = new BrakeEvaluator();
-        eq("model 2026.11.18.2 version and seq constants",
-                "2026.11.18.2/2026111802",
+        eq("builtin model version and seq match constants",
+                BrakeEvaluator.BUILTIN_MODEL_VERSION + "/" + BrakeEvaluator.BUILTIN_MODEL_SEQ,
                 ev.modelVersion() + "/" + ev.modelSeq());
 
         long t = 10_000L;
@@ -4841,7 +4842,7 @@ public final class TestMain {
                     Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(76.0f),
                     BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
         }
-        // Transition to 82.0 km/h steep climb holding 33.0% pedal flat (decel ~ 0) for 3.2s (> 2450 ms):
+        // Transition to 82.0 km/h steep climb holding 33.0% throttle flat (decel ~ 0) for 3.2s (> 2450 ms):
         for (int i = 0; i < 20; i++) {
             t += 50L;
             float climbSpd = 78.0f + 0.20f * (i + 1);
@@ -4881,6 +4882,133 @@ public final class TestMain {
         }
         eq("2026.11.18.2 standstill 0.24 bar light foot-hold after 1.30 bar stop stays BRAKE_PRESSURE",
                 "true/BRAKE_PRESSURE", snap.modelIlluminated + "/" + snap.modelSource);
+    }
+
+    private static void testModel202611191PostStopL3GuardAeroStepDownAndHwyRelease() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        eq("model 2026.11.19.1 version and seq constants",
+                "2026.11.19.1/2026111901",
+                ev.modelVersion() + "/" + ev.modelSeq());
+
+        long t = 20_000L;
+        BrakeEvaluator.Snapshot snap = null;
+        // 1. Establish L3 via settled high-speed coast, then observe <17 km/h L3 creep-taper coast
+        //    (16.0 -> 13.6 km/h at ~0.60 m/s^2) and stop at a red light (0.0 km/h for 30s):
+        float rawSpd = 54.4f;
+        for (int i = 0; i < 45; i++) {
+            t += 50L;
+            rawSpd -= 0.28f; // ~1.55 m/s^2 -> L3
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.1 initial settled coast locks L3",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // Low-speed L3 creep taper (18.4 -> 13.6 km/h at ~0.62 m/s^2 for 2.2s):
+        // Verify lamp releases below 18.6 km/h once decel drops below 0.75 m/s^2 AND verifies non-i-Pedal L3!
+        rawSpd = 18.4f;
+        for (int i = 0; i < 44; i++) {
+            t += 50L;
+            rawSpd -= 0.11f; // ~0.61 m/s^2
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.1 sub-18.6 km/h L3 creep taper (~0.61 m/s^2) extinguishes REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // Stop at red light (0.0 km/h for 35 seconds in Drive), then WOT launch (99.6% pedal) to 109.6 km/h
+        // and cruise/climb uphill at 39.6% pedal for 3.2s (> 2450 ms): must stay L3 (not false-promote to i-Pedal)!
+        for (int i = 0; i < 700; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(4.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        rawSpd = 0.0f;
+        for (int i = 0; i < 200; i++) {
+            t += 50L;
+            rawSpd = Math.min(109.6f, rawSpd + 0.56f);
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(99.6f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 68; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(109.6f), Float.valueOf(39.6f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.1 post-stop WOT launch + 109.6 km/h @ 39.6% climb stays L3 across red light",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 2. Highway L3 throttle-reapply release curve at 86 km/h:
+        //    Strong L3 regen braking (1.35 m/s^2) stays lit at 17.5% pedal reapply, extinguishes at 21.2% pedal:
+        rawSpd = 90.4f;
+        for (int i = 0; i < 24; i++) {
+            t += 50L;
+            rawSpd -= 0.25f; // ~1.39 m/s^2
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(8.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 6; i++) {
+            t += 50L;
+            rawSpd -= 0.22f; // ~1.22 m/s^2 at ~84 km/h
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(17.5f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.1 84 km/h L3 strong regen reapply at 17.5% pedal stays REGEN_DECEL",
+                Boolean.TRUE, Boolean.valueOf(snap.modelIlluminated));
+        t += 50L;
+        snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                t, Float.valueOf(0.0f), Float.valueOf(Math.round(rawSpd / 0.8f) * 0.8f), Float.valueOf(21.2f), Float.valueOf(0.0f),
+                Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        eq("2026.11.19.1 84 km/h L3 reapply at 21.2% pedal extinguishes REGEN_DECEL",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+
+        // 3. Unverified cold-start i-Pedal highway cruise still promotes to i-Pedal (4),
+        //    and aero-compensated sub-i-Pedal highway cruise (17.5% at ~78 km/h with ~0.20 m/s^2 wind drag) steps 4 -> 3:
+        BrakeEvaluator ipEv = new BrakeEvaluator();
+        long ti = 10_000L;
+        for (int i = 0; i < 50; i++) {
+            ti += 50L;
+            snap = ipEv.evaluate(cfg, new BrakeEvaluator.Input(
+                    ti, Float.valueOf(0.0f), Float.valueOf(80.0f), Float.valueOf(34.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ti));
+        }
+        eq("2026.11.19.1 cold-start unverified highway cruise promotes to i-Pedal (4)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snap.inferredRegenLevel));
+
+        float dragSpd = 80.0f;
+        for (int i = 0; i < 48; i++) {
+            ti += 50L;
+            dragSpd -= 0.036f; // ~0.20 m/s^2 total decel (~0.02 m/s^2 motor decel after aero drag subtraction)
+            float qSpd = Math.round(dragSpd / 0.8f) * 0.8f;
+            snap = ipEv.evaluate(cfg, new BrakeEvaluator.Input(
+                    ti, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(17.5f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, ti));
+        }
+        eq("2026.11.19.1 aero-compensated 17.5% pedal @ 78 km/h steps i-Pedal (4) down to L3 (3)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
     }
 
     private static byte[] makeValidDexStub() {

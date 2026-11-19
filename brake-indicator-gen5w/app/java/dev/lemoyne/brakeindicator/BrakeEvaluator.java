@@ -34,8 +34,8 @@ import java.util.Map;
  */
 public final class BrakeEvaluator implements BrakeModel {
 
-    public static final String BUILTIN_MODEL_VERSION = "2026.11.18.2";
-    public static final long BUILTIN_MODEL_SEQ = 2026111802L;
+    public static final String BUILTIN_MODEL_VERSION = "2026.11.19.1";
+    public static final long BUILTIN_MODEL_SEQ = 2026111901L;
 
     public static final int REGEN_LEVEL_UNKNOWN = -1;
     public static final int REGEN_LEVEL_0       = 0;
@@ -818,8 +818,9 @@ public final class BrakeEvaluator implements BrakeModel {
             if (inferredRegenLevel != REGEN_LEVEL_IPEDAL
                     && smoothedPollIntervalMs < 350.0f
                     && in.speedKmh != null
-                    && in.speedKmh < CREEP_TAPER_RELEASE_SPEED_KMH) {
-                releaseThresh = BASE_RELEASE_LOW_REGEN_MPS2 * threshScale;
+                    && in.speedKmh < 18.6f) {
+                releaseThresh = (in.speedKmh < CREEP_TAPER_RELEASE_SPEED_KMH
+                        ? BASE_RELEASE_LOW_REGEN_MPS2 : 0.75f) * threshScale;
             } else if (zeroPedalAboveLiftMin) {
                 boolean settledL2Taper = inferredRegenLevel == REGEN_LEVEL_2
                         && smoothedPollIntervalMs < 350.0f
@@ -1371,9 +1372,9 @@ public final class BrakeEvaluator implements BrakeModel {
             return RELEASE_ACCEL_L3_PCT + (11.8f - RELEASE_ACCEL_L3_PCT) * clamp01((spd - 28.0f) / 27.0f);
         }
         if (spd < 88.0f) {
-            return 11.8f + (15.6f - 11.8f) * clamp01((spd - 55.0f) / 33.0f);
+            return 11.8f + (18.2f - 11.8f) * clamp01((spd - 55.0f) / 33.0f);
         }
-        return 15.6f + (16.4f - 15.6f) * clamp01((spd - 88.0f) / 22.0f);
+        return 18.2f + (19.6f - 18.2f) * clamp01((spd - 88.0f) / 22.0f);
     }
 
     private static float l3StrongCancelPedalPct(Float speedKmh) {
@@ -1381,8 +1382,11 @@ public final class BrakeEvaluator implements BrakeModel {
         if (spd <= 45.0f) {
             return STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT;
         }
-        return STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT
-                + (17.2f - STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT) * clamp01((spd - 45.0f) / 43.0f);
+        if (spd < 88.0f) {
+            return STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT
+                    + (19.8f - STRONG_DECEL_RELEASE_ACCEL_PADDLE_PCT) * clamp01((spd - 45.0f) / 43.0f);
+        }
+        return 19.8f + (21.0f - 19.8f) * clamp01((spd - 88.0f) / 22.0f);
     }
 
     private static float regenReleaseAccelPct(int regenLevel, boolean sccActive, Float speedKmh) {
@@ -1732,14 +1736,18 @@ public final class BrakeEvaluator implements BrakeModel {
                     + 11.5f * clamp01((spd - 84.0f) / 26.0f);
             float hwyNeutralMinDecel = smoothedPollIntervalMs < 350.0f ? -0.08f : -0.15f;
             float hwyNeutralMaxDecel = smoothedPollIntervalMs < 350.0f ? 0.48f : 0.15f;
-            if (spd < 15.0f || autoRegenActive) {
+            float subIpedalVerifyMaxAcc = spd > IPEDAL_CRUISE_MAX_SPD_KMH
+                    ? Math.max(ipedalOnsetPedalPct(in.speedKmh) - 2.8f, hwyNeutralMinAcc - 4.2f)
+                    : (urbNeutralMinAcc - 2.2f);
+            float verifyMotorDecel = smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh);
+            if (autoRegenActive || (inferredRegenLevel >= 0 && inferredRegenLevel < REGEN_LEVEL_2)) {
                 subIpedalHwyVerifySinceMs = -1L;
                 lastVerifiedNonIpedalMs = -1L;
             } else if (inferredRegenLevel >= REGEN_LEVEL_2
                     && inferredRegenLevel <= REGEN_LEVEL_3
-                    && spd >= 42.0f && absSteerDeg < 30.0f
-                    && acc >= 5.5f && acc <= (ipedalOnsetPedalPct(in.speedKmh) - 2.8f)
-                    && smoothedDecelMps2 >= -0.25f && smoothedDecelMps2 <= 0.36f) {
+                    && spd >= 24.0f && absSteerDeg < 30.0f
+                    && acc >= 5.5f && acc <= subIpedalVerifyMaxAcc
+                    && verifyMotorDecel >= -0.25f && verifyMotorDecel <= 0.22f) {
                 if (subIpedalHwyVerifySinceMs < 0L) {
                     subIpedalHwyVerifySinceMs = effPollMs;
                 } else if ((effPollMs - subIpedalHwyVerifySinceMs) >= 900L) {
@@ -1752,7 +1760,7 @@ public final class BrakeEvaluator implements BrakeModel {
                     && inferredRegenLevel >= REGEN_LEVEL_2
                     && inferredRegenLevel <= REGEN_LEVEL_3
                     && lastVerifiedNonIpedalMs > 0L
-                    && (effPollMs - lastVerifiedNonIpedalMs) <= 22000L;
+                    && (effPollMs - lastVerifiedNonIpedalMs) <= 300000L;
             boolean highwayNeutralCruise = !recentSubIpedalHwyCruise
                     && spd > IPEDAL_CRUISE_MAX_SPD_KMH && spd <= 125.0f
                     && absSteerDeg < 25.0f
@@ -1768,6 +1776,8 @@ public final class BrakeEvaluator implements BrakeModel {
                     inferredRegenLevel = REGEN_LEVEL_IPEDAL;
                     autoRegenActive = false;
                     confirmedZeroRegenCoast = false;
+                    subIpedalHwyVerifySinceMs = -1L;
+                    lastVerifiedNonIpedalMs = -1L;
                 }
             } else {
                 ipedalCruiseSinceMs = -1L;
@@ -1819,15 +1829,19 @@ public final class BrakeEvaluator implements BrakeModel {
                 ipedalLaunchSinceMs = -1L;
             }
 
-            // 3) Step down i-Pedal -> L3 if settled low-speed zero-pedal coast exhibits creep taper
-            if (inferredRegenLevel == REGEN_LEVEL_IPEDAL
+            // 3) Step down i-Pedal -> L3 (and verify non-i-Pedal L2/L3) if settled low-speed zero-pedal coast exhibits creep taper
+            if (!autoRegenActive
+                    && inferredRegenLevel >= REGEN_LEVEL_2
                     && spd >= 9.0f && spd <= 17.0f
                     && acc < COAST_MAX_ACCEL_PCT
                     && smoothedDecelMps2 >= 0.15f && smoothedDecelMps2 <= 0.80f) {
                 if (creepTaperSinceMs < 0L) {
                     creepTaperSinceMs = effPollMs;
                 } else if ((effPollMs - creepTaperSinceMs) >= CREEP_TAPER_CONFIRM_MS) {
-                    inferredRegenLevel = REGEN_LEVEL_3;
+                    if (inferredRegenLevel == REGEN_LEVEL_IPEDAL) {
+                        inferredRegenLevel = REGEN_LEVEL_3;
+                    }
+                    lastVerifiedNonIpedalMs = effPollMs;
                 }
             } else {
                 creepTaperSinceMs = -1L;
@@ -1843,7 +1857,8 @@ public final class BrakeEvaluator implements BrakeModel {
                     && spd >= 16.0f
                     && absSteerDeg < 35.0f
                     && acc >= 3.0f && acc <= subIpedalCruiseMaxAcc
-                    && smoothedDecelMps2 <= 0.06f) {
+                    && (smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh))
+                            <= (spd >= 55.0f && smoothedPollIntervalMs < 350.0f ? 0.24f : 0.08f)) {
                 long reqLowPedalConfirmMs = acc <= 12.0f ? IPEDAL_LOW_PEDAL_CRUISE_CONFIRM_MS : 1450L;
                 if (lowPedalCruiseSinceMs < 0L) {
                     lowPedalCruiseSinceMs = effPollMs;

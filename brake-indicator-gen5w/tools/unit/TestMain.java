@@ -107,6 +107,7 @@ public final class TestMain {
         testV0100DriverGroundTruthCaptureAgingInvalidationAndCsv();
         testModel202611182SccPreservationUphillGuardAndFootHold();
         testModel202611191PostStopL3GuardAeroStepDownAndHwyRelease();
+        testModel202611192ElectronicStandstillAndFastHubL1L2Calibration();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -4887,8 +4888,8 @@ public final class TestMain {
     private static void testModel202611191PostStopL3GuardAeroStepDownAndHwyRelease() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
         BrakeEvaluator ev = new BrakeEvaluator();
-        eq("model 2026.11.19.1 version and seq constants",
-                "2026.11.19.1/2026111901",
+        eq("builtin model version and seq match 2026.11.19.2",
+                BrakeEvaluator.BUILTIN_MODEL_VERSION + "/" + BrakeEvaluator.BUILTIN_MODEL_SEQ,
                 ev.modelVersion() + "/" + ev.modelSeq());
 
         long t = 20_000L;
@@ -5009,6 +5010,151 @@ public final class TestMain {
         }
         eq("2026.11.19.1 aero-compensated 17.5% pedal @ 78 km/h steps i-Pedal (4) down to L3 (3)",
                 Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_3), Integer.valueOf(snap.inferredRegenLevel));
+    }
+
+    private static void testModel202611192ElectronicStandstillAndFastHubL1L2Calibration() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        eq("model 2026.11.19.2 version and seq constants",
+                "2026.11.19.2/2026111902",
+                ev.modelVersion() + "/" + ev.modelSeq());
+
+        long t = 10_000L;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // 1. Pre-drive / Neutral stationary (0.0 km/h with gearPark=false before ever driving >= 3 km/h)
+        //    must stay OFF even after 5.0s:
+        for (int i = 0; i < 100; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.2 pre-motion stationary in non-Park stays OFF (no false STANDSTILL_HOLD)",
+                "false/OFF", snap.modelIlluminated + "/" + snap.modelSource);
+
+        // 2. Drive with AUTO HOLD initially OFF (confirmed via 0%-pedal idle creep 0 -> 3.2 km/h),
+        //    then brake to 0.0 km/h, engage SCC / electronic hold while stopped, and release brake pedal:
+        //    after >= 2.4s stationary without creeping, electronicStandstillConfirmed latches STANDSTILL_HOLD!
+        float rawSpd = 0.0f;
+        for (int i = 0; i < 40; i++) {
+            t += 50L;
+            rawSpd = Math.min(4.0f, rawSpd + 0.14f); // 0% pedal idle creep acceleration -> autoHoldConfirmedOff=true
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(qSpd > 0.0f), Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 30; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(24.0f), Float.valueOf(18.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        // Foot-brake stop to 0.0 km/h (12.0 bar):
+        for (int i = 0; i < 40; i++) {
+            t += 50L;
+            float s = Math.max(0.0f, 12.0f - i * 0.45f);
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(12.0f), Float.valueOf(s), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.valueOf(s > 0.0f), Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        // Release brake pedal at 0.0 km/h while SCC holds the car stationary:
+        // At 1.0s (20 ticks), autoHoldConfirmedOff initially suppresses hold; by 2.6s (52 ticks), STANDSTILL_HOLD latches!
+        for (int i = 0; i < 20; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.2 1.0s after foot-brake release with autoHoldConfirmedOff initially stays OFF",
+                Boolean.FALSE, Boolean.valueOf(snap.modelIlluminated));
+        for (int i = 0; i < 35; i++) {
+            t += 50L;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.19.2 >=2.4s non-creeping Drive standstill latches electronic STANDSTILL_HOLD",
+                "true/STANDSTILL_HOLD", snap.modelIlluminated + "/" + snap.modelSource);
+
+        // 3. Fast-Hub (20 Hz) 75 km/h L2 coast (~1.28 m/s^2 motor decel = ~1.36 m/s^2 total) stays L2 (not L3):
+        BrakeEvaluator l2Ev = new BrakeEvaluator();
+        long t2 = 10_000L;
+        rawSpd = 76.0f;
+        for (int i = 0; i < 44; i++) {
+            t2 += 50L;
+            rawSpd -= 0.245f; // ~1.36 m/s^2 total (~1.28 m/s^2 motor decel < 1.38 m/s^2 L2/L3 boundary)
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = l2Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t2, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t2));
+        }
+        eq("2026.11.19.2 20 Hz 75 km/h coast at ~1.28 m/s^2 motor decel classifies as L2 (not L3)",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_2), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 4. Fast-Hub highway L1 across undulating grades: downhill L1 (~0.30 m/s^2), two flat L1 coasts (~0.60 m/s^2),
+        //    then uphill L1 coast (~0.92 m/s^2 motor decel at 82 km/h) stays L1 (!autoRegenActive) and OFF:
+        BrakeEvaluator l1Ev = new BrakeEvaluator();
+        long t1 = 10_000L;
+        // Downhill coast (~0.30 m/s^2 motor decel at 80 km/h -> total ~0.39 m/s^2):
+        rawSpd = 80.8f;
+        for (int i = 0; i < 44; i++) {
+            t1 += 50L;
+            rawSpd -= 0.070f;
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = l1Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t1, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t1));
+        }
+        // Two settled flat L1 coasts (~0.60 m/s^2 motor decel at 80 km/h -> total ~0.69 m/s^2) separated by throttle:
+        for (int c = 0; c < 2; c++) {
+            for (int i = 0; i < 16; i++) {
+                t1 += 50L;
+                snap = l1Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t1, Float.valueOf(0.0f), Float.valueOf(82.4f), Float.valueOf(18.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t1));
+            }
+            rawSpd = 82.4f;
+            for (int i = 0; i < 44; i++) {
+                t1 += 50L;
+                rawSpd -= 0.125f;
+                float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+                snap = l1Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t1, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t1));
+            }
+        }
+        // Uphill L1 coast (~0.92 m/s^2 motor decel at 82 km/h -> total ~1.02 m/s^2 < 0.95+0.08 hysteresis):
+        for (int i = 0; i < 16; i++) {
+            t1 += 50L;
+            snap = l1Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t1, Float.valueOf(0.0f), Float.valueOf(84.0f), Float.valueOf(18.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t1));
+        }
+        rawSpd = 84.0f;
+        for (int i = 0; i < 44; i++) {
+            t1 += 50L;
+            rawSpd -= 0.184f;
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = l1Ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t1, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t1));
+        }
+        eq("2026.11.19.2 undulating highway L1 stays L1 (!autoRegenActive) and keeps brake lamp OFF",
+                "1/false/false", snap.inferredRegenLevel + "/" + snap.autoRegenActive + "/" + snap.modelIlluminated);
     }
 
     private static byte[] makeValidDexStub() {

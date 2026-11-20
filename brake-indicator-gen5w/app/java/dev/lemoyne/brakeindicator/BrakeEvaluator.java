@@ -34,8 +34,8 @@ import java.util.Map;
  */
 public final class BrakeEvaluator implements BrakeModel {
 
-    public static final String BUILTIN_MODEL_VERSION = "2026.11.19.1";
-    public static final long BUILTIN_MODEL_SEQ = 2026111901L;
+    public static final String BUILTIN_MODEL_VERSION = "2026.11.19.2";
+    public static final long BUILTIN_MODEL_SEQ = 2026111902L;
 
     public static final int REGEN_LEVEL_UNKNOWN = -1;
     public static final int REGEN_LEVEL_0       = 0;
@@ -572,6 +572,9 @@ public final class BrakeEvaluator implements BrakeModel {
         epbEngagedInDrive = false;
         epbAutoReleasing = false;
         autoHoldConfirmedOff = false;
+        hadDriveMotionSincePark = false;
+        electronicStandstillConfirmed = false;
+        consecutiveSettledL1Coasts = 0;
         recentZeroSpeedMs = -1L;
         zeroPedalStationaryStartMs = -1L;
         lowDecelFeatherCoastSinceMs = -1L;
@@ -633,6 +636,9 @@ public final class BrakeEvaluator implements BrakeModel {
     private boolean epbEngagedInDrive;
     private boolean epbAutoReleasing;
     private boolean autoHoldConfirmedOff;
+    private boolean hadDriveMotionSincePark;
+    private boolean electronicStandstillConfirmed;
+    private int consecutiveSettledL1Coasts;
     private long recentZeroSpeedMs = -1L;
     private long zeroPedalStationaryStartMs = -1L;
     private long lowDecelFeatherCoastSinceMs = -1L;
@@ -900,15 +906,15 @@ public final class BrakeEvaluator implements BrakeModel {
             }
             if (!sccSustainedBraking && fastPollHub && in.speedKmh >= 55.0f
                     && smoothedDecelMps2 >= 0.21f * threshScale) {
-                for (int i = histCount - 1; i >= 0; i--) {
+                for (int i = 0; i < histCount; i++) {
                     long age = effPollMs - histTimeMs[i];
                     if (age >= 1500L && age <= 2300L) {
                         float dropKmh = histSpeedKmh[i] - in.speedKmh.floatValue();
                         float chordDec = (dropKmh / 3.6f) / (age / 1000.0f);
                         if (dropKmh >= 1.7f && chordDec >= 0.26f * threshScale) {
                             sccSustainedBraking = true;
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -1154,6 +1160,17 @@ public final class BrakeEvaluator implements BrakeModel {
         }
         prevParkingBrake = curEpb;
 
+        if (Boolean.TRUE.equals(in.gearPark)) {
+            hadDriveMotionSincePark = false;
+            electronicStandstillConfirmed = false;
+        } else if (in.speedKmh != null && in.speedKmh >= 3.0f) {
+            hadDriveMotionSincePark = true;
+            electronicStandstillConfirmed = false;
+        } else if ((in.speedKmh != null && in.speedKmh >= STANDSTILL_SPEED_MAX_KMH)
+                || Boolean.TRUE.equals(in.moving)
+                || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
+            electronicStandstillConfirmed = false;
+        }
         if (!Boolean.TRUE.equals(in.gearPark) && in.speedKmh != null && in.speedKmh < 0.3f) {
             recentZeroSpeedMs = effPollMs;
         }
@@ -1175,6 +1192,7 @@ public final class BrakeEvaluator implements BrakeModel {
         }
         if (!Boolean.TRUE.equals(in.gearPark)
                 && !Boolean.TRUE.equals(in.parkingBrake)
+                && !epbEngagedInDrive
                 && !epbAutoReleasing
                 && !Boolean.TRUE.equals(in.moving)
                 && in.speedKmh != null
@@ -1184,11 +1202,20 @@ public final class BrakeEvaluator implements BrakeModel {
                 && (in.accelPedal == null || in.accelPedal < 0.8f)) {
             if (zeroPedalStationaryStartMs < 0L) {
                 zeroPedalStationaryStartMs = effPollMs;
-            } else if ((effPollMs - zeroPedalStationaryStartMs) >= 2200L) {
-                autoHoldConfirmedOff = false;
+            } else {
+                long statMs = effPollMs - zeroPedalStationaryStartMs;
+                if (statMs >= 2200L) {
+                    autoHoldConfirmedOff = false;
+                }
+                if (hadDriveMotionSincePark
+                        && (in.accelPedal == null || in.accelPedal < STANDSTILL_IPEDAL_LATCH_ACCEL)
+                        && statMs >= (sccActive ? 2000L : 2400L)) {
+                    electronicStandstillConfirmed = true;
+                }
             }
         } else {
             zeroPedalStationaryStartMs = -1L;
+            electronicStandstillConfirmed = false;
         }
 
         boolean footBrakeStopWithoutAutoHold = autoHoldConfirmedOff
@@ -1221,6 +1248,7 @@ public final class BrakeEvaluator implements BrakeModel {
                 || (in.accelPedal != null && in.accelPedal >= STANDSTILL_RELEASE_ACCEL)) {
             standstillLatched = false;
         } else if (standstillLatched
+                || electronicStandstillConfirmed
                 || (inferredRegenLevel == REGEN_LEVEL_IPEDAL
                         && (in.accelPedal == null || in.accelPedal < STANDSTILL_IPEDAL_LATCH_ACCEL))
                 || (lastBrakingNearStopMs > 0L && in.nowMs - lastBrakingNearStopMs <= STANDSTILL_ARM_WINDOW_MS)) {
@@ -1500,6 +1528,7 @@ public final class BrakeEvaluator implements BrakeModel {
             coastMaxChordDecel = -Float.MAX_VALUE;
             coastRecordedHigh = false;
             consecutiveFixedHighCoasts = 0;
+            consecutiveSettledL1Coasts = 0;
             autoRegenActive = false;
             confirmedZeroRegenCoast = false;
             autoRegenBaseLevel = REGEN_LEVEL_0;
@@ -1605,7 +1634,9 @@ public final class BrakeEvaluator implements BrakeModel {
                         int prevLevel = inferredRegenLevel;
                         int prevForChord = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
                                 ? REGEN_LEVEL_3 : inferredRegenLevel;
-                        int classified = classifyCoastingRegenLevel(chordDecel, prevForChord);
+                        int classified = (smoothedPollIntervalMs < 350.0f)
+                                ? classifyFastHubCoastingRegenLevel(chordDecel, midSpd, prevForChord)
+                                : classifyCoastingRegenLevel(chordDecel, prevForChord);
                         boolean ipedalUnsettledRamp = prevLevel == REGEN_LEVEL_IPEDAL
                                 && ((effPollMs - coastStartMs) < 1450L || chordDtMs < COAST_CHORD_PREF_MS);
                         boolean l3LowSpeedTaper = prevLevel == REGEN_LEVEL_3
@@ -1624,6 +1655,7 @@ public final class BrakeEvaluator implements BrakeModel {
                                 autoRegenBaseLevel = REGEN_LEVEL_0;
                                 if (curSpd >= 24.5f && chordDtMs >= 950L) {
                                     consecutiveFixedHighCoasts = 0;
+                                    consecutiveSettledL1Coasts = 0;
                                     if (chordDecel < 0.36f) {
                                         confirmedZeroRegenCoast = true;
                                     }
@@ -1634,6 +1666,14 @@ public final class BrakeEvaluator implements BrakeModel {
                                 }
                             } else if (classified == REGEN_LEVEL_1 && curSpd >= 24.5f && chordDtMs >= 950L) {
                                 consecutiveFixedHighCoasts = 0;
+                                if (!coastRecordedHigh && (effPollMs - coastStartMs) >= 1500L
+                                        && chordDecel >= 0.46f && chordDecel <= 0.86f) {
+                                    coastRecordedHigh = true;
+                                    consecutiveSettledL1Coasts++;
+                                    if (consecutiveSettledL1Coasts >= 2) {
+                                        confirmedZeroRegenCoast = false;
+                                    }
+                                }
                             } else if (confirmedZeroRegenCoast && classified >= REGEN_LEVEL_2
                                     && smoothedPollIntervalMs < 350.0f && curSpd >= 24.5f
                                     && chordDtMs >= 950L && consecutiveFixedHighCoasts == 0) {
@@ -1642,16 +1682,18 @@ public final class BrakeEvaluator implements BrakeModel {
                             if (curSpd >= 24.5f && chordDtMs >= 950L) {
                                 if (chordDecel < coastMinChordDecel) coastMinChordDecel = chordDecel;
                                 if (chordDecel > coastMaxChordDecel) coastMaxChordDecel = chordDecel;
-                                if ((coastMinChordDecel < 0.52f && chordDecel >= 0.90f && (chordDecel - coastMinChordDecel) >= 0.45f)
-                                        || (coastMaxChordDecel >= 1.08f && chordDecel <= (coastMaxChordDecel - 0.45f))) {
+                                if ((coastMinChordDecel < 0.52f && chordDecel >= 0.92f && (chordDecel - coastMinChordDecel) >= 0.45f)
+                                        || (coastMaxChordDecel >= 1.08f
+                                                && (consecutiveFixedHighCoasts < 2 || chordDecel <= 0.88f)
+                                                && chordDecel <= (coastMaxChordDecel - 0.45f))) {
                                     autoRegenActive = true;
                                     consecutiveFixedHighCoasts = 0;
-                                } else if (coastRecordedHigh && (coastMaxChordDecel - coastMinChordDecel) >= 0.36f) {
+                                } else if (coastRecordedHigh && (coastMaxChordDecel - coastMinChordDecel) >= 0.46f) {
                                     consecutiveFixedHighCoasts = 0;
                                 }
                                 if (!coastRecordedHigh && (effPollMs - coastStartMs) >= 1600L && chordDecel >= 0.85f) {
                                     coastRecordedHigh = true;
-                                    if (coastMinChordDecel >= 0.78f && (coastMaxChordDecel - coastMinChordDecel) < 0.36f) {
+                                    if (coastMinChordDecel >= 0.78f && (coastMaxChordDecel - coastMinChordDecel) < 0.46f) {
                                         consecutiveFixedHighCoasts++;
                                         if (consecutiveFixedHighCoasts >= 3) {
                                             autoRegenActive = false;
@@ -1898,6 +1940,26 @@ public final class BrakeEvaluator implements BrakeModel {
             lowPedalCruiseSinceMs = -1L;
             lowDecelFeatherCoastSinceMs = -1L;
         }
+    }
+
+    private static int classifyFastHubCoastingRegenLevel(float decelMps2, float midSpdKmh, int prevLevel) {
+        float l12 = midSpdKmh >= 69.5f ? 0.95f : REGEN_L1_L2_MPS2;
+        float l23 = 1.38f;
+        if (prevLevel == 0) {
+            if (decelMps2 < REGEN_L0_L1_MPS2 + REGEN_HYST_MPS2) return 0;
+        } else if (prevLevel == 1) {
+            if (decelMps2 >= REGEN_L0_L1_MPS2 - REGEN_HYST_MPS2
+                    && decelMps2 < l12 + REGEN_HYST_MPS2) return 1;
+        } else if (prevLevel == 2) {
+            if (decelMps2 >= l12 - REGEN_HYST_MPS2
+                    && decelMps2 < l23 + REGEN_HYST_MPS2) return 2;
+        } else if (prevLevel == 3) {
+            if (decelMps2 >= l23 - REGEN_HYST_MPS2) return 3;
+        }
+        if (decelMps2 < REGEN_L0_L1_MPS2) return 0;
+        if (decelMps2 < l12) return 1;
+        if (decelMps2 < l23) return 2;
+        return 3;
     }
 
     public static int classifyCoastingRegenLevel(float decelMps2, int prevLevel) {

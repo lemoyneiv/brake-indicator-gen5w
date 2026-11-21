@@ -34,8 +34,8 @@ import java.util.Map;
  */
 public final class BrakeEvaluator implements BrakeModel {
 
-    public static final String BUILTIN_MODEL_VERSION = "2026.11.19.2";
-    public static final long BUILTIN_MODEL_SEQ = 2026111902L;
+    public static final String BUILTIN_MODEL_VERSION = "2026.11.20.1";
+    public static final long BUILTIN_MODEL_SEQ = 2026112001L;
 
     public static final int REGEN_LEVEL_UNKNOWN = -1;
     public static final int REGEN_LEVEL_0       = 0;
@@ -545,6 +545,7 @@ public final class BrakeEvaluator implements BrakeModel {
         hasDecelSample = false;
         coastStartMs = -1L;
         lastFootBrakeMs = -1L;
+        lastZeroPedalCoastMs = -1L;
         zeroPedalLiftStartMs = -1L;
         zeroPedalLiftInitDecelMps2 = 0.0f;
         featheredIpedalSinceMs = -1L;
@@ -608,6 +609,7 @@ public final class BrakeEvaluator implements BrakeModel {
 
     private long coastStartMs = -1L;
     private long lastFootBrakeMs = -1L;
+    private long lastZeroPedalCoastMs = -1L;
     private long zeroPedalLiftStartMs = -1L;
     private float zeroPedalLiftInitDecelMps2;
     private long featheredIpedalSinceMs = -1L;
@@ -709,6 +711,7 @@ public final class BrakeEvaluator implements BrakeModel {
         boolean obdFresh = (config.obdMode != IndicatorConfig.ObdMode.DISABLED) && in.obd.isFreshAt(in.nowMs);
         if (Boolean.TRUE.equals(in.gearPark)) {
             lastFootBrakeMs = -1L;
+            lastZeroPedalCoastMs = -1L;
             postBrakeStepConfirmed = false;
             confirmedForwardDrive = false;
         } else if (pressureLatched) {
@@ -1491,7 +1494,7 @@ public final class BrakeEvaluator implements BrakeModel {
             float chordDecel = -(dvKmh / 3.6f) / (dtMs / 1000.0f);
             boolean preservePreSccFixedHigh = smoothedPollIntervalMs < 350.0f
                     && !sccActive
-                    && preSccRegenLevel >= REGEN_LEVEL_2
+                    && preSccRegenLevel >= REGEN_LEVEL_1
                     && !preSccAutoRegen;
             int effSccGuardLevel = preservePreSccFixedHigh ? preSccRegenLevel : inferredRegenLevel;
             if (dvKmh >= 1.4f && chordDecel <= -0.18f) {
@@ -1583,13 +1586,18 @@ public final class BrakeEvaluator implements BrakeModel {
         boolean noFootBrake = footBrakeSettled
                 && in.brakePressure != null
                 && in.brakePressure < COAST_MAX_PRESSURE;
+        if (in.speedKmh != null && in.speedKmh >= 18.0f && in.accelPedal != null && in.accelPedal < COAST_MAX_ACCEL_PCT) {
+            lastZeroPedalCoastMs = effPollMs;
+        }
 
         // Signature A: History-ring settled coasting chord above 21 km/h (L0 / L1 / L2 / L3+)
+        float sigAMaxPressure = smoothedPollIntervalMs < 350.0f ? 0.12f : COAST_MAX_PRESSURE;
         boolean zeroPedalHighSpeed = in.speedKmh != null
                 && in.speedKmh >= COAST_MIN_SPEED_KMH
                 && in.accelPedal != null
                 && in.accelPedal < COAST_MAX_ACCEL_PCT
-                && noFootBrake;
+                && noFootBrake
+                && in.brakePressure < sigAMaxPressure;
 
         if (zeroPedalHighSpeed) {
             if (hasDecelSample && smoothedDecelMps2 < -0.55f) {
@@ -1672,6 +1680,9 @@ public final class BrakeEvaluator implements BrakeModel {
                                     consecutiveSettledL1Coasts++;
                                     if (consecutiveSettledL1Coasts >= 2) {
                                         confirmedZeroRegenCoast = false;
+                                    }
+                                    if (consecutiveSettledL1Coasts >= 3 && (coastMaxChordDecel - coastMinChordDecel) < 0.36f) {
+                                        autoRegenActive = false;
                                     }
                                 }
                             } else if (confirmedZeroRegenCoast && classified >= REGEN_LEVEL_2
@@ -1830,14 +1841,18 @@ public final class BrakeEvaluator implements BrakeModel {
             float featherPromoteMotorDecel = smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh);
             float highFeatherMinAcc = 13.5f + 3.5f * clamp01((spd - 45.0f) / 30.0f);
             float highFeatherMinDecel = spd >= 56.0f ? 0.86f : 0.72f;
+            boolean postCoastSettledForFeather = inferredRegenLevel < REGEN_LEVEL_2
+                    || smoothedPollIntervalMs >= 350.0f
+                    || lastZeroPedalCoastMs < 0L
+                    || (effPollMs - lastZeroPedalCoastMs) >= 950L;
             boolean highFeatherPromote = spd >= 24.0f && spd <= 125.0f
-                    && acc >= highFeatherMinAcc && acc <= 22.5f
-                    && featherPromoteMotorDecel >= highFeatherMinDecel;
+                    && ((acc >= highFeatherMinAcc && acc <= 22.5f && featherPromoteMotorDecel >= highFeatherMinDecel)
+                            || (spd >= 56.0f && spd <= 78.0f && acc >= 20.8f && acc <= 24.0f && featherPromoteMotorDecel >= 0.56f));
             boolean deepFeatherPromote = postBrakeFullySettledForIpedal
                     && spd >= 18.0f && spd <= 44.0f
                     && acc >= 6.8f && acc < 13.5f
                     && featherPromoteMotorDecel >= 1.05f;
-            if (absSteerDeg < 35.0f && (highFeatherPromote || deepFeatherPromote)) {
+            if (postCoastSettledForFeather && absSteerDeg < 35.0f && (highFeatherPromote || deepFeatherPromote)) {
                 if (ipedalFeatherPromoteSinceMs < 0L) {
                     ipedalFeatherPromoteSinceMs = effPollMs;
                 } else if ((effPollMs - ipedalFeatherPromoteSinceMs) >= IPEDAL_FEATHER_PROMOTE_CONFIRM_MS) {
@@ -1855,6 +1870,7 @@ public final class BrakeEvaluator implements BrakeModel {
             //     L3 turn-outs with high steering scrub do not false-promote before straightening)
             float minLaunchDecelMps2 = smoothedPollIntervalMs < 350.0f ? -1.72f : -1.65f;
             if (inferredRegenLevel == REGEN_LEVEL_UNKNOWN
+                    && (absSteerDeg < 50.0f || spd < 17.5f || ipedalLaunchSinceMs >= 0L)
                     && spd >= 8.0f && spd <= 36.0f
                     && acc >= 29.5f && acc <= 38.5f
                     && smoothedDecelMps2 >= minLaunchDecelMps2 && smoothedDecelMps2 <= -0.55f) {
@@ -1913,10 +1929,12 @@ public final class BrakeEvaluator implements BrakeModel {
 
             // 5) Step down stale L2/L3 -> L0 when Auto Regen returns to near-zero coasting (< 0.30 m/s^2)
             float featherMotorDecel = smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh);
+            float maxFeatherStepDownAcc = (autoRegenActive || confirmedZeroRegenCoast || consecutiveFixedHighCoasts == 0)
+                    ? 2.0f : COAST_MAX_ACCEL_PCT;
             if (inferredRegenLevel >= REGEN_LEVEL_2
                     && inferredRegenLevel != REGEN_LEVEL_IPEDAL
                     && spd >= 25.0f
-                    && acc < 2.0f
+                    && acc < maxFeatherStepDownAcc
                     && featherMotorDecel >= -0.15f
                     && featherMotorDecel < 0.30f) {
                 if (lowDecelFeatherCoastSinceMs < 0L) {
@@ -1924,7 +1942,9 @@ public final class BrakeEvaluator implements BrakeModel {
                 } else if ((effPollMs - lowDecelFeatherCoastSinceMs) >= 900L) {
                     inferredRegenLevel = REGEN_LEVEL_0;
                     autoRegenBaseLevel = REGEN_LEVEL_0;
-                    autoRegenActive = true;
+                    if (autoRegenActive || confirmedZeroRegenCoast || consecutiveFixedHighCoasts == 0) {
+                        autoRegenActive = true;
+                    }
                     consecutiveFixedHighCoasts = 0;
                     lowDecelFeatherCoastSinceMs = -1L;
                 }
@@ -1943,7 +1963,7 @@ public final class BrakeEvaluator implements BrakeModel {
     }
 
     private static int classifyFastHubCoastingRegenLevel(float decelMps2, float midSpdKmh, int prevLevel) {
-        float l12 = midSpdKmh >= 69.5f ? 0.95f : REGEN_L1_L2_MPS2;
+        float l12 = (midSpdKmh >= 69.5f || midSpdKmh < 50.0f) ? 0.95f : REGEN_L1_L2_MPS2;
         float l23 = 1.38f;
         if (prevLevel == 0) {
             if (decelMps2 < REGEN_L0_L1_MPS2 + REGEN_HYST_MPS2) return 0;

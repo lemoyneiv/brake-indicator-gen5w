@@ -1593,7 +1593,7 @@ public final class TlsHttpClient {
             }
         }
         if (!hasUa) {
-            sb.append("User-Agent: brake-indicator-gen5w/0.10.0\r\n");
+            sb.append("User-Agent: brake-indicator-gen5w/0.10.1\r\n");
         }
         if (bodyLen > 0 || "PUT".equalsIgnoreCase(method) || "POST".equalsIgnoreCase(method)) {
             sb.append("Content-Length: ").append(bodyLen).append("\r\n");

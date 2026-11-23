@@ -29,7 +29,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Material 3 widescreen dashboard for Brake Light Indicator v0.10.0 on Gen5W (1920x720):
+ * Material 3 widescreen dashboard for Brake Light Indicator v0.10.1 on Gen5W (1920x720):
  *  - Left Control Sidebar: Live brake-lamp & OBD status header card, stadium-pill Material 3
  *    controls (`Mark Log`, `Mode`, `Test (3s)`, `Export USB`, `Upload Cloud`, `Test Cloud`,
  *    `Update Model`, `Clear`, `BLE & Log`, and `Close`), and inline action feedback.
@@ -580,7 +580,7 @@ public final class MainActivity extends Activity
         configSummaryText.setSingleLine(true);
         configSummaryText.setEllipsize(TextUtils.TruncateAt.END);
         configSummaryText.setPadding(0, 4, 0, 0);
-        configSummaryText.setText("v0.10.0 \u00B7 Model " + engine.getActiveModelBadge());
+        configSummaryText.setText("v0.10.1 \u00B7 Model " + engine.getActiveModelBadge());
         sidebarFooterInfo.addView(configSummaryText);
 
         sidebar.addView(sidebarFooterInfo, new LinearLayout.LayoutParams(
@@ -1229,7 +1229,7 @@ public final class MainActivity extends Activity
         }
 
         setTextIfChanged(configSummaryText,
-                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
+                "v0.10.1 \u00B7 Model " + engine.getActiveModelBadge()
                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
         setTextIfChanged(modeToggleBtn, sidebarModeLabel(cfg.obdMode));
 
@@ -1602,7 +1602,7 @@ public final class MainActivity extends Activity
                                 : "";
                         actionNoticeText.setText(out.message + suffix);
                         setTextIfChanged(configSummaryText,
-                                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                "v0.10.1 \u00B7 Model " + engine.getActiveModelBadge()
                                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
                         if (bleLogPanelVisible) {
                             setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));
@@ -1625,7 +1625,7 @@ public final class MainActivity extends Activity
                     public void run() {
                         actionNoticeText.setText(out.message);
                         setTextIfChanged(configSummaryText,
-                                "v0.10.0 \u00B7 Model " + engine.getActiveModelBadge()
+                                "v0.10.1 \u00B7 Model " + engine.getActiveModelBadge()
                                         + " \u00B7 HMG: " + engine.getHmgStatusSummary());
                         if (bleLogPanelVisible) {
                             setTextIfChanged(transitionLogText, engine.getRecorder().recentTransitionsText(35));

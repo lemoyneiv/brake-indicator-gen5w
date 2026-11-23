@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "model_version": "2026.11.20.1",
-  "model_seq": 2026112001,
+  "model_version": "2026.11.22.1",
+  "model_seq": 2026112201,
   "min_host_api": 1,
   "max_host_api": 1,
-  "jar_path": "models/brake-model-2026.11.20.1.jar",
-  "jar_sha256": "3b466aa8b1abee8826a40f046cd8954a045d6fee698a426a9349803f8e634798",
-  "jar_size": 36455
+  "jar_path": "models/brake-model-2026.11.22.1.jar",
+  "jar_sha256": "06c76d74ff9abf3a5a247144ecea8caf1bf59ff22a3b21905993ffe5548b2e50",
+  "jar_size": 37299
 }

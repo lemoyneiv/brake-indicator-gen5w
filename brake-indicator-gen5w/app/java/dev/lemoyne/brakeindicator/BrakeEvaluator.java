@@ -34,8 +34,8 @@ import java.util.Map;
  */
 public final class BrakeEvaluator implements BrakeModel {
 
-    public static final String BUILTIN_MODEL_VERSION = "2026.11.20.1";
-    public static final long BUILTIN_MODEL_SEQ = 2026112001L;
+    public static final String BUILTIN_MODEL_VERSION = "2026.11.22.1";
+    public static final long BUILTIN_MODEL_SEQ = 2026112201L;
 
     public static final int REGEN_LEVEL_UNKNOWN = -1;
     public static final int REGEN_LEVEL_0       = 0;
@@ -546,6 +546,10 @@ public final class BrakeEvaluator implements BrakeModel {
         coastStartMs = -1L;
         lastFootBrakeMs = -1L;
         lastZeroPedalCoastMs = -1L;
+        lastStrongAccelMs = -1L;
+        lastSigAPromoteMs = -1L;
+        preSigAPromoteLevel = REGEN_LEVEL_UNKNOWN;
+        preSigAPromoteAuto = false;
         zeroPedalLiftStartMs = -1L;
         zeroPedalLiftInitDecelMps2 = 0.0f;
         featheredIpedalSinceMs = -1L;
@@ -610,6 +614,10 @@ public final class BrakeEvaluator implements BrakeModel {
     private long coastStartMs = -1L;
     private long lastFootBrakeMs = -1L;
     private long lastZeroPedalCoastMs = -1L;
+    private long lastStrongAccelMs = -1L;
+    private long lastSigAPromoteMs = -1L;
+    private int preSigAPromoteLevel = REGEN_LEVEL_UNKNOWN;
+    private boolean preSigAPromoteAuto = false;
     private long zeroPedalLiftStartMs = -1L;
     private float zeroPedalLiftInitDecelMps2;
     private long featheredIpedalSinceMs = -1L;
@@ -712,9 +720,16 @@ public final class BrakeEvaluator implements BrakeModel {
         if (Boolean.TRUE.equals(in.gearPark)) {
             lastFootBrakeMs = -1L;
             lastZeroPedalCoastMs = -1L;
+            lastStrongAccelMs = -1L;
+            lastSigAPromoteMs = -1L;
             postBrakeStepConfirmed = false;
             confirmedForwardDrive = false;
         } else if (pressureLatched) {
+            if (smoothedPollIntervalMs < 350.0f && lastSigAPromoteMs > 0L && (effPollMs - lastSigAPromoteMs) <= 750L) {
+                inferredRegenLevel = preSigAPromoteLevel;
+                autoRegenActive = preSigAPromoteAuto;
+                lastSigAPromoteMs = -1L;
+            }
             lastFootBrakeMs = effPollMs;
             postBrakeStepConfirmed = false;
             if (in.speedKmh == null || in.speedKmh < 4.5f) {
@@ -1599,8 +1614,15 @@ public final class BrakeEvaluator implements BrakeModel {
                 && noFootBrake
                 && in.brakePressure < sigAMaxPressure;
 
+        if (hasDecelSample && in.accelPedal != null && in.accelPedal >= 30.0f && smoothedDecelMps2 <= -2.2f) {
+            lastStrongAccelMs = effPollMs;
+        }
         if (zeroPedalHighSpeed) {
-            if (hasDecelSample && smoothedDecelMps2 < -0.55f) {
+            boolean postWotUnsettled = smoothedPollIntervalMs < 350.0f
+                    && inferredRegenLevel < REGEN_LEVEL_2
+                    && lastStrongAccelMs > 0L
+                    && (effPollMs - lastStrongAccelMs) < 1200L;
+            if ((hasDecelSample && smoothedDecelMps2 < -0.55f) || postWotUnsettled) {
                 coastStartMs = -1L;
                 coastMinChordDecel = Float.MAX_VALUE;
                 coastMaxChordDecel = -Float.MAX_VALUE;
@@ -1642,8 +1664,14 @@ public final class BrakeEvaluator implements BrakeModel {
                         int prevLevel = inferredRegenLevel;
                         int prevForChord = (inferredRegenLevel == REGEN_LEVEL_IPEDAL)
                                 ? REGEN_LEVEL_3 : inferredRegenLevel;
+                        boolean hasSampleClock = in.hmgSampleElapsedMs > 0L;
                         int classified = (smoothedPollIntervalMs < 350.0f)
-                                ? classifyFastHubCoastingRegenLevel(chordDecel, midSpd, prevForChord)
+                                ? classifyFastHubCoastingRegenLevel(
+                                        chordDecel,
+                                        midSpd,
+                                        prevForChord,
+                                        (!autoRegenActive && hasSampleClock) ? consecutiveSettledL1Coasts : 0,
+                                        hasSampleClock)
                                 : classifyCoastingRegenLevel(chordDecel, prevForChord);
                         boolean ipedalUnsettledRamp = prevLevel == REGEN_LEVEL_IPEDAL
                                 && ((effPollMs - coastStartMs) < 1450L || chordDtMs < COAST_CHORD_PREF_MS);
@@ -1652,7 +1680,22 @@ public final class BrakeEvaluator implements BrakeModel {
                                 && classified == REGEN_LEVEL_2
                                 && (curSpd < 26.5f || (effPollMs - coastStartMs) < 1250L
                                         || (smoothedDecelMps2 - aeroDragExcessMps2(in.speedKmh)) >= 1.16f);
-                        if (!ipedalUnsettledRamp && !l3LowSpeedTaper && !(classified == REGEN_LEVEL_3 && prevLevel == REGEN_LEVEL_IPEDAL)) {
+                        boolean settledL1TransientCrest = prevLevel == REGEN_LEVEL_1
+                                && !autoRegenActive
+                                && consecutiveSettledL1Coasts >= 2
+                                && classified >= REGEN_LEVEL_2
+                                && (effPollMs - coastStartMs) < 2100L;
+                        if (!ipedalUnsettledRamp && !l3LowSpeedTaper && !settledL1TransientCrest
+                                && !(classified == REGEN_LEVEL_3 && prevLevel == REGEN_LEVEL_IPEDAL)) {
+                            boolean armPreBrakeRollback = prevLevel < REGEN_LEVEL_2
+                                    && classified >= REGEN_LEVEL_2
+                                    && ((!autoRegenActive && prevLevel == REGEN_LEVEL_1)
+                                            || (in.brakePressure != null && in.brakePressure >= 0.05f));
+                            if (armPreBrakeRollback) {
+                                lastSigAPromoteMs = effPollMs;
+                                preSigAPromoteLevel = prevLevel;
+                                preSigAPromoteAuto = autoRegenActive;
+                            }
                             inferredRegenLevel = classified;
                         }
 
@@ -1962,14 +2005,17 @@ public final class BrakeEvaluator implements BrakeModel {
         }
     }
 
-    private static int classifyFastHubCoastingRegenLevel(float decelMps2, float midSpdKmh, int prevLevel) {
-        float l12 = (midSpdKmh >= 69.5f || midSpdKmh < 50.0f) ? 0.95f : REGEN_L1_L2_MPS2;
+    private static int classifyFastHubCoastingRegenLevel(
+            float decelMps2, float midSpdKmh, int prevLevel, int fixedL1Coasts, boolean hasSampleClock) {
+        float l12 = (hasSampleClock || midSpdKmh >= 69.5f || midSpdKmh < 50.0f) ? 0.95f : REGEN_L1_L2_MPS2;
         float l23 = 1.38f;
         if (prevLevel == 0) {
             if (decelMps2 < REGEN_L0_L1_MPS2 + REGEN_HYST_MPS2) return 0;
         } else if (prevLevel == 1) {
-            if (decelMps2 >= REGEN_L0_L1_MPS2 - REGEN_HYST_MPS2
-                    && decelMps2 < l12 + REGEN_HYST_MPS2) return 1;
+            float l01Min = fixedL1Coasts >= 2 ? 0.22f : (REGEN_L0_L1_MPS2 - REGEN_HYST_MPS2);
+            float l1HoldMax = fixedL1Coasts >= 2 ? 1.22f : (fixedL1Coasts >= 1 ? 1.12f : (l12 + REGEN_HYST_MPS2));
+            if (decelMps2 >= l01Min
+                    && decelMps2 < l1HoldMax) return 1;
         } else if (prevLevel == 2) {
             if (decelMps2 >= l12 - REGEN_HYST_MPS2
                     && decelMps2 < l23 + REGEN_HYST_MPS2) return 2;

@@ -109,6 +109,7 @@ public final class TestMain {
         testModel202611191PostStopL3GuardAeroStepDownAndHwyRelease();
         testModel202611192ElectronicStandstillAndFastHubL1L2Calibration();
         testModel202611201PreSccL1FixedL1SelfClearAndTurnOutGuard();
+        testModel202611221FixedL1GradeHysteresisWotSettleAndIebRollback();
         testIndicatorConfigModesAndLegacyCompatibility();
         testBrakeEvaluatorCachedSpeedAndObdModes();
         testBrakeEvaluatorLegacyHub650msPollAlignment();
@@ -5161,8 +5162,8 @@ public final class TestMain {
     private static void testModel202611201PreSccL1FixedL1SelfClearAndTurnOutGuard() {
         IndicatorConfig cfg = IndicatorConfig.defaults();
         BrakeEvaluator ev = new BrakeEvaluator();
-        eq("model 2026.11.20.1 version and seq constants",
-                "2026.11.20.1/2026112001",
+        eq("builtin model version and seq match active BUILTIN constants (2026.11.20.1 suite)",
+                BrakeEvaluator.BUILTIN_MODEL_VERSION + "/" + BrakeEvaluator.BUILTIN_MODEL_SEQ,
                 ev.modelVersion() + "/" + ev.modelSeq());
 
         // 1. Pre-SCC fixed L1 preservation: establish fixed L1 (!autoRegenActive), then engage SCC behind a slower car
@@ -5339,6 +5340,144 @@ public final class TestMain {
         }
         eq("2026.11.20.1 66 km/h @ 22.0% feathered braking promotes L3 -> i-Pedal (4)",
                 Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_IPEDAL), Integer.valueOf(snap.inferredRegenLevel));
+    }
+
+    private static void testModel202611221FixedL1GradeHysteresisWotSettleAndIebRollback() {
+        IndicatorConfig cfg = IndicatorConfig.defaults();
+        BrakeEvaluator ev = new BrakeEvaluator();
+        eq("model 2026.11.22.1 version and seq constants",
+                "2026.11.22.1/2026112201",
+                ev.modelVersion() + "/" + ev.modelSeq());
+
+        long t = 10_000L;
+        BrakeEvaluator.Snapshot snap = null;
+
+        // 1. Post-WOT ramp liftoff guard: WOT acceleration (-4.0 m/s^2 to 68.8 km/h) followed immediately by
+        //    a 1.8s steep on-ramp coast (~1.05 m/s^2) must NOT false-promote UNKNOWN -> L2 during the 1.2s post-WOT settle:
+        float rawSpd = 40.0f;
+        for (int i = 0; i < 40; i++) {
+            t += 50L;
+            rawSpd += 0.72f; // ~-4.0 m/s^2 WOT acceleration
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(96.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        for (int i = 0; i < 40; i++) { // 2.0s total (< 1.2s WOT settle + 1.5s chord min = 2.7s)
+            t += 50L;
+            rawSpd -= 0.195f; // ~1.08 m/s^2 steep ramp coast right off WOT
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.22.1 post-WOT steep on-ramp coast does not false-promote UNKNOWN -> L2",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_UNKNOWN), Integer.valueOf(snap.inferredRegenLevel));
+
+        // 2. Establish multi-coast confirmed fixed L1 (2 settled ~0.62 m/s^2 coasts), then verify:
+        //    - downhill coast (~0.28 m/s^2 >= 0.22 m/s^2) stays fixed L1 (not L0)
+        //    - uphill coast (~1.14 m/s^2 < 1.22 m/s^2) stays fixed L1 (not L2) & keeps brake lamp OFF
+        for (int c = 0; c < 2; c++) {
+            for (int i = 0; i < 16; i++) {
+                t += 50L;
+                ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, Float.valueOf(0.0f), Float.valueOf(64.0f), Float.valueOf(18.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            }
+            rawSpd = 64.0f;
+            for (int i = 0; i < 44; i++) {
+                t += 50L;
+                rawSpd -= 0.120f; // ~0.62 m/s^2 motor decel -> settled fixed L1
+                float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+                snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                        t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                        Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                        BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+            }
+        }
+        eq("2026.11.22.1 2 settled coasts confirm fixed L1",
+                "1/false", snap.inferredRegenLevel + "/" + snap.autoRegenActive);
+
+        // Downhill L1 coast (~0.28 m/s^2 motor decel at 60 km/h -> total ~0.32 m/s^2):
+        for (int i = 0; i < 14; i++) {
+            t += 50L;
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(60.0f), Float.valueOf(15.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        rawSpd = 60.0f;
+        for (int i = 0; i < 44; i++) {
+            t += 50L;
+            rawSpd -= 0.058f; // ~0.28 m/s^2 motor decel (>= 0.22 m/s^2 floor)
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.22.1 downhill ~0.28 m/s^2 coast in confirmed fixed L1 stays L1 (not L0)",
+                "1/false", snap.inferredRegenLevel + "/" + snap.autoRegenActive);
+
+        // Uphill L1 coast (~1.14 m/s^2 motor decel at 58 km/h < 1.22 m/s^2 ceiling):
+        for (int i = 0; i < 14; i++) {
+            t += 50L;
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(60.0f), Float.valueOf(15.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        rawSpd = 60.0f;
+        for (int i = 0; i < 48; i++) {
+            t += 50L;
+            rawSpd -= 0.210f; // ~1.14 m/s^2 motor decel (< 1.22 m/s^2 ceiling)
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.22.1 uphill ~1.14 m/s^2 coast in confirmed fixed L1 stays L1 (not L2)",
+                "1/false", snap.inferredRegenLevel + "/" + snap.autoRegenActive);
+
+        // 3. Pre-hydraulic IEB cooperative brake-blending rollback:
+        //    In fixed L1, if brake-pedal lead-in briefly spikes decel >= 1.25 m/s^2 (1 -> 2) and hydraulic
+        //    pressure latches (1.2 bar) within <= 750 ms, inferredRegenLevel rolls back to fixed L1!
+        for (int i = 0; i < 14; i++) {
+            t += 50L;
+            ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(56.0f), Float.valueOf(15.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        rawSpd = 56.0f;
+        for (int i = 0; i < 48; i++) {
+            t += 50L;
+            rawSpd -= 0.240f; // ~1.30 m/s^2 pre-hydraulic IEB regen blending -> promotes 1 -> 2 at ~2.1s
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(0.0f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.22.1 sustained 1.30 m/s^2 promotes L1 -> L2 before hydraulic latch",
+                Integer.valueOf(BrakeEvaluator.REGEN_LEVEL_2), Integer.valueOf(snap.inferredRegenLevel));
+        // 300 ms later (<= 750 ms), hydraulic brake pressure crosses threshold (1.2 bar): rolls back to fixed L1!
+        for (int i = 0; i < 6; i++) {
+            t += 50L;
+            rawSpd -= 0.280f;
+            float qSpd = Math.round(rawSpd / 0.8f) * 0.8f;
+            snap = ev.evaluate(cfg, new BrakeEvaluator.Input(
+                    t, Float.valueOf(1.20f), Float.valueOf(qSpd), Float.valueOf(0.0f), Float.valueOf(0.0f),
+                    Boolean.FALSE, Boolean.FALSE, Boolean.TRUE, Float.valueOf(75.0f),
+                    BrakeEvaluator.ObdSample.disconnected(), 0L, -1, t));
+        }
+        eq("2026.11.22.1 hydraulic brake latch within <=750 ms rolls IEB pre-brake promotion back to L1",
+                "1/false/BRAKE_PRESSURE",
+                snap.inferredRegenLevel + "/" + snap.autoRegenActive + "/" + snap.modelSource);
     }
 
     private static byte[] makeValidDexStub() {

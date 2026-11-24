@@ -119,6 +119,7 @@ public final class TestMain {
         testHevRegenProbeSafetyAndBaselineDiff();
         testTelemetryRecorderScoringAndCsv();
         testUsbExporterMountsAndAtomicWrite();
+        testV0103StandbyPowerGating();
 
         System.out.println(passed + " ok, " + failed + " failed");
         if (failed > 0) {
@@ -1091,8 +1092,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.10.2 with Active Brake Model",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.2 Calibration Summary")
+        eq("Summary banner is v0.10.3 with Active Brake Model",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.3 Calibration Summary")
                         && summary.contains("Active Brake Model  :")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
@@ -5761,6 +5762,87 @@ public final class TestMain {
             for (File c : children) deleteRecursive(c);
         }
         f.delete();
+    }
+
+    private static void testV0103StandbyPowerGating() throws Exception {
+        eq("power=on is active", Boolean.TRUE, Boolean.valueOf(HmgVehiclePoller.isVehiclePowerActive("on")));
+        eq("power=null/empty fails open as active",
+                Boolean.TRUE,
+                Boolean.valueOf(HmgVehiclePoller.isVehiclePowerActive(null)
+                        && HmgVehiclePoller.isVehiclePowerActive("")));
+        eq("power=adm/delay_mode/preparing_off/off are standby (inactive)",
+                Boolean.TRUE,
+                Boolean.valueOf(!HmgVehiclePoller.isVehiclePowerActive("adm")
+                        && !HmgVehiclePoller.isVehiclePowerActive("delay_mode")
+                        && !HmgVehiclePoller.isVehiclePowerActive("preparing_off")
+                        && !HmgVehiclePoller.isVehiclePowerActive("off")
+                        && !HmgVehiclePoller.isVehiclePowerActive("logic_on")));
+
+        final ServerSocket mockBle = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        final Socket cliSock = new Socket("127.0.0.1", mockBle.getLocalPort());
+        final Socket srvSock = mockBle.accept();
+        mockBle.close();
+        cliSock.setTcpNoDelay(true);
+        srvSock.setTcpNoDelay(true);
+        final BufferedWriter w = new BufferedWriter(new OutputStreamWriter(srvSock.getOutputStream(), "UTF-8"));
+        final List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+        Thread acceptThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    BufferedReader rdr = new BufferedReader(new InputStreamReader(srvSock.getInputStream(), "UTF-8"));
+                    String l;
+                    while ((l = rdr.readLine()) != null) {
+                        String trimmed = l.trim();
+                        synchronized (lines) {
+                            lines.add(trimmed);
+                            lines.notifyAll();
+                        }
+                        if ("STREAM_SESSION".equals(trimmed)) {
+                            sendBleServerEvent(w, "OK STREAM_READY");
+                        } else if ("CLOSE".equals(trimmed)) {
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }, "MockBleV0103");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+
+        Closeable closeBoth = new Closeable() {
+            @Override
+            public void close() {
+                try { srvSock.close(); } catch (Throwable ignored) {}
+                try { cliSock.close(); } catch (Throwable ignored) {}
+            }
+        };
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        store.save("AA:11:22:33:44:55", "VEEPEAK", 0);
+        ObdBrakeClient client = ObdBrakeClient.createForTest(
+                store, cliSock.getInputStream(), cliSock.getOutputStream(), closeBoth, 35998);
+        try {
+            waitForBleLine(lines, "MULTICONN 1", 1000L);
+            eq("Direct BLE allowed while vehiclePowerOn=true",
+                    Boolean.TRUE, Boolean.valueOf(client.canAttemptDirectBleNowForTest()));
+
+            // Enter Dark Standby (power=adm -> setVehiclePowerOn(false)) -> closes @hmgapi-ble session & pauses BLE!
+            client.setVehiclePowerOn(false);
+            eq("vehiclePowerOn reflects standby", Boolean.FALSE, Boolean.valueOf(client.isVehiclePowerOn()));
+            eq("Direct BLE blocked during standby",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleNowForTest()));
+            eq("BLE session closed cleanly on standby transition",
+                    null, client.getBleSessionForTest());
+            eq("Status reports standby BLE paused",
+                    "Standby (vehicle off — BLE paused)", client.getStatusSummary());
+
+            // Resume IG ON -> vehiclePowerOn=true again
+            client.setVehiclePowerOn(true);
+            eq("vehiclePowerOn restored on IG ON", Boolean.TRUE, Boolean.valueOf(client.isVehiclePowerOn()));
+        } finally {
+            client.close();
+            closeBoth.close();
+        }
     }
 
     private static void eq(String name, Object expected, Object actual) {

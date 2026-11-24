@@ -131,6 +131,7 @@ public final class ObdBrakeClient {
 
     private final AtomicBoolean stopped = new AtomicBoolean(false);
     private volatile boolean enabled = true;
+    private volatile boolean vehiclePowerOn = true;
     private volatile int bridgePort = 35000;
 
     // Paired BLE adapter metadata
@@ -267,6 +268,42 @@ public final class ObdBrakeClient {
         }
     }
 
+    public void setVehiclePowerOn(boolean powerOn) {
+        boolean prev = this.vehiclePowerOn;
+        this.vehiclePowerOn = powerOn;
+        if (prev != powerOn) {
+            if (powerOn) {
+                resetBleRetryState();
+            } else if (testMode && !manualScanActive) {
+                disconnectActiveTransports("Standby (vehicle off — BLE paused)", true);
+            }
+            wakeCoordinator();
+        }
+    }
+
+    public boolean isVehiclePowerOn() {
+        return vehiclePowerOn;
+    }
+
+    static boolean isBluetoothAdapterOffQuiet() {
+        try {
+            Class<?> cls = Class.forName("android.bluetooth.BluetoothAdapter");
+            Object adapter = cls.getMethod("getDefaultAdapter").invoke(null);
+            if (adapter == null) return false;
+            Object stObj = cls.getMethod("getState").invoke(adapter);
+            if (stObj instanceof Integer) {
+                int st = ((Integer) stObj).intValue();
+                if (st == 10 || st == 13) return true;
+            }
+            Object enObj = cls.getMethod("isEnabled").invoke(adapter);
+            if (enObj instanceof Boolean && !((Boolean) enObj).booleanValue()) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     public void applyConfig(IndicatorConfig cfg) {
         if (cfg == null) return;
         boolean wantEnabled = (cfg.obdMode != IndicatorConfig.ObdMode.DISABLED);
@@ -354,6 +391,7 @@ public final class ObdBrakeClient {
                 && !bleGattRejected
                 && !bleScanning
                 && !manualScanActive
+                && vehiclePowerOn
                 && System.currentTimeMillis() >= nextBleReconnectMs;
     }
 
@@ -684,6 +722,12 @@ public final class ObdBrakeClient {
         if (testMode || stopped.get() || !enabled) {
             return existing;
         }
+        if (!vehiclePowerOn && !manualScanActive) {
+            return null;
+        }
+        if (isBluetoothAdapterOffQuiet()) {
+            return null;
+        }
         synchronized (sessionOpenLock) {
             existing = bleSession;
             if (existing != null && existing.isOpen()) {
@@ -726,6 +770,29 @@ public final class ObdBrakeClient {
         while (!stopped.get()) {
             if (!enabled) {
                 waitCoordinator(1000L);
+                continue;
+            }
+
+            if (!vehiclePowerOn && !manualScanActive) {
+                if (bleSession != null || bridgeConnected || bleConnected || bleConnecting) {
+                    disconnectActiveTransports("Standby (vehicle off — BLE paused)", true);
+                } else if (!"Standby (vehicle off — BLE paused)".equals(statusSummary)) {
+                    statusSummary = "Standby (vehicle off — BLE paused)";
+                    notifyListeners();
+                }
+                waitCoordinator(2500L);
+                continue;
+            }
+
+            if (!testMode && !manualScanActive && isBluetoothAdapterOffQuiet()) {
+                if (bleSession != null || bleConnected || bleConnecting) {
+                    recycleBleSession();
+                }
+                if (!"Standby (Bluetooth off)".equals(statusSummary)) {
+                    statusSummary = "Standby (Bluetooth off)";
+                    notifyListeners();
+                }
+                waitCoordinator(2500L);
                 continue;
             }
 
@@ -788,6 +855,7 @@ public final class ObdBrakeClient {
                     && !bleGattRejected
                     && !bleScanning
                     && !manualScanActive
+                    && vehiclePowerOn
                     && now >= nextBleReconnectMs;
 
             if (canTryDirectBle) {
@@ -803,7 +871,7 @@ public final class ObdBrakeClient {
                             emitDiagnostic("OBD BLE wake-scan: "
                                     + shortName(pairedName, pairedMac) + " not advertising");
                         }
-                        if (!s.isOpen() || !enabled || stopped.get() || manualScanActive) {
+                        if (!s.isOpen() || !enabled || !vehiclePowerOn || stopped.get() || manualScanActive) {
                             continue;
                         }
                     }
@@ -846,7 +914,7 @@ public final class ObdBrakeClient {
             synchronized (discoveredCharsByMac) {
                 charProps = discoveredCharsByMac.get(pairedMac);
             }
-            for (int i = 1; i < all.size() && bleConnected && enabled && !stopped.get(); i++) {
+            for (int i = 1; i < all.size() && bleConnected && enabled && vehiclePowerOn && !stopped.get(); i++) {
                 Elm327BrakeProtocol.GattBinding next = all.get(i);
                 synchronized (notifyReadyLock) {
                     lastNotifyReadyUuid = "";
@@ -861,7 +929,7 @@ public final class ObdBrakeClient {
             }
         }
 
-        for (int i = 0; i < Elm327BrakeProtocol.IGMP_INIT_COMMANDS.length && bleConnected && enabled; i++) {
+        for (int i = 0; i < Elm327BrakeProtocol.IGMP_INIT_COMMANDS.length && bleConnected && enabled && vehiclePowerOn; i++) {
             sendBleCommandBlocking(Elm327BrakeProtocol.IGMP_INIT_COMMANDS[i], 900L);
         }
 
@@ -871,7 +939,7 @@ public final class ObdBrakeClient {
         long windowStartMs = System.currentTimeMillis();
         long lastBridgeProbeMs = windowStartMs;
 
-        while (bleConnected && bleBinding != null && enabled && !stopped.get()) {
+        while (bleConnected && bleBinding != null && enabled && vehiclePowerOn && !stopped.get()) {
             long nowCheck = System.currentTimeMillis();
             if (!testMode && nowCheck - lastBridgeProbeMs >= 10000L && nowCheck >= bridgeRetryAfterMs) {
                 lastBridgeProbeMs = nowCheck;

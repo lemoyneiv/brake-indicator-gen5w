@@ -52,6 +52,18 @@ public final class HmgVehiclePoller {
 
     private HmgVehiclePoller() {}
 
+    /**
+     * Returns {@code true} when HMG-API's {@code power} reading indicates ignition/ACC is active
+     * ({@code "on"}), or when {@code power} is absent/empty (fail-open for older hubs/tests).
+     * Returns {@code false} during parked/standby states ({@code "adm"}, {@code "logic_on"},
+     * {@code "system_ready"}, {@code "delay_mode"}, {@code "preparing_off"}, {@code "off"}).
+     */
+    public static boolean isVehiclePowerActive(String power) {
+        if (power == null) return true;
+        String p = power.trim();
+        return p.isEmpty() || "on".equalsIgnoreCase(p);
+    }
+
     public static PollResult readVehicle(String[] names, int initialTimeoutMs, int postOutputExitTimeoutMs) {
         return readVehicleFromSocket(DEFAULT_SOCKET, LocalSocketAddress.Namespace.ABSTRACT,
                 names, initialTimeoutMs, postOutputExitTimeoutMs);

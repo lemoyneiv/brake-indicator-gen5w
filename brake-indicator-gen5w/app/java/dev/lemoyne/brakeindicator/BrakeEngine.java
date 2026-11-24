@@ -68,6 +68,7 @@ public final class BrakeEngine {
     private static final String KEY_CLOUD_API_PORT = "api_port";
 
     private static final String[] VEHICLE_READINGS = {
+        "power",
         "brake.pressure",
         "speed",
         "pedal.accel",
@@ -80,8 +81,10 @@ public final class BrakeEngine {
 
     private static final long EVAL_INTERVAL_MS = 50L;
     private static final long LEGACY_HUB_POLL_MS = 650L;
+    private static final long STANDBY_IDLE_POLL_MS = 1000L;
     private static final long HMG_RETRY_MS = 250L;
     private static final long HMG_FRESH_MAX_MS = 1800L;
+    private static final long STANDBY_HMG_FRESH_MAX_MS = 2800L;
     private static final long SETTINGS_REFRESH_MS = 3000L;
 
     private static BrakeEngine sInstance;
@@ -767,7 +770,13 @@ public final class BrakeEngine {
                 if (res.ok && !res.readings.isEmpty()) {
                     long pollAt = obdClient.monotonicMs();
                     latestHmgPoll = new HmgPollSnapshot(res.readings, pollAt, res.legacyHubStall);
-                    targetPeriodMs = res.legacyHubStall ? LEGACY_HUB_POLL_MS : EVAL_INTERVAL_MS;
+                    boolean powerOn = HmgVehiclePoller.isVehiclePowerActive(res.readings.get("power"));
+                    obdClient.setVehiclePowerOn(powerOn);
+                    if (!powerOn) {
+                        targetPeriodMs = STANDBY_IDLE_POLL_MS;
+                    } else {
+                        targetPeriodMs = res.legacyHubStall ? LEGACY_HUB_POLL_MS : EVAL_INTERVAL_MS;
+                    }
                 } else {
                     targetPeriodMs = HMG_RETRY_MS;
                 }
@@ -790,17 +799,21 @@ public final class BrakeEngine {
         boolean sawOutOfParkForModel = false;
         while (running.get()) {
             long tickStartMono = obdClient.monotonicMs();
+            boolean powerOn = true;
             try {
                 HmgPollSnapshot hmgSnap = latestHmgPoll;
                 long hmgAt = hmgSnap.monoMs;
+                boolean snapPowerOn = HmgVehiclePoller.isVehiclePowerActive(hmgSnap.readings.get("power"));
+                long freshMaxMs = snapPowerOn ? HMG_FRESH_MAX_MS : STANDBY_HMG_FRESH_MAX_MS;
                 boolean okHmg = hmgAt > 0L
                         && (tickStartMono - hmgAt) >= 0L
-                        && (tickStartMono - hmgAt) <= HMG_FRESH_MAX_MS
+                        && (tickStartMono - hmgAt) <= freshMaxMs
                         && !hmgSnap.readings.isEmpty();
                 hmgConnected = okHmg;
                 Map<String, String> readings = okHmg
                         ? hmgSnap.readings
                         : Collections.<String, String>emptyMap();
+                powerOn = !okHmg || HmgVehiclePoller.isVehiclePowerActive(readings.get("power"));
                 long hmgSampleElapsedMs = okHmg ? hmgAt : -1L;
 
                 IndicatorConfig cfg = config;
@@ -824,7 +837,9 @@ public final class BrakeEngine {
                 BrakeEvaluator.Snapshot snap =
                         modelManager.evaluateTick(cfg, input, readings, recorder, tickStartMono);
                 latestSnapshot = snap;
-                recorder.record(snap, System.currentTimeMillis());
+                if (powerOn || Boolean.FALSE.equals(snap.gearPark)) {
+                    recorder.record(snap, System.currentTimeMillis());
+                }
 
                 if (Boolean.FALSE.equals(snap.gearPark)) {
                     sawOutOfParkForModel = true;
@@ -903,10 +918,10 @@ public final class BrakeEngine {
             }
 
             long spent = obdClient.monotonicMs() - tickStartMono;
-            long sleep = EVAL_INTERVAL_MS - spent;
-            if (sleep > 2L) {
+            long targetSleep = (powerOn ? EVAL_INTERVAL_MS : STANDBY_IDLE_POLL_MS) - spent;
+            if (targetSleep > 2L) {
                 try {
-                    Thread.sleep(sleep);
+                    Thread.sleep(targetSleep);
                 } catch (InterruptedException ie) {
                     break;
                 }

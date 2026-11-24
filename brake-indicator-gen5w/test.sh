@@ -54,7 +54,7 @@ has "plan lists BrakeIndicator.apk" "dev.lemoyne.brakeindicator (app/BrakeIndica
 has "plan lists non-root starter service as system" "service  brake-indicator-gen5w/starter as system, at android" "$out"
 has "plan lists BLE central" "ble      BLE scanner and GATT central" "$out"
 has "plan lists USB folder" "usb      BrakeIndicator/ on a stick" "$out"
-for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
+for sig in power brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
     has "plan lists $sig reading" "$sig" "$out"
 done
 check "plan has zero problems" no "$(echo "$out" | grep -q '^problem ' && echo yes || echo no)"
@@ -72,7 +72,7 @@ has "default usb_backup_when_cloud is in state.json" '"usb_backup_when_cloud":fa
 has "default auto_update_model is in state.json" '"auto_update_model":true' "$(tr -d ' \n' < "$R/data/hmgapi/public/state.json")"
 has "starter registered in services.txt as system" "brake-indicator-gen5w starter system android no script svc/start.sh -" "$(cat "$R/data/hmgapi/state/services.txt")"
 has "vehicle hub auto-enabled in services.txt" "hmgapi vehicle root android yes jar" "$(cat "$R/data/hmgapi/state/services.txt")"
-for sig in brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
+for sig in power brake.pressure speed pedal.accel gear.park parking_brake moving steering.angle hv.soc; do
     has "$sig in vehicle.txt" "brake-indicator-gen5w $sig" "$(cat "$R/data/hmgapi/state/vehicle.txt")"
 done
 

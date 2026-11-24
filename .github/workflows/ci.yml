@@ -25,6 +25,6 @@ jobs:
           test "$w" = "$s" || { echo "ci.yml calls mod.yml@$w, hmgapi-sdk.json pins $s"; exit 1; }
 
   mod:
-    uses: lemoyneiv/HMG-API/.github/workflows/mod.yml@a630d98c0235e81f0f503a93731f894ade05d5c9
+    uses: lemoyneiv/HMG-API/.github/workflows/mod.yml@158d779ee1e179111159b996c3a24d30babba691
     with:
       hmgapi-repo: lemoyneiv/HMG-API

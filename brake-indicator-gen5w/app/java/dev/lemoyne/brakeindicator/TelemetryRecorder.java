@@ -1309,7 +1309,7 @@ public final class TelemetryRecorder {
             String exportTriggerLabel) {
         ScoreSnapshot sc = scoreSnapshot();
         StringBuilder sb = new StringBuilder(2800);
-        sb.append("=== Brake Light Indicator v0.10.1 Calibration Summary ===\n");
+        sb.append("=== Brake Light Indicator v0.10.2 Calibration Summary ===\n");
         sb.append("Export Time         : ")
           .append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(new Date()))
           .append('\n');

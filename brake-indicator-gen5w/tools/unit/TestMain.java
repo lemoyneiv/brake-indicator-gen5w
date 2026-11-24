@@ -1091,8 +1091,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.10.1 with Active Brake Model",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.1 Calibration Summary")
+        eq("Summary banner is v0.10.2 with Active Brake Model",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.2 Calibration Summary")
                         && summary.contains("Active Brake Model  :")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")

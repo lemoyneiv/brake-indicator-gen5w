@@ -129,9 +129,32 @@ public final class ObdBrakeClient {
     private final Object notifyReadyLock = new Object();
     private String lastNotifyReadyUuid = "";
 
+    public static final long COLD_BOOT_PARK_DEFER_MS = 45_000L;
+    public static final long BT_ON_SETTLE_MS = 2_500L;
+    static final String STATUS_COLD_BOOT_PARK = "Standby (cold-boot AA/CarPlay priority in Park)";
+    static final String STATUS_BT_SETTLING = "Standby (Bluetooth settling...)";
+
+    private static final java.lang.reflect.Method SYSTEM_ELAPSED_METHOD = resolveSystemElapsedMethod();
+
+    private static java.lang.reflect.Method resolveSystemElapsedMethod() {
+        try {
+            return Class.forName("android.os.SystemClock").getMethod("elapsedRealtime");
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private final AtomicBoolean stopped = new AtomicBoolean(false);
     private volatile boolean enabled = true;
     private volatile boolean vehiclePowerOn = true;
+    private volatile boolean inParkAtRest;
+    private volatile boolean uiFocused = false;
+    private volatile boolean manualConnectOverride = false;
+    private volatile boolean coldBootParkGateReleased;
+    private volatile boolean sawBtNotOn = false;
+    private volatile long btStateOnSinceMonoMs = 0L;
+    private volatile long testBootElapsedOverrideMs = Long.MIN_VALUE;
+    private volatile int testBtStateOverride = Integer.MIN_VALUE;
     private volatile int bridgePort = 35000;
 
     // Paired BLE adapter metadata
@@ -180,6 +203,8 @@ public final class ObdBrakeClient {
     private ObdBrakeClient(PairingStore store, boolean testMode) {
         this.store = store;
         this.testMode = testMode;
+        this.inParkAtRest = !testMode;
+        this.coldBootParkGateReleased = testMode;
         if (store != null) {
             this.pairedMac = safeUpper(store.getMac());
             this.pairedName = store.getName() == null ? "" : store.getName();
@@ -285,23 +310,152 @@ public final class ObdBrakeClient {
         return vehiclePowerOn;
     }
 
-    static boolean isBluetoothAdapterOffQuiet() {
+    public void setInParkAtRest(boolean inParkAtRest) {
+        boolean prev = this.inParkAtRest;
+        this.inParkAtRest = inParkAtRest;
+        if (!inParkAtRest && !this.coldBootParkGateReleased) {
+            this.coldBootParkGateReleased = true;
+            wakeCoordinator();
+        } else if (prev != inParkAtRest) {
+            wakeCoordinator();
+        }
+    }
+
+    public boolean isInParkAtRest() {
+        return inParkAtRest;
+    }
+
+    public void setUiFocused(boolean focused) {
+        boolean prev = this.uiFocused;
+        this.uiFocused = focused;
+        if (focused && !this.coldBootParkGateReleased) {
+            this.coldBootParkGateReleased = true;
+            wakeCoordinator();
+        } else if (prev != focused) {
+            wakeCoordinator();
+        }
+    }
+
+    public static boolean shouldDeferColdBootInPark(
+            long bootElapsedMs,
+            boolean gateAlreadyReleased,
+            boolean inParkAtRest,
+            boolean uiFocused,
+            boolean manualActionActive) {
+        if (gateAlreadyReleased || !inParkAtRest || uiFocused || manualActionActive) {
+            return false;
+        }
+        return bootElapsedMs >= 0L && bootElapsedMs < COLD_BOOT_PARK_DEFER_MS;
+    }
+
+    long currentBootElapsedMs() {
+        long ov = testBootElapsedOverrideMs;
+        if (ov != Long.MIN_VALUE) {
+            return ov;
+        }
+        if (SYSTEM_ELAPSED_METHOD != null) {
+            try {
+                Object v = SYSTEM_ELAPSED_METHOD.invoke(null);
+                if (v instanceof Long) {
+                    return ((Long) v).longValue();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return -1L;
+    }
+
+    boolean isColdBootParkDeferredNow() {
+        long bootEl = currentBootElapsedMs();
+        if (bootEl >= COLD_BOOT_PARK_DEFER_MS) {
+            coldBootParkGateReleased = true;
+            return false;
+        }
+        boolean deferred = shouldDeferColdBootInPark(
+                bootEl,
+                coldBootParkGateReleased,
+                inParkAtRest,
+                uiFocused,
+                manualScanActive || manualConnectOverride);
+        if (!deferred && bootEl >= 0L) {
+            coldBootParkGateReleased = true;
+        }
+        return deferred;
+    }
+
+    void configureColdBootForTest(long bootElapsedMs, boolean inParkAtRest) {
+        this.testBootElapsedOverrideMs = bootElapsedMs;
+        this.inParkAtRest = inParkAtRest;
+        this.uiFocused = false;
+        this.manualConnectOverride = false;
+        this.coldBootParkGateReleased = false;
+        if (isColdBootParkDeferredNow() && !STATUS_COLD_BOOT_PARK.equals(statusSummary)) {
+            statusSummary = STATUS_COLD_BOOT_PARK;
+        }
+    }
+
+    void setBootElapsedOverrideForTest(long bootElapsedMs) {
+        this.testBootElapsedOverrideMs = bootElapsedMs;
+        isColdBootParkDeferredNow();
+    }
+
+    void setBluetoothStateOverrideForTest(int btState, long nowMonoMs) {
+        this.testBtStateOverride = btState;
+        updateBluetoothStateSettleRemainingMs(btState, currentBootElapsedMs(), nowMonoMs);
+    }
+
+    static int readBluetoothAdapterStateQuiet() {
         try {
             Class<?> cls = Class.forName("android.bluetooth.BluetoothAdapter");
             Object adapter = cls.getMethod("getDefaultAdapter").invoke(null);
-            if (adapter == null) return false;
+            if (adapter == null) return 12;
             Object stObj = cls.getMethod("getState").invoke(adapter);
             if (stObj instanceof Integer) {
-                int st = ((Integer) stObj).intValue();
-                if (st == 10 || st == 13) return true;
+                return ((Integer) stObj).intValue();
             }
             Object enObj = cls.getMethod("isEnabled").invoke(adapter);
             if (enObj instanceof Boolean && !((Boolean) enObj).booleanValue()) {
-                return true;
+                return 10;
             }
         } catch (Throwable ignored) {
         }
-        return false;
+        return 12;
+    }
+
+    int currentBluetoothAdapterState() {
+        int ov = testBtStateOverride;
+        return ov != Integer.MIN_VALUE ? ov : readBluetoothAdapterStateQuiet();
+    }
+
+    static boolean isBluetoothAdapterOffQuiet() {
+        return readBluetoothAdapterStateQuiet() != 12;
+    }
+
+    long updateBluetoothStateSettleRemainingMs(int btState, long bootElapsedMs, long nowMonoMs) {
+        if (btState != 12) {
+            sawBtNotOn = true;
+            btStateOnSinceMonoMs = 0L;
+            return -1L;
+        }
+        long onSince = btStateOnSinceMonoMs;
+        if (onSince <= 0L) {
+            if (sawBtNotOn || (bootElapsedMs >= 0L && bootElapsedMs < 15_000L)) {
+                onSince = Math.max(1L, nowMonoMs);
+            } else {
+                onSince = Math.max(1L, nowMonoMs - BT_ON_SETTLE_MS);
+            }
+            btStateOnSinceMonoMs = onSince;
+        }
+        long elapsedOn = Math.max(0L, nowMonoMs - onSince);
+        return elapsedOn >= BT_ON_SETTLE_MS ? 0L : (BT_ON_SETTLE_MS - elapsedOn);
+    }
+
+    long btSettleRemainingNowMs(long nowMonoMs) {
+        if (testMode && testBtStateOverride == Integer.MIN_VALUE) {
+            return 0L;
+        }
+        int st = currentBluetoothAdapterState();
+        return updateBluetoothStateSettleRemainingMs(st, currentBootElapsedMs(), nowMonoMs);
     }
 
     public void applyConfig(IndicatorConfig cfg) {
@@ -384,7 +538,12 @@ public final class ObdBrakeClient {
     }
 
     boolean canAttemptDirectBleNowForTest() {
+        return canAttemptDirectBleAtMonoForTest(monotonicMs());
+    }
+
+    boolean canAttemptDirectBleAtMonoForTest(long nowMonoMs) {
         Ble s = bleSession;
+        long btRem = btSettleRemainingNowMs(nowMonoMs);
         return s != null
                 && s.isOpen()
                 && !pairedMac.isEmpty()
@@ -392,6 +551,8 @@ public final class ObdBrakeClient {
                 && !bleScanning
                 && !manualScanActive
                 && vehiclePowerOn
+                && !isColdBootParkDeferredNow()
+                && btRem == 0L
                 && System.currentTimeMillis() >= nextBleReconnectMs;
     }
 
@@ -404,6 +565,8 @@ public final class ObdBrakeClient {
         synchronized (discovered) {
             discovered.clear();
         }
+        manualConnectOverride = true;
+        coldBootParkGateReleased = true;
         manualScanActive = true;
         bleScanning = true;
         final int gen = ++scanGeneration;
@@ -500,6 +663,8 @@ public final class ObdBrakeClient {
         if (store != null) {
             store.save(cleanMac, cleanName, addrType);
         }
+        manualConnectOverride = true;
+        coldBootParkGateReleased = true;
         resetBleRetryState();
         manualScanActive = false;
         scanGeneration++;
@@ -562,6 +727,8 @@ public final class ObdBrakeClient {
     }
 
     public void requestReconnect() {
+        manualConnectOverride = true;
+        coldBootParkGateReleased = true;
         manualScanActive = false;
         scanGeneration++;
         resetBleRetryState();
@@ -725,8 +892,21 @@ public final class ObdBrakeClient {
         if (!vehiclePowerOn && !manualScanActive) {
             return null;
         }
-        if (isBluetoothAdapterOffQuiet()) {
+        if (!manualScanActive && !manualConnectOverride && isColdBootParkDeferredNow()) {
             return null;
+        }
+        long btRem = btSettleRemainingNowMs(monotonicMs());
+        if (btRem < 0L) {
+            return null;
+        }
+        if (btRem > 0L) {
+            if (!manualScanActive && !manualConnectOverride) {
+                return null;
+            }
+            sleepQuiet(Math.min(btRem, BT_ON_SETTLE_MS));
+            if (btSettleRemainingNowMs(monotonicMs()) < 0L) {
+                return null;
+            }
         }
         synchronized (sessionOpenLock) {
             existing = bleSession;
@@ -784,16 +964,38 @@ public final class ObdBrakeClient {
                 continue;
             }
 
-            if (!testMode && !manualScanActive && isBluetoothAdapterOffQuiet()) {
-                if (bleSession != null || bleConnected || bleConnecting) {
-                    recycleBleSession();
-                }
-                if (!"Standby (Bluetooth off)".equals(statusSummary)) {
-                    statusSummary = "Standby (Bluetooth off)";
+            if (!testMode && !manualScanActive && isColdBootParkDeferredNow()) {
+                if (!STATUS_COLD_BOOT_PARK.equals(statusSummary)) {
+                    statusSummary = STATUS_COLD_BOOT_PARK;
                     notifyListeners();
                 }
-                waitCoordinator(2500L);
+                long bootEl = Math.max(0L, currentBootElapsedMs());
+                long waitMs = Math.max(250L, Math.min(2500L, COLD_BOOT_PARK_DEFER_MS - bootEl));
+                waitCoordinator(waitMs);
                 continue;
+            }
+
+            if (!testMode && !manualScanActive) {
+                long btRem = btSettleRemainingNowMs(monotonicMs());
+                if (btRem < 0L) {
+                    if (bleSession != null || bleConnected || bleConnecting) {
+                        recycleBleSession();
+                    }
+                    if (!"Standby (Bluetooth off)".equals(statusSummary)) {
+                        statusSummary = "Standby (Bluetooth off)";
+                        notifyListeners();
+                    }
+                    waitCoordinator(1000L);
+                    continue;
+                }
+                if (btRem > 0L) {
+                    if (!STATUS_BT_SETTLING.equals(statusSummary)) {
+                        statusSummary = STATUS_BT_SETTLING;
+                        notifyListeners();
+                    }
+                    waitCoordinator(Math.max(100L, Math.min(2500L, btRem)));
+                    continue;
+                }
             }
 
             // Priority 1: Active @hmgapi-ble GATT session

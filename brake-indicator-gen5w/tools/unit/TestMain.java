@@ -120,6 +120,7 @@ public final class TestMain {
         testTelemetryRecorderScoringAndCsv();
         testUsbExporterMountsAndAtomicWrite();
         testV0103StandbyPowerGating();
+        testV0104ColdBootParkDeferralAndBtSettleGuard();
 
         System.out.println(passed + " ok, " + failed + " failed");
         if (failed > 0) {
@@ -1092,8 +1093,8 @@ public final class TestMain {
 
         String summary = rec.buildSummaryReport(
                 IndicatorConfig.defaults(), "BLE @hmgapi-ble (Veepeak)", "OK (20Hz)", null);
-        eq("Summary banner is v0.10.3 with Active Brake Model",
-                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.3 Calibration Summary")
+        eq("Summary banner is v0.10.4 with Active Brake Model",
+                Boolean.TRUE, Boolean.valueOf(summary.contains("v0.10.4 Calibration Summary")
                         && summary.contains("Active Brake Model  :")));
         eq("Summary includes confusion matrix and Pedal Switch Rec.",
                 Boolean.TRUE, Boolean.valueOf(summary.contains("TP=2  FP=1  TN=2  FN=1")
@@ -5839,6 +5840,98 @@ public final class TestMain {
             // Resume IG ON -> vehiclePowerOn=true again
             client.setVehiclePowerOn(true);
             eq("vehiclePowerOn restored on IG ON", Boolean.TRUE, Boolean.valueOf(client.isVehiclePowerOn()));
+        } finally {
+            client.close();
+            closeBoth.close();
+        }
+    }
+
+    private static void testV0104ColdBootParkDeferralAndBtSettleGuard() throws Exception {
+        final ServerSocket mockBle = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+        final Socket cliSock = new Socket("127.0.0.1", mockBle.getLocalPort());
+        final Socket srvSock = mockBle.accept();
+        mockBle.close();
+        cliSock.setTcpNoDelay(true);
+        srvSock.setTcpNoDelay(true);
+        final BufferedWriter w = new BufferedWriter(new OutputStreamWriter(srvSock.getOutputStream(), "UTF-8"));
+        Thread acceptThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    BufferedReader rdr = new BufferedReader(new InputStreamReader(srvSock.getInputStream(), "UTF-8"));
+                    String l;
+                    while ((l = rdr.readLine()) != null) {
+                        if ("STREAM_SESSION".equals(l.trim())) {
+                            sendBleServerEvent(w, "OK STREAM_READY");
+                        } else if ("CLOSE".equals(l.trim())) {
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }, "MockBleV0104");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+
+        Closeable closeBoth = new Closeable() {
+            @Override
+            public void close() {
+                try { srvSock.close(); } catch (Throwable ignored) {}
+                try { cliSock.close(); } catch (Throwable ignored) {}
+            }
+        };
+        InMemoryPairingStore store = new InMemoryPairingStore();
+        store.save("AA:11:22:33:44:66", "VEEPEAK", 0);
+        ObdBrakeClient client = ObdBrakeClient.createForTest(
+                store, cliSock.getInputStream(), cliSock.getOutputStream(), closeBoth, 35997);
+        try {
+            // 1. Cold boot at el=8s in Park: @hmgapi-ble deferred so AA/CarPlay gets clear runway
+            client.configureColdBootForTest(8_000L, true);
+            eq("v0.10.4 cold-boot Park deferral active at el=8s",
+                    Boolean.TRUE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+            eq("v0.10.4 status shows cold-boot AA/CarPlay priority in Park",
+                    ObdBrakeClient.STATUS_COLD_BOOT_PARK, client.getStatusSummary());
+            eq("v0.10.4 direct BLE blocked while cold-boot Park gate active",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(8_000L)));
+
+            // 2. Shift out of Park at el=11s -> immediately and permanently releases cold-boot gate
+            client.setBootElapsedOverrideForTest(11_000L);
+            client.setInParkAtRest(false);
+            eq("v0.10.4 shifting out of Park immediately releases cold-boot gate",
+                    Boolean.FALSE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+            eq("v0.10.4 direct BLE allowed immediately on shift out of Park",
+                    Boolean.TRUE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(11_000L)));
+            client.setInParkAtRest(true);
+            eq("v0.10.4 returning to Park at el=15s does NOT re-latch cold-boot gate",
+                    Boolean.FALSE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+
+            // 3. Opening MainActivity (setUiFocused(true)) releases cold-boot Park gate immediately
+            client.configureColdBootForTest(6_000L, true);
+            eq("v0.10.4 re-armed cold-boot Park gate at el=6s",
+                    Boolean.TRUE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+            client.setUiFocused(true);
+            eq("v0.10.4 opening MainActivity releases cold-boot Park gate",
+                    Boolean.FALSE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+
+            // 4. Staying in Park past el=45s automatically releases cold-boot gate
+            client.configureColdBootForTest(44_900L, true);
+            eq("v0.10.4 still deferred at el=44.9s in Park",
+                    Boolean.TRUE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+            client.setBootElapsedOverrideForTest(45_000L);
+            eq("v0.10.4 auto-released at el=45.0s in Park",
+                    Boolean.FALSE, Boolean.valueOf(client.isColdBootParkDeferredNow()));
+
+            // 5. 2.5s Bluedroid STATE_ON settle guard after STATE_TURNING_ON (11) -> STATE_ON (12)
+            client.setBluetoothStateOverrideForTest(11, 10_000L);
+            eq("v0.10.4 STATE_TURNING_ON (11) blocks BLE (<0 settle)",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(10_000L)));
+            client.setBluetoothStateOverrideForTest(12, 11_000L);
+            eq("v0.10.4 STATE_ON (12) holds 2.5s settle guard at +1.0s",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(12_000L)));
+            eq("v0.10.4 STATE_ON (12) still settling at +2.49s",
+                    Boolean.FALSE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(13_490L)));
+            eq("v0.10.4 STATE_ON (12) allows BLE at +2.50s",
+                    Boolean.TRUE, Boolean.valueOf(client.canAttemptDirectBleAtMonoForTest(13_500L)));
         } finally {
             client.close();
             closeBoth.close();

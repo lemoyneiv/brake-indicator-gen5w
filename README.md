@@ -6,7 +6,7 @@ On E-GMP and other Hyundai/Kia EVs/HEVs, regenerative braking profiles (Level 1�
 
 ---
 
-## Architecture (`v0.10.3`)
+## Architecture (`v0.10.4`)
 
 `brake-indicator-gen5w` is completely standalone (`"live": true`, `"ble": {"central": true}`, zero `/system` file patches, zero `root` mod daemons) and runs inside a single lightweight Android app (`app/BrakeIndicator.apk`, `OverlayService` + `BrakeEngine`):
 
@@ -109,9 +109,9 @@ Configurable inside **HMG-API → Mods → Brake Light Indicator** (and `obd_mod
 
 Download the latest release assets from [Releases](https://github.com/lemoyneiv/brake-indicator-gen5w/releases):
 
-- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.10.3-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.10.3.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
-- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.10.3-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
-- **Direct Packages:** `brake-indicator-gen5w-v0.10.3.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.10.3-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
+- **With HMG-API (USB Updater):** Unzip `brake-indicator-gen5w-v0.10.4-hmgapi-usb.zip` to the root of a FAT32/exFAT USB drive (creates `HMGAPI/updates/brake-indicator-gen5w-v0.10.4.zip`), plug into the head unit's data USB port, and install/update from **HMG-API → Updates**.
+- **With NEMESIS (USB Auto-Prompt):** Unzip `brake-indicator-gen5w-v0.10.4-nemesis-usb.zip` to the root of a USB drive (`NEMESIS.data` and `packages/hmgapi.brake-indicator-gen5w.zip`) and plug into the head unit once Android has booted. Tapping **Launch** on **Brake Light Indicator** in NEMESIS Manager opens the **Brake Indicator** app directly.
+- **Direct Packages:** `brake-indicator-gen5w-v0.10.4.hmgapi.zip` (raw signed HMG-API mod package) and `brake-indicator-gen5w-v0.10.4-nemesis-package.zip` (NEMESIS Package Store / `nemesis install` archive).
 
 > **Note on USB Provisioning / USB Export & USB Host Mode:** When importing `BrakeIndicator/cloud-upload.json`, importing an offline `BrakeIndicator/brake-model-*.jar`, or exporting calibration CSV datasets to USB, make sure **USB ADB** is turned off so the head unit's front data USB port operates in USB host mode (able to mount a FAT32/exFAT flash drive).
 

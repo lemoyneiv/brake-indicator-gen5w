@@ -214,7 +214,7 @@ public final class BrakeEngine {
         });
         this.modelManager = new ModelManager(appContext.getFilesDir());
         long initMono = this.obdClient.monotonicMs();
-        this.nextBootModelCheckMonoMs = initMono + 4000L;
+        this.nextBootModelCheckMonoMs = initMono + 35000L;
         this.modelManager.initFromDisk(this.recorder, initMono);
     }
 
@@ -362,6 +362,7 @@ public final class BrakeEngine {
 
     public void setUiFocused(boolean focused) {
         recorder.setUiFocused(focused, obdClient.monotonicMs());
+        obdClient.setUiFocused(focused);
     }
 
     public TelemetryRecorder.DriverGroundTruth confirmDriverRegenLevel(int level) {
@@ -771,7 +772,12 @@ public final class BrakeEngine {
                     long pollAt = obdClient.monotonicMs();
                     latestHmgPoll = new HmgPollSnapshot(res.readings, pollAt, res.legacyHubStall);
                     boolean powerOn = HmgVehiclePoller.isVehiclePowerActive(res.readings.get("power"));
+                    Boolean gearPark = BrakeEvaluator.parseReadingFlag(res.readings.get("gear.park"));
+                    Float speedKmh = BrakeEvaluator.parseReadingFloat(res.readings.get("speed"));
+                    boolean inParkAtRest = !Boolean.FALSE.equals(gearPark)
+                            && (speedKmh == null || speedKmh.floatValue() < 0.5f);
                     obdClient.setVehiclePowerOn(powerOn);
+                    obdClient.setInParkAtRest(inParkAtRest);
                     if (!powerOn) {
                         targetPeriodMs = STANDBY_IDLE_POLL_MS;
                     } else {
